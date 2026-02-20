@@ -154,7 +154,7 @@ impl SqliteStorage {
         let base_backoff_ms: u64 = 10;
 
         for attempt in 0..MAX_RETRIES {
-            self.conn.execute("BEGIN CONCURRENT")?;
+            self.conn.execute("BEGIN IMMEDIATE")?;
             let mut ctx = MutationContext::new(op, actor);
 
             match f(&self.conn, &mut ctx) {
@@ -176,10 +176,15 @@ impl SqliteStorage {
                         )?;
                     }
 
-                    // Mark dirty
+                    // Mark dirty — DELETE + INSERT instead of INSERT OR
+                    // REPLACE because fsqlite lacks UNIQUE enforcement.
                     for id in &ctx.dirty_ids {
                         self.conn.execute_with_params(
-                            "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                            "DELETE FROM dirty_issues WHERE issue_id = ?",
+                            &[SqliteValue::from(id.as_str())],
+                        )?;
+                        self.conn.execute_with_params(
+                            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
                             &[
                                 SqliteValue::from(id.as_str()),
                                 SqliteValue::from(Utc::now().to_rfc3339()),
@@ -225,6 +230,20 @@ impl SqliteStorage {
     #[allow(clippy::too_many_lines)]
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         self.mutate("create_issue", actor, |conn, ctx| {
+            // Explicit duplicate check since fsqlite does not enforce
+            // UNIQUE constraints on non-rowid columns.
+            let existing = conn.query_with_params(
+                "SELECT id FROM issues WHERE id = ?",
+                &[SqliteValue::from(issue.id.as_str())],
+            )?;
+            if !existing.is_empty() {
+                return Err(BeadsError::Database(
+                    fsqlite_error::FrankenError::UniqueViolation {
+                        columns: format!("issues.id = {}", issue.id),
+                    },
+                ));
+            }
+
             let status_str = issue.status.as_str();
             let issue_type_str = issue.issue_type.as_str();
             let created_at_str = issue.created_at.to_rfc3339();
@@ -881,7 +900,9 @@ impl SqliteStorage {
 
         if let Some(ref labels) = filters.labels {
             for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                sql.push_str(
+                    " AND id IN (SELECT issue_id FROM labels WHERE label = ?)",
+                );
                 params.push(SqliteValue::from(label.as_str()));
             }
         }
@@ -1058,7 +1079,9 @@ impl SqliteStorage {
 
         if let Some(ref labels) = filters.labels {
             for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                sql.push_str(
+                    " AND id IN (SELECT issue_id FROM labels WHERE label = ?)",
+                );
                 params.push(SqliteValue::from(label.as_str()));
             }
         }
@@ -1194,9 +1217,13 @@ impl SqliteStorage {
             sql.push_str(" AND assignee IS NULL");
         }
 
-        // Filter by labels (AND logic)
+        // Filter by labels (AND logic) — use IN subquery instead of
+        // correlated EXISTS so fsqlite's eager EXISTS rewriter doesn't
+        // strip the bind parameters.
         for label in &filters.labels_and {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+            sql.push_str(
+                " AND id IN (SELECT issue_id FROM labels WHERE label = ?)",
+            );
             params.push(SqliteValue::from(label.as_str()));
         }
 
@@ -2814,9 +2841,14 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
+        // Explicit DELETE + INSERT instead of ON CONFLICT because
+        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
         self.conn.execute_with_params(
-            "INSERT INTO config (key, value) VALUES (?, ?)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "DELETE FROM config WHERE key = ?",
+            &[SqliteValue::from(key)],
+        )?;
+        self.conn.execute_with_params(
+            "INSERT INTO config (key, value) VALUES (?, ?)",
             &[SqliteValue::from(key), SqliteValue::from(value)],
         )?;
         Ok(())
@@ -3070,8 +3102,13 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn set_export_hash(&mut self, issue_id: &str, content_hash: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
         self.conn.execute_with_params(
-            "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+            "DELETE FROM export_hashes WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        self.conn.execute_with_params(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
             &[SqliteValue::from(issue_id), SqliteValue::from(content_hash), SqliteValue::from(now)],
         )?;
         Ok(())
@@ -3091,8 +3128,13 @@ impl SqliteStorage {
         let now = Utc::now().to_rfc3339();
         let mut count = 0;
         for (issue_id, content_hash) in exports {
+            // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
             self.conn.execute_with_params(
-                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                "DELETE FROM export_hashes WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id.as_str())],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -3179,8 +3221,14 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
+        // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
+        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
         self.conn.execute_with_params(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(key)],
+        )?;
+        self.conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
             &[SqliteValue::from(key), SqliteValue::from(value)],
         )?;
         Ok(())
@@ -3335,8 +3383,14 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn set_metadata_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
+        // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
+        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
         conn.execute_with_params(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(key)],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
             &[SqliteValue::from(key), SqliteValue::from(value)],
         )?;
         Ok(())
@@ -3908,8 +3962,15 @@ impl SqliteStorage {
         let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
         let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
 
+        // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
+        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
+        self.conn.execute_with_params(
+            "DELETE FROM issues WHERE id = ?",
+            &[SqliteValue::from(issue.id.as_str())],
+        )?;
+
         let rows = self.conn.execute_with_params(
-            r"INSERT OR REPLACE INTO issues (
+            r"INSERT INTO issues (
                 id, content_hash, title, description, design, acceptance_criteria, notes,
                 status, priority, issue_type, assignee, owner, estimated_minutes,
                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
