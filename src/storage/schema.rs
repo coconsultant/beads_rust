@@ -583,7 +583,9 @@ mod tests {
                         .unwrap_or("")
                         .to_string(),
                     #[allow(clippy::cast_possible_truncation)]
-                    {row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) as i32},
+                    {
+                        row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) as i32
+                    },
                     row.get(4).and_then(|v| v.as_text()).map(String::from),
                 )
             })

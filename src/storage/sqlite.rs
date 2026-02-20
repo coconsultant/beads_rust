@@ -1444,22 +1444,20 @@ impl SqliteStorage {
 
         // Insert blocked issues into cache
         let mut count = 0;
-        {
-            let insert_stmt = conn
-                .prepare("INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)")?;
-
-            for (issue_id, blockers) in blocked_issues_map {
-                if blockers.is_empty() {
-                    continue;
-                }
-                let blockers_json =
-                    serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-                insert_stmt.execute_with_params(&[
+        for (issue_id, blockers) in blocked_issues_map {
+            if blockers.is_empty() {
+                continue;
+            }
+            let blockers_json =
+                serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
+            conn.execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
+                &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(blockers_json),
-                ])?;
-                count += 1;
-            }
+                ],
+            )?;
+            count += 1;
         }
 
         // Now handle transitive blocking via parent-child relationships
@@ -1501,25 +1499,22 @@ impl SqliteStorage {
                 issue_blockers.entry(issue_id).or_default().push(parent_id);
             }
 
-            {
-                let insert_stmt = conn.prepare(
+            for (issue_id, parents) in issue_blockers {
+                let blockers: Vec<String> = parents
+                    .into_iter()
+                    .map(|p| format!("{p}:parent-blocked"))
+                    .collect();
+                let blockers_json =
+                    serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
+
+                conn.execute_with_params(
                     "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                )?;
-
-                for (issue_id, parents) in issue_blockers {
-                    let blockers: Vec<String> = parents
-                        .into_iter()
-                        .map(|p| format!("{p}:parent-blocked"))
-                        .collect();
-                    let blockers_json =
-                        serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-
-                    insert_stmt.execute_with_params(&[
+                    &[
                         SqliteValue::from(issue_id),
                         SqliteValue::from(blockers_json),
-                    ])?;
-                    count += 1;
-                }
+                    ],
+                )?;
+                count += 1;
             }
 
             depth += 1;
@@ -3094,16 +3089,16 @@ impl SqliteStorage {
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
-        let stmt = self.conn.prepare(
-            "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-        )?;
         let mut count = 0;
         for (issue_id, content_hash) in exports {
-            stmt.execute_with_params(&[
-                SqliteValue::from(issue_id.as_str()),
-                SqliteValue::from(content_hash.as_str()),
-                SqliteValue::from(now.as_str()),
-            ])?;
+            self.conn.execute_with_params(
+                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(now.as_str()),
+                ],
+            )?;
             count += 1;
         }
         Ok(count)
