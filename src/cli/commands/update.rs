@@ -57,6 +57,25 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         || !args.set_labels.is_empty()
         || args.parent.is_some();
 
+    // Validate labels before making any database changes
+    for label in &args.add_label {
+        LabelValidator::validate(label)
+            .map_err(|e| BeadsError::validation("label", e.message))?;
+    }
+    
+    let mut valid_set_labels = Vec::new();
+    if !args.set_labels.is_empty() {
+        let combined = args.set_labels.join(",");
+        for label in combined.split(',') {
+            let label = label.trim();
+            if !label.is_empty() {
+                LabelValidator::validate(label)
+                    .map_err(|e| BeadsError::validation("label", e.message))?;
+                valid_set_labels.push(label.to_string());
+            }
+        }
+    }
+
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
 
     let storage = &mut storage_ctx.storage;
@@ -96,26 +115,13 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
         // Apply labels
         for label in &args.add_label {
-            LabelValidator::validate(label)
-                .map_err(|e| BeadsError::validation("label", e.message))?;
             storage.add_label(id, label, &actor)?;
         }
         for label in &args.remove_label {
             storage.remove_label(id, label, &actor)?;
         }
         if !args.set_labels.is_empty() {
-            // Remove all then add new
-            storage.remove_all_labels(id, &actor)?;
-            // Join all flag values, then split by comma (handles both --set-labels a,b and --set-labels a --set-labels b)
-            let combined = args.set_labels.join(",");
-            for label in combined.split(',') {
-                let label = label.trim();
-                if !label.is_empty() {
-                    LabelValidator::validate(label)
-                        .map_err(|e| BeadsError::validation("label", e.message))?;
-                    storage.add_label(id, label, &actor)?;
-                }
-            }
+            storage.set_labels(id, &valid_set_labels, &actor)?;
         }
 
         // Apply parent
@@ -335,6 +341,15 @@ fn apply_parent_update(
             "parent",
             "issue cannot be its own parent",
         ));
+    }
+
+    // Pre-check for cycle to prevent partial update (orphaning the issue if add_dependency fails)
+    if storage.would_create_cycle(issue_id, &parent_id, true)? {
+        return Err(BeadsError::DependencyCycle {
+            path: format!(
+                "Setting parent of {issue_id} to {parent_id} would create a cycle"
+            ),
+        });
     }
 
     storage.remove_parent(issue_id, actor)?;

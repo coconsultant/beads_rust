@@ -301,7 +301,9 @@ pub fn validate_dependency_type(dep_type: &str) -> Option<&str> {
 /// whether the type was recognized.
 #[must_use]
 pub fn parse_dependency(dep_str: &str) -> (String, String, bool) {
-    if let Some((type_part, id_part)) = dep_str.split_once(':') {
+    if dep_str.starts_with("external:") {
+        ("blocks".to_string(), dep_str.to_string(), true)
+    } else if let Some((type_part, id_part)) = dep_str.split_once(':') {
         let is_valid = validate_dependency_type(type_part).is_some();
         (type_part.to_string(), id_part.to_string(), is_valid)
     } else {

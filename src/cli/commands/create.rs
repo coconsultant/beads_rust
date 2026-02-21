@@ -295,7 +295,9 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
 
     // Validate Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if let Some((t, i)) = dep_str.split_once(':') {
+        let (type_str, dep_id) = if dep_str.starts_with("external:") {
+            ("blocks", dep_str.as_str())
+        } else if let Some((t, i)) = dep_str.split_once(':') {
             (t, i)
         } else {
             ("blocks", dep_str.as_str())
@@ -357,7 +359,9 @@ fn populate_relations(issue: &mut Issue, args: &CreateArgs, actor: &str, now: Da
 
     // Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if let Some((t, i)) = dep_str.split_once(':') {
+        let (type_str, dep_id) = if dep_str.starts_with("external:") {
+            ("blocks", dep_str.as_str())
+        } else if let Some((t, i)) = dep_str.split_once(':') {
             (t, i)
         } else {
             ("blocks", dep_str.as_str())

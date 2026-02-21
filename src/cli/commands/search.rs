@@ -323,7 +323,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         } else {
             Some(args.label.clone())
         },
-        labels_or: None,
+        labels_or: if args.label_any.is_empty() {
+            None
+        } else {
+            Some(args.label_any.clone())
+        },
         updated_before: None,
         updated_after: None,
     })
@@ -456,8 +460,8 @@ fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> 
 
     match sort_key {
         "priority" => issues.sort_by_key(|iwc| iwc.issue.priority),
-        "created_at" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.created_at)),
-        "updated_at" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.updated_at)),
+        "created_at" | "created" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.created_at)),
+        "updated_at" | "updated" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.updated_at)),
         "title" => issues.sort_by_cached_key(|iwc| iwc.issue.title.to_lowercase()),
         _ => {
             return Err(BeadsError::Validation {
