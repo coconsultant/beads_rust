@@ -64,7 +64,7 @@ crossterm = "0.29"
 rich_rust = { version = "0.2.0", features = ["full"] }
 
 # TOON format support (sibling project)
-toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust.git", rev = "788589d" }
+toon_rust = { version = "0.2.0", package = "tru" }
 
 # Path normalization (strips \\?\ prefix on Windows)
 dunce = "1.0.5"
