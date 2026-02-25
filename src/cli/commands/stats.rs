@@ -120,6 +120,7 @@ fn compute_summary(
     let mut closed = 0;
     let mut blocked_by_status = 0;
     let mut deferred = 0;
+    let mut draft = 0;
     let mut tombstone = 0;
     let mut pinned = 0;
     let mut epics = Vec::new();
@@ -146,6 +147,7 @@ fn compute_summary(
             }
             Status::Blocked => blocked_by_status += 1,
             Status::Deferred => deferred += 1,
+            Status::Draft => draft += 1,
             Status::Tombstone => tombstone += 1,
             Status::Pinned | Status::Custom(_) => {}
         }
@@ -204,6 +206,7 @@ fn compute_summary(
         closed_issues: closed,
         blocked_issues: blocked,
         deferred_issues: deferred,
+        draft_issues: draft,
         ready_issues: ready,
         tombstone_issues: tombstone,
         pinned_issues: pinned,

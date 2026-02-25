@@ -167,6 +167,7 @@ pub struct StatsSummary {
     pub closed_issues: usize,
     pub blocked_issues: usize,
     pub deferred_issues: usize,
+    pub draft_issues: usize,
     pub ready_issues: usize,
     pub tombstone_issues: usize,
     pub pinned_issues: usize,

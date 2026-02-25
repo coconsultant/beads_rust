@@ -119,7 +119,7 @@ impl Theme {
             Status::Open => self.status_open.clone(),
             Status::InProgress => self.status_in_progress.clone(),
             Status::Blocked => self.status_blocked.clone(),
-            Status::Deferred => self.status_deferred.clone(),
+            Status::Deferred | Status::Draft => self.status_deferred.clone(),
             Status::Closed => self.status_closed.clone(),
             Status::Tombstone | Status::Custom(_) => self.muted.clone(),
             Status::Pinned => self.highlight.clone(),

@@ -37,6 +37,7 @@ pub enum Status {
     InProgress,
     Blocked,
     Deferred,
+    Draft,
     Closed,
     #[serde(rename = "tombstone")]
     Tombstone,
@@ -54,6 +55,7 @@ impl Status {
             Self::InProgress => "in_progress",
             Self::Blocked => "blocked",
             Self::Deferred => "deferred",
+            Self::Draft => "draft",
             Self::Closed => "closed",
             Self::Tombstone => "tombstone",
             Self::Pinned => "pinned",
@@ -69,6 +71,12 @@ impl Status {
     #[must_use]
     pub const fn is_active(&self) -> bool {
         matches!(self, Self::Open | Self::InProgress)
+    }
+
+    /// Returns true if the issue is in draft state (not yet ready for execution).
+    #[must_use]
+    pub const fn is_draft(&self) -> bool {
+        matches!(self, Self::Draft)
     }
 }
 
@@ -87,6 +95,7 @@ impl FromStr for Status {
             "in_progress" | "inprogress" => Ok(Self::InProgress),
             "blocked" => Ok(Self::Blocked),
             "deferred" => Ok(Self::Deferred),
+            "draft" => Ok(Self::Draft),
             "closed" => Ok(Self::Closed),
             "tombstone" => Ok(Self::Tombstone),
             "pinned" => Ok(Self::Pinned),

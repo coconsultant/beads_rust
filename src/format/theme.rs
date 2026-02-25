@@ -118,7 +118,7 @@ impl Theme {
             Status::Open => &self.status_open,
             Status::InProgress => &self.status_in_progress,
             Status::Blocked => &self.status_blocked,
-            Status::Deferred => &self.status_deferred,
+            Status::Deferred | Status::Draft => &self.status_deferred,
             Status::Closed | Status::Tombstone => &self.status_closed,
             Status::Pinned => &self.status_pinned,
             Status::Custom(_) => &self.muted,
