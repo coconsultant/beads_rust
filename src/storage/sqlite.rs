@@ -12,10 +12,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+/// Number of mutations between WAL checkpoint attempts.
+const WAL_CHECKPOINT_INTERVAL: u32 = 50;
+
 /// SQLite-based storage backend.
 #[derive(Debug)]
 pub struct SqliteStorage {
     conn: Connection,
+    /// Track mutations to trigger periodic WAL checkpoints.
+    mutation_count: u32,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -108,7 +113,7 @@ impl SqliteStorage {
         if user_version < CURRENT_SCHEMA_VERSION {
             apply_schema(&conn)?;
         }
-        Ok(Self { conn })
+        Ok(Self { conn, mutation_count: 0 })
     }
 
     /// Open an in-memory database for testing.
@@ -119,7 +124,16 @@ impl SqliteStorage {
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open(":memory:")?;
         apply_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, mutation_count: 0 })
+    }
+
+    /// Attempt a WAL checkpoint (TRUNCATE mode) to flush WAL back to the main
+    /// database file. Errors are logged but do not propagate — checkpoint
+    /// failure is non-fatal and will be retried on the next interval.
+    fn try_wal_checkpoint(&self) {
+        if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+            tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
+        }
     }
 
     /// Get audit events for a specific issue.
@@ -199,7 +213,15 @@ impl SqliteStorage {
 
                     // Try to commit
                     match self.conn.execute("COMMIT") {
-                        Ok(_) => return Ok(result),
+                        Ok(_) => {
+                            // Periodic WAL checkpoint to prevent unbounded WAL growth
+                            self.mutation_count += 1;
+                            if self.mutation_count >= WAL_CHECKPOINT_INTERVAL {
+                                self.mutation_count = 0;
+                                self.try_wal_checkpoint();
+                            }
+                            return Ok(result);
+                        }
                         Err(e) => {
                             let _ = self.conn.execute("ROLLBACK");
                             if attempt < MAX_RETRIES - 1
@@ -4280,6 +4302,13 @@ fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
             .to_string(),
         created_at: parse_datetime(&created_at_str)?,
     })
+}
+
+impl Drop for SqliteStorage {
+    fn drop(&mut self) {
+        // Final WAL checkpoint on close to flush all data to the main DB file.
+        self.try_wal_checkpoint();
+    }
 }
 
 #[cfg(test)]

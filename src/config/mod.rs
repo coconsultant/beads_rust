@@ -1077,8 +1077,13 @@ fn get_startup_value<'a>(layer: &'a ConfigLayer, keys: &[&str]) -> Option<&'a St
 }
 
 fn get_value<'a>(layer: &'a ConfigLayer, keys: &[&str]) -> Option<&'a String> {
-    for key in keys {
-        if let Some(value) = layer.runtime.get(*key) {
+    let normalized_keys: Vec<String> = keys.iter().map(|key| normalize_key(key)).collect();
+    for (key, value) in &layer.runtime {
+        let normalized = normalize_key(key);
+        if normalized_keys
+            .iter()
+            .any(|candidate| candidate == &normalized)
+        {
             return Some(value);
         }
     }

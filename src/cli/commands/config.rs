@@ -588,7 +588,13 @@ fn delete_config_value(
         // Only try to open DB if we have a beads dir
         if let Ok(mut storage_ctx) = config::open_storage_with_cli(dir, overrides) {
             // We ignore is_startup_key check here to allow deleting from YAML even if not in DB
-            db_deleted = storage_ctx.storage.delete_config(key).unwrap_or(false);
+            match storage_ctx.storage.delete_config(key) {
+                Ok(deleted) => db_deleted = deleted,
+                Err(e) => {
+                    tracing::warn!(key, error = %e, "Failed to delete config key from DB");
+                    eprintln!("Warning: failed to delete '{key}' from DB: {e}");
+                }
+            }
         }
     }
 

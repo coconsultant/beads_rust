@@ -157,6 +157,8 @@ pub fn execute(
         // or explicitly import-only
         execute_import(
             &mut storage,
+            &beads_dir,
+            cli,
             &path_policy,
             args,
             use_json,
@@ -851,6 +853,8 @@ fn should_show_progress(json: bool, quiet: bool) -> bool {
 #[allow(clippy::too_many_lines)]
 fn execute_import(
     storage: &mut crate::storage::SqliteStorage,
+    beads_dir: &std::path::Path,
+    cli: &config::CliOverrides,
     path_policy: &SyncPathPolicy,
     args: &SyncArgs,
     use_json: bool,
@@ -948,13 +952,19 @@ fn execute_import(
         show_progress,
     };
 
-    // Get expected prefix from config, or auto-detect from JSONL
-    let configured_prefix = storage.get_config("issue_prefix")?;
-    let prefix = if let Some(p) = configured_prefix {
-        p
+    // Get expected prefix from the full merged config layer (YAML, env, CLI, DB)
+    // rather than reading only from the DB, so that project config is respected.
+    let layer = config::load_config(beads_dir, Some(storage), cli)?;
+    let id_cfg = config::id_config_from_layer(&layer);
+    let prefix = if id_cfg.prefix != "bd" {
+        // Config layer resolved a non-default prefix — use it
+        id_cfg.prefix
     } else {
-        // No prefix configured - try to auto-detect from JSONL for migration scenarios
-        if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
+        // Prefix is still the default — check if we should auto-detect from JSONL
+        let db_prefix = storage.get_config("issue_prefix")?;
+        if let Some(p) = db_prefix {
+            p
+        } else if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
             info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
             // Persist the detected prefix to config for future operations
             storage.set_config("issue_prefix", &detected)?;

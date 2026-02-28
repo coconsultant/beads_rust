@@ -5,7 +5,7 @@ use fsqlite_types::SqliteValue;
 
 use crate::error::Result;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 /// The complete SQL schema for the beads database.
 /// Schema matches classic bd (Go) for interoperability.
@@ -340,6 +340,161 @@ fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> R
     Ok(())
 }
 
+/// Expected column order for the issues table (id + ISSUE_COLUMNS names).
+/// Used to detect when ALTER TABLE has appended columns in the wrong position,
+/// which causes fsqlite to fail with "no such column" errors on older databases.
+const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
+    "id",
+    "content_hash",
+    "title",
+    "description",
+    "design",
+    "acceptance_criteria",
+    "notes",
+    "status",
+    "priority",
+    "issue_type",
+    "assignee",
+    "owner",
+    "estimated_minutes",
+    "created_at",
+    "created_by",
+    "updated_at",
+    "closed_at",
+    "close_reason",
+    "closed_by_session",
+    "due_at",
+    "defer_until",
+    "external_ref",
+    "source_system",
+    "source_repo",
+    "deleted_at",
+    "deleted_by",
+    "delete_reason",
+    "original_type",
+    "compaction_level",
+    "compacted_at",
+    "compacted_at_commit",
+    "original_size",
+    "sender",
+    "ephemeral",
+    "pinned",
+    "is_template",
+];
+
+/// Check whether the issues table has columns in the expected order.
+/// Returns `true` if the column order matches, `false` if it differs or the
+/// table doesn't exist.
+fn issues_column_order_matches(conn: &Connection) -> bool {
+    if !table_exists(conn, "issues") {
+        return true; // Will be created fresh by SCHEMA_SQL
+    }
+
+    let Ok(rows) = conn.query("PRAGMA table_info(issues)") else {
+        return false;
+    };
+
+    let actual_columns: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
+        .collect();
+
+    if actual_columns.len() != EXPECTED_ISSUE_COLUMN_ORDER.len() {
+        return false;
+    }
+
+    actual_columns
+        .iter()
+        .zip(EXPECTED_ISSUE_COLUMN_ORDER.iter())
+        .all(|(actual, expected)| actual == expected)
+}
+
+/// Rebuild the issues table so columns match the canonical SCHEMA_SQL order.
+///
+/// This fixes databases where ALTER TABLE ADD COLUMN appended columns in a
+/// different position than the CREATE TABLE definition, causing fsqlite's
+/// column-name resolver to fail with "no such column" errors.
+///
+/// Uses the standard SQLite migration pattern:
+///   1. Create new table with correct schema
+///   2. Copy data from old table
+///   3. Drop old table
+///   4. Rename new table
+fn rebuild_issues_table(conn: &Connection) -> Result<()> {
+    // Build column list from what currently exists in the table
+    let existing_rows = conn.query("PRAGMA table_info(issues)")?;
+    let existing_columns: Vec<String> = existing_rows
+        .iter()
+        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
+        .collect();
+
+    if existing_columns.is_empty() {
+        return Ok(()); // Table is empty or doesn't exist
+    }
+
+    // Drop all indexes on the issues table first (they'll be recreated by SCHEMA_SQL)
+    let index_rows =
+        conn.query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='issues' AND sql IS NOT NULL")?;
+    for row in &index_rows {
+        if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
+            conn.execute(&format!("DROP INDEX IF EXISTS {name}"))?;
+        }
+    }
+
+    // Drop tables that have foreign keys referencing issues (they'll be recreated)
+    // We need to save and restore their data too.
+    // For simplicity, we only rebuild the issues table and let SCHEMA_SQL
+    // recreate indexes. Foreign key tables (dependencies, labels, etc.) keep
+    // their data since we use the same primary key.
+
+    // Create the new table with canonical column order
+    // Use a temporary name to avoid conflicts
+    conn.execute("DROP TABLE IF EXISTS issues_rebuild_tmp")?;
+
+    // Build CREATE TABLE for the new table with only columns that exist in the old table
+    // plus any missing columns with defaults
+    let all_expected: Vec<(&str, &str)> = std::iter::once(("id", "TEXT PRIMARY KEY"))
+        .chain(ISSUE_COLUMNS.iter().copied())
+        .collect();
+
+    let mut create_cols = Vec::new();
+    for (col_name, col_def) in &all_expected {
+        create_cols.push(format!("{col_name} {col_def}"));
+    }
+
+    let create_sql = format!(
+        "CREATE TABLE issues_rebuild_tmp ({})",
+        create_cols.join(", ")
+    );
+    conn.execute(&create_sql)?;
+
+    // Build the SELECT column list: use existing columns where available,
+    // NULL (or default) for missing ones
+    let mut select_cols = Vec::new();
+    for (col_name, _) in &all_expected {
+        if existing_columns.iter().any(|c| c == col_name) {
+            select_cols.push((*col_name).to_string());
+        } else {
+            select_cols.push("NULL".to_string());
+        }
+    }
+
+    let insert_cols: Vec<&str> = all_expected.iter().map(|(name, _)| *name).collect();
+
+    let copy_sql = format!(
+        "INSERT INTO issues_rebuild_tmp ({}) SELECT {} FROM issues",
+        insert_cols.join(", "),
+        select_cols.join(", ")
+    );
+    conn.execute(&copy_sql)?;
+
+    // Swap tables
+    conn.execute("DROP TABLE issues")?;
+    conn.execute("ALTER TABLE issues_rebuild_tmp RENAME TO issues")?;
+
+    Ok(())
+}
+
 /// Run pre-schema migrations to fix incompatible old tables.
 ///
 /// This must run BEFORE `execute_batch(SCHEMA_SQL)` because the schema includes
@@ -355,6 +510,14 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
         if !has_blocked_at || !has_blocked_by || !has_issue_id {
             conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
         }
+    }
+
+    // Rebuild the issues table if columns are out of order or missing.
+    // This fixes fsqlite "no such column" errors on databases created with
+    // older br versions where ALTER TABLE ADD COLUMN appended columns in
+    // a different position than the canonical CREATE TABLE definition.
+    if table_exists(conn, "issues") && !issues_column_order_matches(conn) {
+        rebuild_issues_table(conn)?;
     }
 
     // Ensure legacy tables have all columns needed for schema indexes and queries.
