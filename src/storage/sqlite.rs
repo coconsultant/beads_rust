@@ -102,8 +102,15 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the connection cannot be established or schema application fails.
-    pub fn open_with_timeout(path: &Path, _lock_timeout_ms: Option<u64>) -> Result<Self> {
+    pub fn open_with_timeout(path: &Path, lock_timeout_ms: Option<u64>) -> Result<Self> {
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
+
+        // Configure busy_timeout so that BEGIN IMMEDIATE retries instead of
+        // failing instantly when another writer holds the lock (issue #109).
+        if let Some(timeout_ms) = lock_timeout_ms {
+            conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
+        }
+
         #[allow(clippy::cast_possible_truncation)]
         let user_version = conn
             .query_row("PRAGMA user_version")
@@ -156,6 +163,12 @@ impl SqliteStorage {
 
     /// Execute a mutation with the 4-step transaction protocol.
     ///
+    /// Retries on all transient BUSY errors (from BEGIN, DML, or COMMIT) with
+    /// exponential backoff.  This is the fix for issue #109 — previously only
+    /// `BusySnapshot` at COMMIT time was retried, while `Busy` from
+    /// `BEGIN IMMEDIATE` (lock contention) would propagate immediately,
+    /// causing concurrent close/update operations to silently lose data.
+    ///
     /// # Errors
     ///
     /// Returns an error if any step fails (e.g. database error, logic error).
@@ -168,7 +181,20 @@ impl SqliteStorage {
         let base_backoff_ms: u64 = 10;
 
         for attempt in 0..MAX_RETRIES {
-            self.conn.execute("BEGIN IMMEDIATE")?;
+            // BEGIN IMMEDIATE acquires a write lock. If another writer holds
+            // the lock and busy_timeout is configured, fsqlite will retry
+            // internally. If it still fails (or busy_timeout is 0), we retry
+            // at this level with backoff.
+            match self.conn.execute("BEGIN IMMEDIATE") {
+                Ok(_) => {}
+                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+
             let mut ctx = MutationContext::new(op, actor);
 
             match f(&self.conn, &mut ctx) {
@@ -224,9 +250,7 @@ impl SqliteStorage {
                         }
                         Err(e) => {
                             let _ = self.conn.execute("ROLLBACK");
-                            if attempt < MAX_RETRIES - 1
-                                && matches!(e, fsqlite_error::FrankenError::BusySnapshot { .. })
-                            {
+                            if attempt < MAX_RETRIES - 1 && e.is_transient() {
                                 let backoff = base_backoff_ms * 2u64.pow(attempt);
                                 std::thread::sleep(Duration::from_millis(backoff));
                                 continue;
