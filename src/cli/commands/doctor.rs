@@ -200,6 +200,18 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
         "blocked_issues_cache",
         "child_counters",
     ];
+
+    // Fallback: if sqlite_master returned nothing (frankensqlite may not
+    // support it), probe each required table directly.
+    if tables.is_empty() {
+        for &table in &required_tables {
+            let probe = format!("SELECT 1 FROM {table} LIMIT 1");
+            if conn.query(&probe).is_ok() {
+                tables.push(table.to_string());
+            }
+        }
+    }
+
     let missing_tables: Vec<&str> = required_tables
         .iter()
         .copied()

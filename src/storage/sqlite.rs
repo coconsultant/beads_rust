@@ -1181,9 +1181,10 @@ impl SqliteStorage {
             sql.push_str(" AND status IN ('open', 'in_progress')");
         }
 
-        // Ready condition 2: NOT in blocked_issues_cache (NOT EXISTS is faster than NOT IN)
+        // Ready condition 2: NOT in blocked_issues_cache (NOT IN — frankensqlite
+        // does not support correlated NOT EXISTS subqueries)
         sql.push_str(
-            " AND NOT EXISTS (SELECT 1 FROM blocked_issues_cache WHERE issue_id = issues.id)",
+            " AND issues.id NOT IN (SELECT issue_id FROM blocked_issues_cache)",
         );
 
         // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
@@ -1520,8 +1521,8 @@ impl SqliteStorage {
                   INNER JOIN issues i ON d.depends_on_id = i.id
                   WHERE d.type = 'parent-child'
                     AND i.status = 'deferred'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM blocked_issues_cache WHERE issue_id = d.issue_id
+                    AND d.issue_id NOT IN (
+                        SELECT issue_id FROM blocked_issues_cache
                     )",
             )?;
 
@@ -1567,7 +1568,7 @@ impl SqliteStorage {
                       FROM dependencies d
                       INNER JOIN blocked_issues_cache bc ON d.depends_on_id = bc.issue_id
                       WHERE d.type = 'parent-child'
-                        AND NOT EXISTS (SELECT 1 FROM blocked_issues_cache WHERE issue_id = d.issue_id)",
+                        AND d.issue_id NOT IN (SELECT issue_id FROM blocked_issues_cache)",
                 )?;
 
                 rows.iter()
@@ -3284,7 +3285,7 @@ impl SqliteStorage {
                  WHERE i.id IN ({})
                    AND i.deleted_at IS NULL
                    AND (
-                     NOT EXISTS (SELECT 1 FROM export_hashes e WHERE e.issue_id = i.id)
+                     i.id NOT IN (SELECT issue_id FROM export_hashes)
                      OR i.content_hash != (SELECT e.content_hash FROM export_hashes e WHERE e.issue_id = i.id)
                    )
                  ORDER BY i.id",
