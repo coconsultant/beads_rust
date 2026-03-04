@@ -239,13 +239,20 @@ fn run_auto_import(overrides: &config::CliOverrides, allow_stale: bool) -> Resul
         Err(e) => return Err(e),
     };
 
-    // Fast path: skip auto-import/no_db via merged config (CLI + config file)
-    if let Ok(startup_layer) = config::load_startup_config(&beads_dir) {
+    // Resolve startup config once for both no_db and no_auto_import checks
+    let (skip_db, no_auto_import) = {
+        let startup_layer =
+            config::load_startup_config(&beads_dir).unwrap_or_default();
         let merged_layer =
             config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
-        if config::no_db_from_layer(&merged_layer).unwrap_or(false) {
-            return Ok(());
-        }
+        (
+            config::no_db_from_layer(&merged_layer).unwrap_or(false),
+            config::no_auto_import_from_layer(&merged_layer).unwrap_or(false),
+        )
+    };
+
+    if skip_db {
+        return Ok(());
     }
 
     let config::OpenStorageResult {
@@ -257,14 +264,6 @@ fn run_auto_import(overrides: &config::CliOverrides, allow_stale: bool) -> Resul
     if no_db {
         return Ok(());
     }
-
-    // Resolve no_auto_import from merged config (CLI + config file)
-    let no_auto_import = {
-        let startup_layer = config::load_startup_config(&beads_dir).unwrap_or_default();
-        let merged_layer =
-            config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
-        config::no_auto_import_from_layer(&merged_layer).unwrap_or(false)
-    };
 
     let expected_prefix = storage.get_config("issue_prefix")?;
     let outcome = auto_import_if_stale(
