@@ -150,9 +150,9 @@ br sync --status                             # Check sync status
 ```bash
 br doctor                                    # Run diagnostics
 br where                                     # Show workspace location
-br config --list                             # Show all config
-br config --get id.prefix                    # Get specific value
-br config --set defaults.priority=1          # Set value
+br config list                               # Show all config
+br config get id.prefix                      # Get specific value
+br config set defaults.priority=1            # Set value
 br version                                   # Show version
 br upgrade                                   # Self-update (if enabled)
 ```

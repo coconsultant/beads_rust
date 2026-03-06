@@ -53,9 +53,9 @@ sync:
 ## Config Commands
 
 ```bash
-br config --list                     # Show all config
-br config --get id.prefix            # Get specific value
-br config --set defaults.priority=1  # Set value
+br config list                       # Show all config
+br config get id.prefix              # Get specific value
+br config set defaults.priority=1    # Set value
 ```
 
 ---

@@ -41,7 +41,7 @@ br search "keyword" --json
 
 ```bash
 # Check your prefix
-br config --get id.prefix
+br config get id.prefix
 
 # Import with validation skip (careful!)
 br sync --import-only --skip-prefix-validation
@@ -94,7 +94,7 @@ RUST_LOG=debug br list
 ```bash
 br doctor                    # Full diagnostics
 br dep cycles                # Must be empty
-br config --list             # Check settings
+br config list               # Check settings
 which br                     # Verify br is installed
 br version                   # Check version
 ```

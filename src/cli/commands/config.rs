@@ -315,7 +315,7 @@ fn edit_config() -> Result<()> {
     // Create file if it doesn't exist
     if !config_path.exists() {
         let default_content = r"# br configuration
-# See `br config --list` for available options
+# See `br config list` for available options
 
 # Issue ID prefix
 # issue_prefix: bd

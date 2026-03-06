@@ -179,9 +179,9 @@ br sync --import-only
 ```bash
 br doctor                            # Full diagnostics
 br stats --json                      # Project statistics
-br config --list                     # Show all configuration
-br config --get id.prefix            # Get specific value
-br config --set defaults.priority=1  # Set value
+br config list                       # Show all configuration
+br config get id.prefix              # Get specific value
+br config set defaults.priority=1    # Set value
 br where                             # Show workspace location
 br version                           # Show version
 br upgrade                           # Self-update (if enabled)
@@ -338,7 +338,7 @@ br blocked --json
 ```bash
 br doctor                    # Full diagnostics
 br dep cycles                # Must be empty
-br config --list             # Check settings
+br config list               # Check settings
 which br                     # Verify br is installed
 ```
 

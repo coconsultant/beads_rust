@@ -36,7 +36,7 @@ br stats
 br sync --status
 
 # Show configuration
-br config --list
+br config list
 
 # Show version
 br version
@@ -93,7 +93,7 @@ br list
 **Solution:**
 ```bash
 # Check current location
-br config --path
+br config path
 
 # Move to correct directory
 cd /correct/path
@@ -408,13 +408,13 @@ br sync --import-only --error-policy best-effort
 **Solutions:**
 ```bash
 # Check configured prefix
-br config --get id.prefix
+br config get id.prefix
 
 # Import with force (if intentional)
 br sync --import-only --force
 
 # Or update config to match
-br config --set id.prefix=bd
+br config set id.prefix=bd
 ```
 
 ---
@@ -613,7 +613,7 @@ br sync --import-only
 cat .beads/beads.yaml | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)"
 
 # Find config paths
-br config --path
+br config path
 
 # Reset to defaults
 rm .beads/beads.yaml
@@ -629,10 +629,10 @@ br init
 **Diagnosis:**
 ```bash
 # Show effective config with sources
-br config --list -v
+br config list -v
 
 # Check specific value
-br config --get <key>
+br config get <key>
 
 # Override via CLI
 br --db /path/to/db list
@@ -950,7 +950,7 @@ If you're still stuck:
    ```bash
    br doctor
    br version
-   br config --list
+   br config list
    ```
 
 3. **Enable debug logging:**

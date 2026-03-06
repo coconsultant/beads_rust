@@ -686,16 +686,16 @@ br config [OPTIONS]
 **Examples:**
 ```bash
 # List all config
-br config --list
+br config list
 
 # Get specific value
-br config --get id.prefix
+br config get id.prefix
 
 # Set value
-br config --set id.prefix=myproj
+br config set id.prefix=myproj
 
 # Edit in editor
-br config --edit
+br config edit
 ```
 
 ---
@@ -872,7 +872,7 @@ source ~/.bashrc
 | `BEADS_DIR` | Override `.beads` directory location |
 | `BEADS_JSONL` | Override JSONL file path (requires `--allow-external-jsonl`) |
 | `BD_ACTOR` | Default actor name for audit trail |
-| `EDITOR` | Editor for `br config --edit` |
+| `EDITOR` | Editor for `br config edit` |
 | `NO_COLOR` | Disable colored output (any value) |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 
