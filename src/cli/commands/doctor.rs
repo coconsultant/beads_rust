@@ -945,10 +945,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let db_str = db_path.to_string_lossy().to_string();
         for suffix in &["", "-wal", "-shm"] {
             let p = PathBuf::from(format!("{db_str}{suffix}"));
-            if p.exists() {
-                if let Err(e) = fs::remove_file(&p) {
-                    tracing::warn!(path = %p.display(), error = %e, "Failed to remove corrupt DB file");
-                }
+            if p.exists() && let Err(e) = fs::remove_file(&p) {
+                tracing::warn!(path = %p.display(), error = %e, "Failed to remove corrupt DB file");
             }
         }
 
@@ -1004,18 +1002,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     }
                 }
 
-                if !ctx.is_json() {
-                    ctx.info(&format!(
-                        "Repair complete: imported {}, skipped {}",
-                        result.imported_count, result.skipped_count
-                    ));
-                } else {
+                if ctx.is_json() {
                     ctx.json(&serde_json::json!({
                         "repaired": true,
                         "imported": result.imported_count,
                         "skipped": result.skipped_count,
                         "fk_violations_cleaned": fk_violations,
                     }));
+                } else {
+                    ctx.info(&format!(
+                        "Repair complete: imported {}, skipped {}",
+                        result.imported_count, result.skipped_count
+                    ));
                 }
             }
             Err(err) => {

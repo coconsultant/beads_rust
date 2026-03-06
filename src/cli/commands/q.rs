@@ -27,6 +27,7 @@ fn split_labels(values: &[String]) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error if validation fails, the database cannot be opened, or creation fails.
+#[allow(clippy::too_many_lines)]
 pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let title = args.title.join(" ").trim().to_string();
     if title.is_empty() {
