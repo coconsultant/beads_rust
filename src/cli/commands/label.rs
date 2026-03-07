@@ -323,6 +323,25 @@ fn label_rename(
 ) -> Result<()> {
     validate_label(&args.new_name)?;
 
+    if args.old_name == args.new_name {
+        if ctx.is_json() {
+            let result = RenameResult {
+                old_name: args.old_name.clone(),
+                new_name: args.new_name.clone(),
+                affected_issues: 0,
+            };
+            ctx.json_pretty(&result);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
+            render_rename_noop_rich(&args.old_name, ctx);
+        } else {
+            println!(
+                "Label '{}' already has that name; no changes made.",
+                args.old_name
+            );
+        }
+        return Ok(());
+    }
+
     info!(
         old = %args.old_name,
         new = %args.new_name,
@@ -568,6 +587,23 @@ fn render_rename_not_found_rich(old_name: &str, ctx: &OutputContext) {
     text.append("Label ");
     text.append_styled(old_name, Style::new().color(label_color(old_name)));
     text.append_styled(" not found on any issues.", theme.dimmed.clone());
+
+    console.print_renderable(&text);
+}
+
+/// Render rename no-op message in rich mode.
+fn render_rename_noop_rich(label: &str, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2139} ", theme.dimmed.clone());
+    text.append("Label ");
+    text.append_styled(label, Style::new().color(label_color(label)));
+    text.append_styled(
+        " already has that name; no changes made.",
+        theme.dimmed.clone(),
+    );
 
     console.print_renderable(&text);
 }

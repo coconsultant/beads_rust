@@ -856,7 +856,7 @@ impl SqliteStorage {
 
         let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
-        let mut tombstone_issue = issue.clone();
+        let mut tombstone_issue = issue;
         tombstone_issue.status = Status::Tombstone;
         let tombstone_hash = crate::util::content_hash(&tombstone_issue);
 
@@ -2407,17 +2407,29 @@ impl SqliteStorage {
                 "SELECT label FROM labels WHERE issue_id = ?",
                 &[SqliteValue::from(issue_id)],
             )?;
-            let old_labels: Vec<String> = old_rows
+            let old_labels_raw: Vec<String> = old_rows
                 .iter()
                 .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
                 .collect();
+            let old_labels = dedupe_preserving_order(&old_labels_raw);
+            let desired_labels = dedupe_preserving_order(labels);
+
+            let old_matches_desired = old_labels.len() == desired_labels.len()
+                && old_labels
+                    .iter()
+                    .all(|label| desired_labels.contains(label));
+            let db_has_duplicate_labels = old_labels_raw.len() != old_labels.len();
+
+            if old_matches_desired && !db_has_duplicate_labels {
+                return Ok(());
+            }
 
             conn.execute_with_params(
                 "DELETE FROM labels WHERE issue_id = ?",
                 &[SqliteValue::from(issue_id)],
             )?;
 
-            for label in labels {
+            for label in &desired_labels {
                 conn.execute_with_params(
                     "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
                     &[
@@ -2428,10 +2440,16 @@ impl SqliteStorage {
             }
 
             // Record changes
-            let removed: Vec<_> = old_labels.iter().filter(|l| !labels.contains(l)).collect();
-            let added: Vec<_> = labels.iter().filter(|l| !old_labels.contains(l)).collect();
+            let removed: Vec<_> = old_labels
+                .iter()
+                .filter(|label| !desired_labels.contains(label))
+                .collect();
+            let added: Vec<_> = desired_labels
+                .iter()
+                .filter(|label| !old_labels.contains(label))
+                .collect();
 
-            if !removed.is_empty() || !added.is_empty() {
+            if !removed.is_empty() || !added.is_empty() || db_has_duplicate_labels {
                 let mut details = Vec::new();
                 if !removed.is_empty() {
                     details.push(format!(
@@ -2452,6 +2470,9 @@ impl SqliteStorage {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
+                }
+                if db_has_duplicate_labels && removed.is_empty() && added.is_empty() {
+                    details.push("normalized duplicate labels".to_string());
                 }
                 ctx.record_event(
                     EventType::Updated,
@@ -2602,6 +2623,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn rename_label(&mut self, old_name: &str, new_name: &str, actor: &str) -> Result<usize> {
+        if old_name == new_name {
+            return Ok(0);
+        }
+
         self.mutate("rename_label", actor, |conn, ctx| {
             let id_rows = conn.query_with_params(
                 "SELECT issue_id FROM labels WHERE label = ?",
@@ -2667,32 +2692,7 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         )?;
 
-        let mut comments = Vec::new();
-        for row in &rows {
-            comments.push(Comment {
-                id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
-                issue_id: row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                author: row
-                    .get(2)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                body: row
-                    .get(3)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                created_at: parse_datetime(
-                    row.get(4).and_then(SqliteValue::as_text).unwrap_or(""),
-                )?,
-            });
-        }
-
-        Ok(comments)
+        rows.iter().map(comment_from_row).collect()
     }
 
     /// Add a comment to an issue.
@@ -3239,27 +3239,7 @@ impl SqliteStorage {
 
         let mut map: HashMap<String, Vec<Comment>> = HashMap::new();
         for row in &rows {
-            let comment = Comment {
-                id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
-                issue_id: row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                author: row
-                    .get(2)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                body: row
-                    .get(3)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string(),
-                created_at: parse_datetime(
-                    row.get(4).and_then(SqliteValue::as_text).unwrap_or(""),
-                )?,
-            };
+            let comment = comment_from_row(row)?;
             map.entry(comment.issue_id.clone())
                 .or_default()
                 .push(comment);
@@ -4484,7 +4464,18 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
         ],
     )?;
     let row = conn.query_row("SELECT last_insert_rowid()")?;
-    Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0))
+    let comment_id = row
+        .get(0)
+        .and_then(SqliteValue::as_integer)
+        .ok_or_else(|| {
+            BeadsError::Config("comments insert did not return last_insert_rowid".to_string())
+        })?;
+    if comment_id <= 0 {
+        return Err(BeadsError::Config(format!(
+            "comments insert returned invalid last_insert_rowid: {comment_id}"
+        )));
+    }
+    Ok(comment_id)
 }
 
 fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
@@ -4492,30 +4483,58 @@ fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
         "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?",
         &[SqliteValue::from(comment_id)],
     )?;
+    comment_from_row(&row)
+}
+
+fn comment_from_row(row: &fsqlite::Row) -> Result<Comment> {
+    let id = row
+        .get(0)
+        .and_then(SqliteValue::as_integer)
+        .ok_or_else(|| BeadsError::Config("comments row missing id".to_string()))?;
+    let issue_id = row
+        .get(1)
+        .and_then(SqliteValue::as_text)
+        .ok_or_else(|| BeadsError::Config(format!("comments row missing issue_id for {id}")))?
+        .to_string();
+    let author = row
+        .get(2)
+        .and_then(SqliteValue::as_text)
+        .ok_or_else(|| BeadsError::Config(format!("comments row missing author for {id}")))?
+        .to_string();
+    let body = row
+        .get(3)
+        .and_then(SqliteValue::as_text)
+        .ok_or_else(|| BeadsError::Config(format!("comments row missing body for {id}")))?
+        .to_string();
     let created_at_str = row
         .get(4)
         .and_then(SqliteValue::as_text)
-        .unwrap_or("")
-        .to_string();
+        .ok_or_else(|| BeadsError::Config(format!("comments row missing created_at for {id}")))?;
+    let created_at = parse_datetime(created_at_str).map_err(|err| match err {
+        BeadsError::Config(msg) => {
+            BeadsError::Config(format!("invalid comment timestamp for {id}: {msg}"))
+        }
+        other => other,
+    })?;
+
     Ok(Comment {
-        id: row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
-        issue_id: row
-            .get(1)
-            .and_then(SqliteValue::as_text)
-            .unwrap_or("")
-            .to_string(),
-        author: row
-            .get(2)
-            .and_then(SqliteValue::as_text)
-            .unwrap_or("")
-            .to_string(),
-        body: row
-            .get(3)
-            .and_then(SqliteValue::as_text)
-            .unwrap_or("")
-            .to_string(),
-        created_at: parse_datetime(&created_at_str)?,
+        id,
+        issue_id,
+        author,
+        body,
+        created_at,
     })
+}
+
+fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(values.len());
+    for value in values {
+        if seen.insert(value.clone()) {
+            deduped.push(value.clone());
+        }
+    }
+    deduped
 }
 
 impl Drop for SqliteStorage {
@@ -4838,7 +4857,7 @@ mod tests {
 
         ready_rx.recv().unwrap();
 
-        let updater_db_path = db_path.clone();
+        let updater_db_path = db_path;
         let updater = std::thread::spawn(move || {
             let mut storage = SqliteStorage::open(&updater_db_path).unwrap();
             let updates = IssueUpdate {
@@ -5012,6 +5031,55 @@ mod tests {
     }
 
     #[test]
+    fn test_set_labels_deduplicates_input() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-l2", "Dedup labels", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .set_labels(
+                "bd-l2",
+                &[
+                    "backend".to_string(),
+                    "backend".to_string(),
+                    "api".to_string(),
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        let labels = storage.get_labels("bd-l2").unwrap();
+        assert_eq!(labels, vec!["api".to_string(), "backend".to_string()]);
+    }
+
+    #[test]
+    fn test_rename_label_same_name_is_noop() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-l3", "Rename label", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        storage.add_label("bd-l3", "backend", "tester").unwrap();
+        let event_count_before = storage.get_events("bd-l3", 100).unwrap().len();
+
+        let affected = storage
+            .rename_label("backend", "backend", "tester")
+            .unwrap();
+
+        assert_eq!(affected, 0);
+        assert_eq!(
+            storage.get_labels("bd-l3").unwrap(),
+            vec!["backend".to_string()]
+        );
+        assert_eq!(
+            storage.get_events("bd-l3", 100).unwrap().len(),
+            event_count_before
+        );
+    }
+
+    #[test]
     fn test_add_dependency_and_remove() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
@@ -5144,6 +5212,77 @@ mod tests {
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].author, "alice");
         assert_eq!(comments[1].author, "bob");
+    }
+
+    #[test]
+    fn test_get_comments_errors_on_invalid_timestamp() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue = Issue {
+            id: "bd-c-invalid".to_string(),
+            content_hash: None,
+            title: "Comment issue".to_string(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: t1,
+            created_by: None,
+            updated_at: t1,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            defer_until: None,
+            due_at: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    SqliteValue::from("bd-c-invalid"),
+                    SqliteValue::from("alice"),
+                    SqliteValue::from("first"),
+                    SqliteValue::from("not-a-real-timestamp"),
+                ],
+            )
+            .unwrap();
+
+        let err = storage.get_comments("bd-c-invalid").unwrap_err();
+        match err {
+            BeadsError::Config(msg) => {
+                assert!(msg.contains("invalid comment timestamp"));
+                assert!(msg.contains("unparseable datetime"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

@@ -1827,25 +1827,37 @@ pub fn finalize_export(
 ) -> Result<()> {
     use chrono::Utc;
 
-    // Clear dirty flags for exported issues
-    let mut clear_ids = result.exported_ids.clone();
-    if !result.skipped_tombstone_ids.is_empty() {
-        clear_ids.extend(result.skipped_tombstone_ids.iter().cloned());
-    }
-    if !clear_ids.is_empty() {
-        storage.clear_dirty_issues(&clear_ids)?;
-    }
+    storage.execute_raw("BEGIN IMMEDIATE")?;
+    match (|| -> Result<()> {
+        // Clear dirty flags for exported issues
+        let mut clear_ids = result.exported_ids.clone();
+        if !result.skipped_tombstone_ids.is_empty() {
+            clear_ids.extend(result.skipped_tombstone_ids.iter().cloned());
+        }
+        if !clear_ids.is_empty() {
+            storage.clear_dirty_issues(&clear_ids)?;
+        }
 
-    // Record export hashes for each exported issue (for incremental export detection)
-    if let Some(hashes) = issue_hashes {
-        storage.set_export_hashes(hashes)?;
+        // Record export hashes for each exported issue (for incremental export detection)
+        if let Some(hashes) = issue_hashes {
+            storage.set_export_hashes_in_tx(hashes)?;
+        }
+
+        // Update metadata
+        storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
+        storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+
+        Ok(())
+    })() {
+        Ok(()) => {
+            storage.execute_raw("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = storage.execute_raw("ROLLBACK");
+            Err(err)
+        }
     }
-
-    // Update metadata
-    storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
-    storage.set_metadata(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-
-    Ok(())
 }
 
 /// Result of an auto-flush operation.
@@ -4029,6 +4041,47 @@ mod tests {
                 .get_metadata(METADATA_LAST_EXPORT_TIME)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn test_finalize_export_rolls_back_on_failure() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_test_issue("bd-finalize", "Issue");
+        storage.create_issue(&issue, "test").unwrap();
+        assert_eq!(storage.get_dirty_issue_ids().unwrap().len(), 1);
+
+        let config = ExportConfig::default();
+        let result = export_to_jsonl(&storage, &output_path, &config).unwrap();
+
+        storage
+            .execute_test_sql("DROP TABLE export_hashes")
+            .unwrap();
+
+        let err = finalize_export(&mut storage, &result, Some(&result.issue_hashes)).unwrap_err();
+        match err {
+            BeadsError::Database(_) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec!["bd-finalize".to_string()]
+        );
+        assert!(
+            storage
+                .get_metadata(METADATA_JSONL_CONTENT_HASH)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_metadata(METADATA_LAST_EXPORT_TIME)
+                .unwrap()
+                .is_none()
         );
     }
 

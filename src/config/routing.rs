@@ -229,7 +229,7 @@ pub fn follow_redirects(start: &Path, max_depth: usize) -> Result<PathBuf> {
         )));
     }
 
-    if !current.file_name().is_some_and(|name| name == ".beads") {
+    if current.file_name().is_none_or(|name| name != ".beads") {
         return Err(BeadsError::Config(format!(
             "Redirect target must be a .beads directory: {}",
             current.display()
