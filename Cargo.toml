@@ -8,6 +8,33 @@ license = "MIT"
 repository = "https://github.com/Dicklesworthstone/beads_rust"
 keywords = ["cli", "issue-tracker", "sqlite", "agent"]
 categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+exclude = [
+    "sample_beads_db_files/",
+    ".beads/",
+    ".github/",
+    ".claude/",
+    ".ntm/",
+    "agent_baseline/",
+    "docs/",
+    "scripts/",
+    "skills/",
+    "temp_test/",
+    "temp_test_2/",
+    "*.webp",
+    "*.png",
+    "*.db",
+    "*.db-wal",
+    "*.db-shm",
+    "custom.db",
+    "EXISTING_BEADS_STRUCTURE_AND_ARCHITECTURE.md",
+    "PLAN_TO_PORT_BEADS_WITH_SQLITE_AND_ISSUES_JSONL_TO_RUST.md",
+    "PROPOSED_ARCHITECTURE_FOR_BR_USING_RUST_BEST_PRACTICES.md",
+    "RICH_INTEGRATION_PLAN.md",
+    "AGENT_FRIENDLINESS_REPORT.md",
+    "ROBOT_MODE_EXAMPLES.jsonl",
+    "CLI_SCHEMA.json",
+]
 
 [[bin]]
 name = "br"
