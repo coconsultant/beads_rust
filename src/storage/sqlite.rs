@@ -650,6 +650,7 @@ impl SqliteStorage {
             // Status
             if let Some(ref status) = updates.status {
                 let old_status = issue.status.as_str().to_string();
+                let was_terminal = issue.status.is_terminal();
                 issue.status.clone_from(status);
                 add_update("status", SqliteValue::from(status.as_str()));
                 ctx.record_field_change(
@@ -671,10 +672,15 @@ impl SqliteStorage {
                         issue.closed_at = Some(now);
                         add_update("closed_at", SqliteValue::from(now.to_rfc3339()));
                     }
-                } else if issue.closed_at.is_some() && updates.closed_at.is_none() {
-                    // Reopening (or fixing state): Clear closed_at if it was set
-                    issue.closed_at = None;
-                    add_update("closed_at", SqliteValue::Null);
+                } else {
+                    if was_terminal && !status.is_terminal() {
+                        ctx.record_event(EventType::Reopened, id, None);
+                    }
+                    if issue.closed_at.is_some() && updates.closed_at.is_none() {
+                        // Reopening (or fixing state): Clear closed_at if it was set
+                        issue.closed_at = None;
+                        add_update("closed_at", SqliteValue::Null);
+                    }
                 }
 
                 if !updates.skip_cache_rebuild {
@@ -4874,6 +4880,41 @@ mod tests {
 
         let is_tombstone = storage.is_tombstone("bd-d1").unwrap();
         assert!(is_tombstone);
+    }
+
+    #[test]
+    fn test_reopen_records_reopened_event() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-r1", "Reopen me", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let close_update = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-r1", &close_update, "tester")
+            .unwrap();
+
+        let reopen_update = IssueUpdate {
+            status: Some(Status::Open),
+            closed_at: Some(None),
+            close_reason: Some(None),
+            closed_by_session: Some(None),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-r1", &reopen_update, "tester")
+            .unwrap();
+
+        let events = storage.get_events("bd-r1", 10).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == EventType::Reopened)
+        );
     }
 
     #[test]
