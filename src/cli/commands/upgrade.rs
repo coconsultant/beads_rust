@@ -259,8 +259,10 @@ fn asset_target_name() -> &'static str {
     match self_update::get_target() {
         "x86_64-apple-darwin" => "darwin_amd64",
         "aarch64-apple-darwin" => "darwin_arm64",
-        "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" => "linux_amd64",
-        "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux-musl" => "linux_arm64",
+        "x86_64-unknown-linux-gnu" => "linux_amd64",
+        "x86_64-unknown-linux-musl" => "linux_musl_amd64",
+        "aarch64-unknown-linux-gnu" => "linux_arm64",
+        "aarch64-unknown-linux-musl" => "linux_musl_arm64",
         "x86_64-pc-windows-msvc" | "x86_64-pc-windows-gnu" => "windows_amd64",
         other => other, // fall back to the raw triple for unknown targets
     }
