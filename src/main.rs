@@ -1,5 +1,5 @@
 use beads_rust::cli::commands;
-use beads_rust::cli::{Cli, Commands};
+use beads_rust::cli::{Cli, Commands, OutputFormat};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
@@ -144,11 +144,22 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Close(_)
         | Commands::Reopen(_)
         | Commands::Q(_)
-        | Commands::Dep { .. }
-        | Commands::Label { .. }
-        | Commands::Comments(_)
         | Commands::Defer(_)
         | Commands::Undefer(_) => true,
+        Commands::Dep { command } => matches!(
+            command,
+            beads_rust::cli::DepCommands::Add(_) | beads_rust::cli::DepCommands::Remove(_)
+        ),
+        Commands::Label { command } => matches!(
+            command,
+            beads_rust::cli::LabelCommands::Add(_)
+                | beads_rust::cli::LabelCommands::Remove(_)
+                | beads_rust::cli::LabelCommands::Rename(_)
+        ),
+        Commands::Comments(args) => matches!(
+            args.command.as_ref(),
+            Some(beads_rust::cli::CommentCommands::Add(_))
+        ),
         Commands::Epic { command } => matches!(
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
@@ -225,8 +236,40 @@ const fn command_requests_robot_json(cmd: &Commands) -> bool {
     }
 }
 
-const fn should_render_errors_as_json(cli: &Cli) -> bool {
-    cli.json || command_requests_robot_json(&cli.command)
+fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
+    match cmd {
+        Commands::List(args) => args.format,
+        Commands::Search(args) => args.filters.format,
+        Commands::Show(args) => args.format.map(Into::into),
+        Commands::Ready(args) => args.format.map(Into::into),
+        Commands::Blocked(args) => args.format.map(Into::into),
+        Commands::Stats(args) | Commands::Status(args) => args.format.map(Into::into),
+        Commands::Schema(args) => args.format.map(Into::into),
+        Commands::Dep { command } => match command {
+            beads_rust::cli::DepCommands::List(args) => args.format.map(Into::into),
+            beads_rust::cli::DepCommands::Tree(_)
+            | beads_rust::cli::DepCommands::Add(_)
+            | beads_rust::cli::DepCommands::Remove(_)
+            | beads_rust::cli::DepCommands::Cycles(_) => None,
+        },
+        _ => None,
+    }
+}
+
+fn should_render_errors_as_json_with_env(
+    cli: &Cli,
+    env_output_format: Option<OutputFormat>,
+) -> bool {
+    cli.json
+        || command_requests_robot_json(&cli.command)
+        || matches!(
+            command_requested_output_format(&cli.command).or(env_output_format),
+            Some(OutputFormat::Json)
+        )
+}
+
+fn should_render_errors_as_json(cli: &Cli) -> bool {
+    should_render_errors_as_json_with_env(cli, OutputFormat::from_env())
 }
 
 /// Run auto-import before read-only commands when JSONL is newer.
@@ -343,13 +386,14 @@ fn run_auto_flush(overrides: &config::CliOverrides) {
 
 /// Handle errors with structured output support.
 ///
-/// When --json is set or stdout is not a TTY, outputs structured JSON to stderr.
+/// When JSON output is explicitly requested or stdout is not a TTY, outputs
+/// structured JSON to stderr.
 /// Otherwise, outputs human-readable error with optional color.
 fn handle_error(err: &BeadsError, json_mode: bool) -> ! {
     let structured = StructuredError::from_error(err);
     let exit_code = structured.code.exit_code();
 
-    // Determine output mode: JSON if --json flag or stdout is not a terminal
+    // Determine output mode: JSON if requested or stdout is not a terminal
     let use_json = json_mode || !io::stdout().is_terminal();
 
     if use_json {
@@ -473,5 +517,43 @@ mod tests {
         let list_cmd = Commands::List(beads_rust::cli::ListArgs::default());
         assert!(is_mutating_command(&create_cmd));
         assert!(!is_mutating_command(&list_cmd));
+    }
+
+    #[test]
+    fn is_mutating_command_distinguishes_read_only_subcommands() {
+        let dep_list = Cli::parse_from(["br", "dep", "list", "bd-123"]).command;
+        let dep_add = Cli::parse_from(["br", "dep", "add", "bd-123", "bd-456"]).command;
+        let label_list = Cli::parse_from(["br", "label", "list"]).command;
+        let label_add = Cli::parse_from(["br", "label", "add", "bd-123", "--label", "ops"]).command;
+        let comments_list = Cli::parse_from(["br", "comments", "bd-123"]).command;
+        let comments_add = Cli::parse_from(["br", "comments", "add", "bd-123", "hello"]).command;
+
+        assert!(!is_mutating_command(&dep_list));
+        assert!(is_mutating_command(&dep_add));
+        assert!(!is_mutating_command(&label_list));
+        assert!(is_mutating_command(&label_add));
+        assert!(!is_mutating_command(&comments_list));
+        assert!(is_mutating_command(&comments_add));
+    }
+
+    #[test]
+    fn should_render_errors_as_json_when_command_requests_json_format() {
+        let cli = Cli::parse_from(["br", "list", "--format", "json"]);
+        assert!(should_render_errors_as_json_with_env(&cli, None));
+    }
+
+    #[test]
+    fn should_render_errors_as_json_when_env_requests_json_format() {
+        let cli = Cli::parse_from(["br", "history", "list"]);
+        assert!(should_render_errors_as_json_with_env(
+            &cli,
+            Some(OutputFormat::Json)
+        ));
+    }
+
+    #[test]
+    fn should_not_render_errors_as_json_without_json_request() {
+        let cli = Cli::parse_from(["br", "history", "list"]);
+        assert!(!should_render_errors_as_json_with_env(&cli, None));
     }
 }

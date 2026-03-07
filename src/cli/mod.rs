@@ -3,12 +3,14 @@
 use clap::builder::StyledStr;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config;
@@ -73,6 +75,7 @@ const STATUS_CANDIDATES: &[(&str, &str)] = &[
     ("in_progress", "In progress"),
     ("blocked", "Blocked"),
     ("deferred", "Deferred"),
+    ("draft", "Draft"),
     ("closed", "Closed"),
     ("tombstone", "Deleted"),
     ("pinned", "Pinned"),
@@ -84,6 +87,7 @@ const STATUS_WITH_ALL_CANDIDATES: &[(&str, &str)] = &[
     ("in_progress", "In progress"),
     ("blocked", "Blocked"),
     ("deferred", "Deferred"),
+    ("draft", "Draft"),
     ("closed", "Closed"),
     ("tombstone", "Deleted"),
     ("pinned", "Pinned"),
@@ -199,11 +203,46 @@ fn add_layer_keys(keys: &mut BTreeSet<String>, layer: &config::ConfigLayer) {
     keys.extend(layer.startup.keys().cloned());
 }
 
-fn build_completion_index() -> CompletionIndex {
-    let Ok(beads_dir) = config::discover_beads_dir(None) else {
-        return CompletionIndex::default();
+fn resolve_completion_paths_for_beads_dir(beads_dir: &Path) -> Option<config::ConfigPaths> {
+    config::resolve_paths(beads_dir, None).ok()
+}
+
+fn completion_paths() -> Option<config::ConfigPaths> {
+    let beads_dir = config::discover_beads_dir(None).ok()?;
+    resolve_completion_paths_for_beads_dir(&beads_dir)
+}
+
+fn saved_queries_from_db(db_path: &Path) -> BTreeSet<String> {
+    let mut saved_queries = BTreeSet::new();
+    if !db_path.is_file() {
+        return saved_queries;
+    }
+
+    let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
+        return saved_queries;
     };
-    let Ok(paths) = config::resolve_paths(&beads_dir, None) else {
+    let _ = conn.execute("PRAGMA busy_timeout=0");
+
+    let Ok(rows) = conn.query("SELECT key FROM config") else {
+        return saved_queries;
+    };
+
+    for row in &rows {
+        let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        if let Some(name) = key.strip_prefix(SAVED_QUERY_PREFIX)
+            && !name.trim().is_empty()
+        {
+            saved_queries.insert(name.to_string());
+        }
+    }
+
+    saved_queries
+}
+
+fn build_completion_index() -> CompletionIndex {
+    let Some(paths) = completion_paths() else {
         return CompletionIndex::default();
     };
     let Ok(file) = File::open(&paths.jsonl_path) else {
@@ -280,26 +319,11 @@ fn build_config_index() -> CompletionConfigIndex {
     }
     add_layer_keys(&mut keys, &config::ConfigLayer::from_env());
 
-    if let Ok(beads_dir) = config::discover_beads_dir(None) {
-        if let Ok(project) = config::load_project_config(&beads_dir) {
+    if let Some(paths) = completion_paths() {
+        if let Ok(project) = config::load_project_config(&paths.beads_dir) {
             add_layer_keys(&mut keys, &project);
         }
-        if let Ok(storage_ctx) =
-            config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
-        {
-            if let Ok(db_layer) = config::ConfigLayer::from_db(&storage_ctx.storage) {
-                add_layer_keys(&mut keys, &db_layer);
-            }
-            if let Ok(map) = storage_ctx.storage.get_all_config() {
-                for key in map.keys() {
-                    if let Some(name) = key.strip_prefix(SAVED_QUERY_PREFIX)
-                        && !name.trim().is_empty()
-                    {
-                        saved_queries.insert(name.to_string());
-                    }
-                }
-            }
-        }
+        saved_queries.extend(saved_queries_from_db(&paths.db_path));
     }
 
     CompletionConfigIndex {
@@ -2425,7 +2449,9 @@ pub struct AgentsArgs {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands};
+    use crate::storage::sqlite::SqliteStorage;
     use clap::Parser;
+    use tempfile::TempDir;
 
     #[test]
     fn test_list_limit_defaults_to_50() {
@@ -2443,5 +2469,27 @@ mod tests {
             Commands::List(args) => assert_eq!(args.limit, Some(0)),
             _ => panic!("expected list command"),
         }
+    }
+
+    #[test]
+    fn test_saved_queries_from_db_reads_saved_query_names_without_config_scan() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("open db");
+        storage
+            .set_config("saved_query:mine", r#"{"name":"mine"}"#)
+            .expect("save query");
+        storage
+            .set_config("saved_query:stale", r#"{"name":"stale"}"#)
+            .expect("save query");
+        storage
+            .set_config("ui.theme", "amber")
+            .expect("save regular config");
+
+        let saved_queries = super::saved_queries_from_db(&db_path);
+        assert_eq!(
+            saved_queries.into_iter().collect::<Vec<_>>(),
+            vec!["mine".to_string(), "stale".to_string()]
+        );
     }
 }

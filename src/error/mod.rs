@@ -235,10 +235,12 @@ impl BeadsError {
             Self::InvalidPriority { .. } => {
                 Some("Use a priority between 0 (critical) and 4 (backlog)")
             }
-            Self::InvalidStatus { .. } => {
-                Some("Valid statuses: open, in_progress, blocked, deferred, closed")
+            Self::InvalidStatus { .. } => Some(
+                "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned",
+            ),
+            Self::InvalidType { .. } => {
+                Some("Valid types: task, bug, feature, epic, chore, docs, question")
             }
-            Self::InvalidType { .. } => Some("Valid types: task, bug, feature, epic, chore"),
             _ => None,
         }
     }
@@ -320,6 +322,16 @@ mod tests {
             matches: vec!["bd-abc".to_string(), "bd-abd".to_string()],
         };
         assert_eq!(err.suggestion(), Some("Provide more characters of the ID"));
+
+        let err = BeadsError::InvalidStatus {
+            status: "dra".to_string(),
+        };
+        assert_eq!(
+            err.suggestion(),
+            Some(
+                "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned",
+            )
+        );
     }
 
     #[test]

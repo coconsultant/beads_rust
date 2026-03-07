@@ -1201,7 +1201,7 @@ pub fn load_config(
     // is missing the stored prefix (e.g. after auto-rebuild).
     // Uses a fast single-line read (not full-file scan) since this runs on
     // every command.
-    let jsonl_path = beads_dir.join("issues.jsonl");
+    let jsonl_path = resolve_paths(beads_dir, cli.db.as_ref())?.jsonl_path;
     let mut jsonl_inferred = ConfigLayer::default();
     if let Some(prefix) = first_prefix_from_jsonl(&jsonl_path)? {
         jsonl_inferred
@@ -1309,7 +1309,9 @@ pub fn external_projects_from_layer(
 ) -> HashMap<String, PathBuf> {
     let base_dir = beads_dir.parent().unwrap_or(beads_dir);
     let mut map = HashMap::new();
-    let iter = layer.runtime.iter().chain(layer.startup.iter());
+    // Startup keys are lower precedence than runtime keys in merged config.
+    // Insert startup first so runtime values win on duplicate project names.
+    let iter = layer.startup.iter().chain(layer.runtime.iter());
 
     for (key, value) in iter {
         let key_lower = key.to_lowercase();
@@ -2262,6 +2264,56 @@ routing:
 
         let actor = actor_from_layer(&layer).expect("actor");
         assert_eq!(actor, "test_actor");
+    }
+
+    #[test]
+    fn external_projects_runtime_mapping_overrides_startup_mapping() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut layer = ConfigLayer::default();
+        layer.startup.insert(
+            "external_projects.shared".to_string(),
+            "startup-path".to_string(),
+        );
+        layer.runtime.insert(
+            "external_projects.shared".to_string(),
+            "runtime-path".to_string(),
+        );
+
+        let projects = external_projects_from_layer(&layer, &beads_dir);
+        assert_eq!(
+            projects.get("shared"),
+            Some(&temp.path().join("runtime-path")),
+            "Runtime config should override lower-precedence startup config"
+        );
+    }
+
+    #[test]
+    fn resolved_jsonl_path_drives_prefix_inference() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"custom.jsonl"}"#,
+        )
+        .expect("write metadata");
+        write_single_issue_jsonl(&beads_dir.join("custom.jsonl"), "br-abc123", "custom issue");
+
+        let paths = resolve_paths(&beads_dir, None).expect("resolve paths");
+        assert_eq!(
+            paths.jsonl_path,
+            beads_dir.join("custom.jsonl"),
+            "Metadata override should determine the active JSONL path"
+        );
+        assert_eq!(
+            first_prefix_from_jsonl(&paths.jsonl_path).expect("infer prefix"),
+            Some("br".to_string()),
+            "Prefix inference should read from the resolved JSONL path"
+        );
     }
 
     #[test]

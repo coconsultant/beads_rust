@@ -405,7 +405,10 @@ impl StructuredError {
         let hint = if let Some(detected) = detect_status_intent(provided) {
             Some(format!("Did you mean --status {detected}?"))
         } else {
-            Some("Valid statuses: open, in_progress, blocked, deferred, closed".to_string())
+            Some(
+                "Valid statuses: open, in_progress, blocked, deferred, draft, closed, tombstone, pinned"
+                    .to_string(),
+            )
         };
 
         let context = json!({
@@ -428,7 +431,7 @@ impl StructuredError {
         let hint = if let Some(detected) = detect_type_intent(provided) {
             Some(format!("Did you mean --type {detected}?"))
         } else {
-            Some("Valid types: task, bug, feature, epic, chore".to_string())
+            Some("Valid types: task, bug, feature, epic, chore, docs, question".to_string())
         };
 
         let context = json!({
@@ -674,8 +677,10 @@ static VALID_STATUSES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "in_progress",
         "blocked",
         "deferred",
+        "draft",
         "closed",
         "tombstone",
+        "pinned",
     ]
     .into_iter()
     .collect()
@@ -683,9 +688,11 @@ static VALID_STATUSES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 
 /// Valid issue type values (matching bd conformance).
 static VALID_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    ["task", "bug", "feature", "epic", "chore"]
-        .into_iter()
-        .collect()
+    [
+        "task", "bug", "feature", "epic", "chore", "docs", "question",
+    ]
+    .into_iter()
+    .collect()
 });
 
 /// Status synonyms for intent detection.
@@ -992,6 +999,7 @@ mod tests {
         assert_eq!(detect_status_intent("done"), Some("closed"));
         assert_eq!(detect_status_intent("wip"), Some("in_progress"));
         assert_eq!(detect_status_intent("OPEN"), Some("open"));
+        assert_eq!(detect_status_intent("draft"), Some("draft"));
         assert_eq!(detect_status_intent("op"), Some("open")); // Prefix match
         assert_eq!(detect_status_intent("xyz"), None);
     }
@@ -1001,6 +1009,7 @@ mod tests {
         assert_eq!(detect_type_intent("story"), Some("feature"));
         assert_eq!(detect_type_intent("defect"), Some("bug"));
         assert_eq!(detect_type_intent("TASK"), Some("task"));
+        assert_eq!(detect_type_intent("docs"), Some("docs"));
         assert_eq!(detect_type_intent("xyz"), None);
     }
 

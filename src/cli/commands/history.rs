@@ -11,6 +11,12 @@ use std::path::{Component, Path, PathBuf};
 /// Result type for diff status: (status_string, diff_available, optional_size_tuple).
 type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffCommandStatus {
+    Identical,
+    Different,
+}
+
 /// Execute the history command.
 ///
 /// # Errors
@@ -48,6 +54,7 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
                     .to_string();
                 json!({
                     "filename": filename,
+                    "target": entry.target_path.display().to_string(),
                     "size_bytes": entry.size,
                     "size": format_size(entry.size),
                     "timestamp": entry.timestamp.to_rfc3339(),
@@ -90,6 +97,7 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
 
         table = table
             .with_column(Column::new("Filename").min_width(20).max_width(40))
+            .with_column(Column::new("Target").min_width(24).max_width(56))
             .with_column(Column::new("Size").min_width(8).max_width(12))
             .with_column(Column::new("Timestamp").min_width(20).max_width(26));
 
@@ -100,10 +108,12 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            let target = entry.target_path.display().to_string();
             let size = format_size(entry.size);
             let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string();
             let row = Row::new(vec![
                 Cell::new(Text::styled(filename, theme.emphasis.clone())),
+                Cell::new(Text::new(target)),
                 Cell::new(Text::new(size)),
                 Cell::new(Text::styled(timestamp, theme.timestamp.clone())),
             ]);
@@ -113,14 +123,18 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
         ctx.render(&table);
     } else {
         println!("Backups in {}:", history_dir.display());
-        println!("{:<30} {:<10} {:<20}", "FILENAME", "SIZE", "TIMESTAMP");
-        println!("{}", "-".repeat(62));
+        println!(
+            "{:<30} {:<36} {:<10} {:<20}",
+            "FILENAME", "TARGET", "SIZE", "TIMESTAMP"
+        );
+        println!("{}", "-".repeat(100));
 
         for entry in backups {
             let filename = entry.path.file_name().unwrap_or_default().to_string_lossy();
+            let target = entry.target_path.display();
             let size = format_size(entry.size);
             let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-            println!("{filename:<30} {size:<10} {timestamp:<20}");
+            println!("{filename:<30} {target:<36} {size:<10} {timestamp:<20}");
         }
     }
 
@@ -195,16 +209,16 @@ fn diff_backup(
         .status();
 
     match status {
-        Ok(s) => {
-            if s.success() {
+        Ok(s) => match classify_diff_exit(s.success(), s.code())? {
+            DiffCommandStatus::Identical => {
                 if ctx.is_rich() {
                     ctx.success("Files are identical.");
                 } else {
                     println!("Files are identical.");
                 }
             }
-            // diff returns 1 if differences found, which is fine/expected.
-        }
+            DiffCommandStatus::Different => {}
+        },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let current_size = std::fs::metadata(&current_path)?.len();
             let backup_size = std::fs::metadata(&backup_path)?.len();
@@ -263,6 +277,9 @@ fn restore_backup(
         )));
     }
 
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let temp_path = target_path.with_file_name(format!("{target_name}.restore.tmp"));
     std::fs::copy(&backup_path, &temp_path)?;
     std::fs::rename(&temp_path, &target_path)?;
@@ -354,33 +371,37 @@ fn diff_status_for_json(current_path: &Path, backup_path: &Path) -> Result<DiffS
         .output();
 
     match output {
-        Ok(out) => {
-            if out.status.success() {
-                Ok(("identical", true, None))
-            } else if out.status.code() == Some(1) {
-                Ok(("different", true, None))
-            } else {
-                Ok(("error", true, None))
-            }
-        }
+        Ok(out) => match classify_diff_exit(out.status.success(), out.status.code())? {
+            DiffCommandStatus::Identical => Ok(("identical", true, None)),
+            DiffCommandStatus::Different => Ok(("different", true, None)),
+        },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let current_size = std::fs::metadata(current_path)?.len();
             let backup_size = std::fs::metadata(backup_path)?.len();
             Ok(("diff_unavailable", false, Some((current_size, backup_size))))
         }
-        Err(_) => Ok(("error", false, None)),
+        Err(err) => Err(BeadsError::Config(format!("Failed to run diff: {err}"))),
     }
+}
+
+fn classify_diff_exit(success: bool, code: Option<i32>) -> Result<DiffCommandStatus> {
+    if success {
+        return Ok(DiffCommandStatus::Identical);
+    }
+    if code == Some(1) {
+        return Ok(DiffCommandStatus::Different);
+    }
+
+    let detail = code.map_or_else(
+        || "diff terminated without an exit code".to_string(),
+        |value| format!("diff exited with status {value}"),
+    );
+    Err(BeadsError::Config(format!("Failed to run diff: {detail}")))
 }
 
 fn current_jsonl_path_for_backup(beads_dir: &Path, filename: &str) -> Result<PathBuf> {
     let backup_name = validated_backup_filename(filename)?;
-    let Some((stem, _timestamp)) = history::parse_backup_filename(&backup_name) else {
-        return Err(BeadsError::Config(format!(
-            "Invalid backup filename format: {backup_name}"
-        )));
-    };
-
-    Ok(beads_dir.join(format!("{stem}.jsonl")))
+    history::resolve_backup_target_path(beads_dir, &beads_dir.join(".br_history").join(backup_name))
 }
 
 fn validated_backup_filename(filename: &str) -> Result<String> {
@@ -471,6 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_diff_exit_rejects_real_diff_failures() {
+        let err = classify_diff_exit(false, Some(2)).unwrap_err();
+
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("diff exited with status 2")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_restore_backup_uses_backup_stem_target_path() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path();
@@ -489,6 +520,81 @@ mod tests {
             "new-state\n"
         );
         assert!(!beads_dir.join("issues.jsonl").exists());
+    }
+
+    #[test]
+    fn test_current_jsonl_path_for_backup_reads_target_metadata() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let external_target = external_dir.join("issues.jsonl");
+        fs::write(&external_target, "external-state\n").unwrap();
+
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &external_target).unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+
+        let resolved = current_jsonl_path_for_backup(&beads_dir, &backup_name).unwrap();
+        assert_eq!(resolved, external_target);
+    }
+
+    #[test]
+    fn test_restore_backup_recreates_missing_target_parent_directories() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let nested_target = beads_dir.join("snapshots").join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(nested_target.parent().unwrap()).unwrap();
+        fs::write(&nested_target, "nested-state\n").unwrap();
+
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &nested_target).unwrap();
+
+        fs::remove_dir_all(nested_target.parent().unwrap()).unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        restore_backup(&beads_dir, &history_dir, &backup_name, true, &ctx).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&nested_target).unwrap(),
+            "nested-state\n"
+        );
     }
 
     #[test]

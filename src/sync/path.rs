@@ -467,37 +467,53 @@ pub fn validate_sync_path_with_external(
     if allow_external {
         // Log the external path usage (safety invariant PC-2)
         tracing::info!(path = %path.display(), "Using external JSONL path (--allow-external-jsonl)");
-
-        // Still validate it's a JSONL file
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        // Case-sensitive check is intentional: JSONL files should use lowercase .jsonl extension
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
-        if !file_name.ends_with(".jsonl") && !file_name.ends_with(".jsonl.tmp") {
-            return Err(BeadsError::Config(format!(
-                "External path '{}' must be a .jsonl file",
-                path.display()
-            )));
-        }
-
-        // Check for traversal attempts even in external paths
-        for component in path.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                return Err(BeadsError::Config(format!(
-                    "Path '{}' contains traversal sequences",
-                    path.display()
-                )));
-            }
-        }
-
-        return Ok(());
+        return validate_external_jsonl_path(path);
     }
 
     // Standard validation for paths within .beads/
     require_valid_sync_path(path, beads_dir)
+}
+
+fn validate_external_jsonl_path(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Case-sensitive check is intentional: JSONL files should use lowercase .jsonl extension
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    if !file_name.ends_with(".jsonl") && !file_name.ends_with(".jsonl.tmp") {
+        return Err(BeadsError::Config(format!(
+            "External path '{}' must be a .jsonl file",
+            path.display()
+        )));
+    }
+
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(BeadsError::Config(format!(
+                "Path '{}' contains traversal sequences",
+                path.display()
+            )));
+        }
+    }
+
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(BeadsError::Config(format!(
+                "External path '{}' must not be a symlink",
+                path.display()
+            )));
+        }
+        if !metadata.is_file() {
+            return Err(BeadsError::Config(format!(
+                "External path '{}' must be a regular file",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Require that a path is safe for destructive sync operations (delete/overwrite).
@@ -884,6 +900,35 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_sync_path_with_external_rejects_symlinked_jsonl() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let outside_target = temp.path().join("secret.txt");
+        std::fs::write(&outside_target, "secret data").expect("write");
+
+        let symlink_path = temp.path().join("outside.jsonl");
+        symlink(&outside_target, &symlink_path).expect("create symlink");
+
+        let result = validate_sync_path_with_external(&symlink_path, &beads_dir, true);
+        assert!(
+            result.is_err(),
+            "External symlinked JSONL paths should be rejected"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must not be a symlink"),
+            "Error should explain why the external path was rejected"
+        );
+    }
+
     #[test]
     fn test_validation_logs_rejection() {
         // This test verifies the logging behavior by checking the return value
@@ -933,6 +978,19 @@ mod tests {
         assert!(
             result.is_err(),
             "External non-JSONL overwrite should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_safe_overwrite_rejects_external_directory_named_jsonl() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let path = temp.path().join("outside.jsonl");
+        std::fs::create_dir_all(&path).expect("create directory");
+
+        let result = require_safe_sync_overwrite_path(&path, &beads_dir, true, "overwrite");
+        assert!(
+            result.is_err(),
+            "External directories should be rejected even if they look like JSONL files"
         );
     }
 
