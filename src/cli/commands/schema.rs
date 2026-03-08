@@ -4,7 +4,9 @@
 //! This is intended for AI agents and tooling that want stable schemas without
 //! reading source code.
 
-use crate::cli::{OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic};
+use crate::cli::{
+    OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
+};
 use crate::error::Result;
 use crate::format::{
     BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics, TreeNode,
@@ -55,7 +57,11 @@ pub fn execute(
     cli: &config::CliOverrides,
     outer_ctx: &OutputContext,
 ) -> Result<()> {
-    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), false);
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        args.format,
+        outer_ctx.inherited_output_mode(),
+        false,
+    );
     let quiet = cli.quiet.unwrap_or(false);
 
     // Schema output is always machine-readable; for text mode we print pretty JSON.

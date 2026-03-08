@@ -2,7 +2,9 @@
 //!
 //! Shows issues ready to work on: unblocked, not deferred, not pinned, not ephemeral.
 
-use crate::cli::{OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic};
+use crate::cli::{
+    OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic_with_outer_mode,
+};
 use crate::config;
 use crate::error::Result;
 use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_title};
@@ -19,6 +21,7 @@ use unicode_width::UnicodeWidthStr;
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or the query fails.
+#[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &ReadyArgs,
     _json: bool,
@@ -38,7 +41,11 @@ pub fn execute(
     } else {
         None
     };
-    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        args.format,
+        outer_ctx.inherited_output_mode(),
+        args.robot,
+    );
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 

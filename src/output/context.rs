@@ -1,5 +1,5 @@
 use super::Theme;
-use crate::cli::{Cli, OutputFormat};
+use crate::cli::{Cli, InheritedOutputMode, OutputFormat};
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use std::io::{self, IsTerminal, Write};
@@ -162,6 +162,15 @@ impl OutputContext {
     }
     pub fn is_plain(&self) -> bool {
         self.mode == OutputMode::Plain
+    }
+
+    pub const fn inherited_output_mode(&self) -> InheritedOutputMode {
+        match self.mode {
+            OutputMode::Json => InheritedOutputMode::Json,
+            OutputMode::Toon => InheritedOutputMode::Toon,
+            OutputMode::Quiet => InheritedOutputMode::Quiet,
+            OutputMode::Rich | OutputMode::Plain => InheritedOutputMode::None,
+        }
     }
 
     /// Get terminal width (lazy-initialized).

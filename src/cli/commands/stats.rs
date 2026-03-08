@@ -3,7 +3,7 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
-use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic};
+use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::Result;
 use crate::format::{
@@ -37,7 +37,11 @@ pub fn execute(
     let storage = &storage_ctx.storage;
     let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
     let use_color = config::should_use_color(&config_layer);
-    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        args.format,
+        outer_ctx.inherited_output_mode(),
+        args.robot,
+    );
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 

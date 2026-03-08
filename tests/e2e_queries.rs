@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -265,6 +265,42 @@ fn e2e_queries_ready_stale_count_search() {
     assert!(stale_json.len() >= 2);
     assert!(stale_json.iter().any(|item| item["id"] == blocker_id));
     assert!(stale_json.iter().any(|item| item["id"] == blocked_id));
+}
+
+#[test]
+fn e2e_query_run_inherits_env_json_output() {
+    let _log = common::test_log("e2e_query_run_inherits_env_json_output");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Env query bug"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let save = run_br(
+        &workspace,
+        ["query", "save", "env-open", "--status", "open"],
+        "query_save_env_open",
+    );
+    assert!(save.status.success(), "query save failed: {}", save.stderr);
+
+    let run = run_br_with_env(
+        &workspace,
+        ["query", "run", "env-open"],
+        [("BR_OUTPUT_FORMAT", "json")],
+        "query_run_env_json",
+    );
+    assert!(
+        run.status.success(),
+        "query run with BR_OUTPUT_FORMAT=json failed: {}",
+        run.stderr
+    );
+
+    let payload = extract_json_payload(&run.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON query output");
+    assert_eq!(json.len(), 1);
+    assert_eq!(json[0]["title"], "Env query bug");
 }
 
 /// E2E tests for stats command - text and JSON output.

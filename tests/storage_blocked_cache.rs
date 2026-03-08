@@ -724,9 +724,8 @@ fn deep_parent_child_chain_blocking() {
 /// propagation reaches every descendant.
 #[test]
 fn deep_chain_beyond_50_levels_blocks_all_descendants() {
-    let mut storage = test_db();
-
     const CHAIN_LEN: usize = 75;
+    let mut storage = test_db();
 
     // Create the blocker issue that will block the root of the chain
     let blocker = fixtures::issue("deep75-blocker");

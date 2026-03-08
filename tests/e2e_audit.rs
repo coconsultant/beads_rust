@@ -9,6 +9,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::harness::parse_created_id;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -436,6 +437,36 @@ fn e2e_audit_label_without_label_fails() {
     info!("e2e_audit_label_without_label_fails: done");
 }
 
+#[test]
+fn e2e_audit_label_missing_parent_fails() {
+    common::init_test_logging();
+    info!("e2e_audit_label_missing_parent_fails: start");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let label = run_br(
+        &workspace,
+        ["audit", "label", "int-missing", "--label", "bad"],
+        "label_missing_parent",
+    );
+    assert!(
+        !label.status.success(),
+        "label with missing parent should fail"
+    );
+    let combined = format!("{}{}", label.stdout, label.stderr);
+    assert!(
+        combined.contains("not found") || combined.contains("entry_id"),
+        "error should mention missing parent entry: {combined}"
+    );
+    assert!(
+        read_interactions(&workspace).is_empty(),
+        "dangling label must not be written"
+    );
+    info!("e2e_audit_label_missing_parent_fails: done");
+}
+
 // =============================================================================
 // EDGE CASE TESTS
 // =============================================================================
@@ -560,6 +591,64 @@ fn e2e_audit_record_via_stdin() {
     assert_eq!(entries[0]["model"], "gpt-4");
     assert_eq!(entries[0]["prompt"], "stdin test");
     info!("e2e_audit_record_via_stdin: done");
+}
+
+#[test]
+fn e2e_audit_record_quiet_suppresses_stdout() {
+    common::init_test_logging();
+    info!("e2e_audit_record_quiet_suppresses_stdout: start");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let record = run_br(
+        &workspace,
+        ["audit", "record", "--kind", "llm_call", "--quiet"],
+        "record_quiet",
+    );
+    assert!(
+        record.status.success(),
+        "quiet audit record failed: {}",
+        record.stderr
+    );
+    assert!(
+        record.stdout.trim().is_empty(),
+        "quiet audit record should not print an ID: {}",
+        record.stdout
+    );
+    assert_eq!(read_interactions(&workspace).len(), 1);
+    info!("e2e_audit_record_quiet_suppresses_stdout: done");
+}
+
+#[test]
+fn e2e_audit_summary_quiet_suppresses_stdout() {
+    common::init_test_logging();
+    info!("e2e_audit_summary_quiet_suppresses_stdout: start");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Audit summary quiet"],
+        "create_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let summary = run_br(&workspace, ["audit", "summary", "--quiet"], "summary_quiet");
+    assert!(
+        summary.status.success(),
+        "quiet audit summary failed: {}",
+        summary.stderr
+    );
+    assert!(
+        summary.stdout.trim().is_empty(),
+        "quiet audit summary should not print output: {}",
+        summary.stdout
+    );
+    info!("e2e_audit_summary_quiet_suppresses_stdout: done");
 }
 
 #[test]
@@ -701,24 +790,7 @@ fn e2e_audit_log_for_issue() {
     // Create an issue
     let create = run_br(&workspace, ["create", "Test Issue"], "create");
     assert!(create.status.success());
-    // Parse ID from output: "Created bd-123: Test Issue" or similar
-    let output = create.stdout.trim();
-    let id = output
-        .split_whitespace()
-        .find(|word| word.starts_with("bd-"))
-        .map_or_else(
-            || {
-                // Fallback: parse from "Created bd-xxx: Title" format
-                output
-                    .split(':')
-                    .next()
-                    .unwrap_or("")
-                    .replace("Created ", "")
-                    .trim()
-                    .to_string()
-            },
-            |word| word.trim_end_matches(':').to_string(),
-        );
+    let id = parse_created_id(&create.stdout);
 
     // Update it to generate events
     let update = run_br(

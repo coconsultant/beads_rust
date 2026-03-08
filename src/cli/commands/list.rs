@@ -3,7 +3,7 @@
 //! Primary discovery interface with classic filter semantics and
 //! `IssueWithCounts` JSON output. Supports text, JSON, and CSV formats.
 
-use crate::cli::{ListArgs, OutputFormat, resolve_output_format};
+use crate::cli::{ListArgs, OutputFormat, resolve_output_format_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
@@ -88,7 +88,11 @@ pub fn execute(
     };
 
     // Determine output format: --json flag overrides --format
-    let output_format = resolve_output_format(args.format, outer_ctx.is_json(), false);
+    let output_format = resolve_output_format_with_outer_mode(
+        args.format,
+        outer_ctx.inherited_output_mode(),
+        false,
+    );
 
     // Warn on stderr when results were truncated (skip for structured output)
     if truncated && !matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {

@@ -2,7 +2,7 @@
 //!
 //! Lists blocked issues from the `blocked_issues_cache`.
 
-use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic};
+use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic_with_outer_mode};
 use crate::config::{
     CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, load_config,
     open_storage_with_cli, should_use_color,
@@ -37,7 +37,11 @@ pub fn execute(
     let config_layer = load_config(&beads_dir, Some(storage), overrides)?;
     let external_db_paths = external_project_db_paths(&config_layer, &beads_dir);
     let use_color = should_use_color(&config_layer);
-    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        args.format,
+        outer_ctx.inherited_output_mode(),
+        args.robot,
+    );
     let quiet = overrides.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 

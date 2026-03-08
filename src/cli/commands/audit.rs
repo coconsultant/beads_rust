@@ -5,13 +5,14 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::EventType;
 use crate::output::{OutputContext, Theme};
+use crate::sync::require_valid_sync_path;
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -148,6 +149,10 @@ fn execute_log(
     let issue_id = &args.id;
     let events = storage_ctx.storage.get_events(issue_id, 0)?;
 
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+
     if ctx.is_json() {
         let output = AuditLogOutput {
             issue_id: issue_id.clone(),
@@ -221,6 +226,10 @@ fn execute_summary(
 
     let mut actors: Vec<_> = actor_map.into_values().collect();
     actors.sort_by_key(|b| std::cmp::Reverse(b.total));
+
+    if ctx.is_quiet() {
+        return Ok(());
+    }
 
     if ctx.is_json() {
         let output = AuditSummaryOutput {
@@ -312,7 +321,7 @@ fn record_entry(
 
     if ctx.is_json() {
         ctx.json_pretty(&output);
-    } else {
+    } else if !ctx.is_quiet() {
         println!("{id}");
     }
 
@@ -332,6 +341,16 @@ fn label_entry(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| BeadsError::validation("label", "required"))?
         .to_string();
+    let parent_id = args.entry_id.trim();
+    if parent_id.is_empty() {
+        return Err(BeadsError::validation("entry_id", "required"));
+    }
+    if !audit_entry_exists(beads_dir, parent_id)? {
+        return Err(BeadsError::validation(
+            "entry_id",
+            format!("Audit entry '{parent_id}' not found"),
+        ));
+    }
 
     let mut entry = AuditEntry {
         id: None,
@@ -345,7 +364,7 @@ fn label_entry(
         error: None,
         tool_name: None,
         exit_code: None,
-        parent_id: Some(args.entry_id.clone()),
+        parent_id: Some(parent_id.to_string()),
         label: Some(label.clone()),
         reason: clean_opt(args.reason.as_deref()),
         extra: None,
@@ -354,13 +373,13 @@ fn label_entry(
     let id = append_entry(beads_dir, &mut entry)?;
     let output = AuditLabelOutput {
         id: id.clone(),
-        parent_id: args.entry_id.clone(),
+        parent_id: parent_id.to_string(),
         label,
     };
 
     if ctx.is_json() {
         ctx.json_pretty(&output);
-    } else {
+    } else if !ctx.is_quiet() {
         println!("{id}");
     }
 
@@ -429,17 +448,57 @@ fn append_entry(beads_dir: &Path, entry: &mut AuditEntry) -> Result<String> {
     Ok(entry.id.as_ref().expect("id set before append").clone())
 }
 
+fn interactions_file_path(beads_dir: &Path) -> PathBuf {
+    beads_dir.join("interactions.jsonl")
+}
+
 fn ensure_interactions_file(beads_dir: &Path) -> Result<PathBuf> {
     if !beads_dir.exists() {
         return Err(BeadsError::NotInitialized);
     }
 
     fs::create_dir_all(beads_dir)?;
-    let path = beads_dir.join("interactions.jsonl");
+    let path = interactions_file_path(beads_dir);
+    require_valid_sync_path(&path, beads_dir)?;
     if !path.exists() {
-        fs::write(&path, b"")?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
     }
     Ok(path)
+}
+
+fn audit_entry_exists(beads_dir: &Path, entry_id: &str) -> Result<bool> {
+    let entry_id = entry_id.trim();
+    if entry_id.is_empty() {
+        return Err(BeadsError::validation("entry_id", "required"));
+    }
+
+    let path = interactions_file_path(beads_dir);
+    require_valid_sync_path(&path, beads_dir)?;
+
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: AuditEntry = serde_json::from_str(&line).map_err(|err| {
+            BeadsError::Config(format!("Failed to parse audit interaction entry: {err}"))
+        })?;
+        if entry.id.as_deref() == Some(entry_id) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn new_audit_id() -> String {
@@ -708,5 +767,37 @@ mod tests {
         assert_eq!(json["id"], "int-2b3c4d5e");
         assert_eq!(json["parent_id"], "int-aaaa1111");
         assert_eq!(json["label"], "good");
+    }
+
+    #[test]
+    fn test_audit_entry_exists_finds_existing_parent() {
+        let dir = temp_beads_dir();
+        let beads_dir = dir.path().join(".beads");
+
+        let mut entry = base_entry("llm_call");
+        let entry_id = append_entry(&beads_dir, &mut entry).expect("append interaction");
+
+        assert!(audit_entry_exists(&beads_dir, &entry_id).expect("lookup existing entry"));
+        assert!(!audit_entry_exists(&beads_dir, "int-missing").expect("lookup missing entry"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_interactions_file_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_beads_dir();
+        let beads_dir = dir.path().join(".beads");
+        let outside_dir = TempDir::new().expect("outside tempdir");
+        let outside_path = outside_dir.path().join("captured.jsonl");
+        fs::write(&outside_path, "outside").expect("write outside file");
+
+        symlink(&outside_path, beads_dir.join("interactions.jsonl")).expect("create symlink");
+
+        let err = ensure_interactions_file(&beads_dir).unwrap_err();
+        match err {
+            BeadsError::Config(_) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

@@ -69,9 +69,7 @@ pub fn execute(
 
     let output_format = resolve_output_format_with_outer_mode(
         args.filters.format,
-        outer_ctx.is_json(),
-        outer_ctx.is_toon(),
-        outer_ctx.is_quiet(),
+        outer_ctx.inherited_output_mode(),
         false,
     );
     let needs_counts = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);

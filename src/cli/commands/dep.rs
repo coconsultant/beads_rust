@@ -296,7 +296,7 @@ fn dep_remove(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn dep_list(
     args: &DepListArgs,
     storage: &SqliteStorage,
@@ -309,9 +309,7 @@ fn dep_list(
 ) -> Result<()> {
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
-        outer_ctx.is_json(),
-        outer_ctx.is_toon(),
-        outer_ctx.is_quiet(),
+        outer_ctx.inherited_output_mode(),
         false,
     );
     let ctx = OutputContext::from_output_format(output_format, quiet, no_color);

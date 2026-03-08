@@ -1318,6 +1318,41 @@ pub fn resolve_output_format(
     }
 }
 
+/// Machine-readable or quiet state inherited from an outer command context.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InheritedOutputMode {
+    None,
+    Quiet,
+    Json,
+    Toon,
+}
+
+/// Resolve effective output format while preserving an already-selected outer mode.
+///
+/// This is used by command wrappers and subcommands that inherit global output
+/// state from an existing [`OutputContext`]. Structured outer modes are carried
+/// through when no command-specific format was requested, while global quiet
+/// suppresses env-selected machine formats unless the command explicitly
+/// requested one.
+#[must_use]
+pub fn resolve_output_format_with_outer_mode(
+    requested: Option<OutputFormat>,
+    inherited_mode: InheritedOutputMode,
+    robot: bool,
+) -> OutputFormat {
+    if matches!(inherited_mode, InheritedOutputMode::Json) || robot {
+        OutputFormat::Json
+    } else if let Some(requested) = requested {
+        requested
+    } else if matches!(inherited_mode, InheritedOutputMode::Toon) {
+        OutputFormat::Toon
+    } else if matches!(inherited_mode, InheritedOutputMode::Quiet) {
+        OutputFormat::Text
+    } else {
+        OutputFormat::from_env().unwrap_or(OutputFormat::Text)
+    }
+}
+
 /// Resolve effective output format for commands without CSV support.
 #[must_use]
 pub fn resolve_output_format_basic(
@@ -1326,6 +1361,22 @@ pub fn resolve_output_format_basic(
     robot: bool,
 ) -> OutputFormat {
     let resolved = resolve_output_format(requested.map(Into::into), json, robot);
+    match resolved {
+        OutputFormat::Csv => OutputFormat::Text,
+        other => other,
+    }
+}
+
+/// Resolve effective output format for commands without CSV support while
+/// preserving an already-selected outer mode.
+#[must_use]
+pub fn resolve_output_format_basic_with_outer_mode(
+    requested: Option<OutputFormatBasic>,
+    inherited_mode: InheritedOutputMode,
+    robot: bool,
+) -> OutputFormat {
+    let resolved =
+        resolve_output_format_with_outer_mode(requested.map(Into::into), inherited_mode, robot);
     match resolved {
         OutputFormat::Csv => OutputFormat::Text,
         other => other,
@@ -2448,7 +2499,10 @@ pub struct AgentsArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
+    use super::{
+        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic,
+        resolve_output_format_basic_with_outer_mode, resolve_output_format_with_outer_mode,
+    };
     use crate::storage::sqlite::SqliteStorage;
     use clap::Parser;
     use tempfile::TempDir;
@@ -2491,5 +2545,29 @@ mod tests {
             saved_queries.into_iter().collect::<Vec<_>>(),
             vec!["mine".to_string(), "stale".to_string()]
         );
+    }
+
+    #[test]
+    fn test_resolve_output_format_with_outer_mode_inherits_toon() {
+        let resolved =
+            resolve_output_format_with_outer_mode(None, InheritedOutputMode::Toon, false);
+        assert_eq!(resolved, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn test_resolve_output_format_with_outer_mode_keeps_quiet_over_env_defaults() {
+        let resolved =
+            resolve_output_format_with_outer_mode(None, InheritedOutputMode::Quiet, false);
+        assert_eq!(resolved, OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_resolve_output_format_basic_with_outer_mode_honors_explicit_format() {
+        let resolved = resolve_output_format_basic_with_outer_mode(
+            Some(OutputFormatBasic::Json),
+            InheritedOutputMode::Toon,
+            false,
+        );
+        assert_eq!(resolved, OutputFormat::Json);
     }
 }
