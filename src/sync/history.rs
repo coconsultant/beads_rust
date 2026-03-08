@@ -182,18 +182,57 @@ fn backup_metadata_path(backup_path: &Path) -> PathBuf {
     backup_path.with_extension("jsonl.meta.json")
 }
 
-fn remove_backup_artifacts(backup_path: &Path) -> Result<()> {
-    fs::remove_file(backup_path).map_err(BeadsError::Io)?;
-    let metadata_path = backup_metadata_path(backup_path);
-    if metadata_path.is_file() {
-        fs::remove_file(metadata_path).map_err(BeadsError::Io)?;
+fn history_artifact_metadata(path: &Path, label: &str) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(BeadsError::Config(format!(
+                    "History {label} '{}' must not be a symlink",
+                    path.display()
+                )));
+            }
+            if !file_type.is_file() {
+                return Err(BeadsError::Config(format!(
+                    "History {label} '{}' must be a regular file",
+                    path.display()
+                )));
+            }
+            Ok(Some(metadata))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(BeadsError::Io(err)),
     }
+}
+
+fn remove_history_artifact_if_present(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() || file_type.is_file() {
+                fs::remove_file(path).map_err(BeadsError::Io)?;
+                return Ok(());
+            }
+            Err(BeadsError::Config(format!(
+                "History {label} '{}' must be a regular file",
+                path.display()
+            )))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(BeadsError::Io(err)),
+    }
+}
+
+fn remove_backup_artifacts(backup_path: &Path) -> Result<()> {
+    remove_history_artifact_if_present(backup_path, "backup file")?;
+    let metadata_path = backup_metadata_path(backup_path);
+    remove_history_artifact_if_present(&metadata_path, "backup metadata")?;
     Ok(())
 }
 
 fn read_backup_metadata(backup_path: &Path) -> Result<Option<BackupMetadata>> {
     let metadata_path = backup_metadata_path(backup_path);
-    if !metadata_path.is_file() {
+    if history_artifact_metadata(&metadata_path, "backup metadata")?.is_none() {
         return Ok(None);
     }
 
@@ -252,6 +291,10 @@ fn legacy_backup_target_path(beads_dir: &Path, backup_name: &str) -> Result<Path
     Ok(beads_dir.join(format!("{stem}.jsonl")))
 }
 
+fn invalid_metadata_target_path(backup_name: &str) -> PathBuf {
+    PathBuf::from(format!("<invalid metadata: {backup_name}>"))
+}
+
 fn backup_target_details(
     history_dir: &Path,
     backup_path: &Path,
@@ -285,12 +328,9 @@ fn backup_target_details(
                 error = %err,
                 "Ignoring unreadable history backup metadata during history rotation/listing"
             );
-            legacy_backup_target_path(beads_dir, backup_name).map_or_else(
-                |_| {
-                    let fallback = PathBuf::from(backup_name);
-                    (fallback, format!("invalid-metadata:{backup_name}"))
-                },
-                |target_path| (target_path, format!("legacy-name:{backup_name}")),
+            (
+                invalid_metadata_target_path(backup_name),
+                format!("invalid-metadata:{backup_name}"),
             )
         }
     }
@@ -303,20 +343,26 @@ fn target_key_for_path(beads_dir: &Path, target_path: &Path) -> String {
 }
 
 pub(crate) fn resolve_backup_target_path(beads_dir: &Path, backup_path: &Path) -> Result<PathBuf> {
-    let target_path = if let Some(metadata) = read_backup_metadata(backup_path)? {
-        metadata.target.resolve_path(beads_dir)
-    } else {
-        let backup_name = backup_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "Invalid backup filename format: {}",
-                    backup_path.display()
-                ))
-            })?;
-        legacy_backup_target_path(beads_dir, backup_name)?
-    };
+    let backup_name = backup_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Invalid backup filename format: {}",
+                backup_path.display()
+            ))
+        })?;
+    if parse_backup_filename(backup_name).is_none() {
+        return Err(BeadsError::Config(format!(
+            "Invalid backup filename format: {backup_name}"
+        )));
+    }
+    let metadata = read_backup_metadata(backup_path)?.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "History backup '{backup_name}' is missing target metadata and cannot be safely restored or diffed"
+        ))
+    })?;
+    let target_path = metadata.target.resolve_path(beads_dir);
 
     validate_sync_path_with_external(&target_path, beads_dir, true)?;
     Ok(target_path)
@@ -444,10 +490,6 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
         let entry = entry?;
         let path = entry.path();
 
-        if !path.is_file() {
-            continue;
-        }
-
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
@@ -469,8 +511,17 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
             continue;
         };
 
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
+        let metadata = match history_artifact_metadata(&path, "backup file") {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    backup = %path.display(),
+                    error = %err,
+                    "Ignoring unsafe history backup entry during history listing"
+                );
+                continue;
+            }
         };
         let (target_path, target_key) = backup_target_details(history_dir, &path, name);
 
@@ -569,11 +620,13 @@ pub fn prune_backups(
             let is_age_exceeded = cutoff.is_some_and(|c| entry.timestamp < c);
 
             if is_count_exceeded || is_age_exceeded {
-                if let Err(e) = remove_backup_artifacts(&entry.path) {
-                    tracing::warn!("Failed to delete backup {}: {}", entry.path.display(), e);
-                } else {
-                    deleted_count += 1;
-                }
+                remove_backup_artifacts(&entry.path).map_err(|err| {
+                    BeadsError::Config(format!(
+                        "Failed to delete backup '{}': {err}",
+                        entry.path.display()
+                    ))
+                })?;
+                deleted_count += 1;
             }
         }
     }
@@ -866,6 +919,69 @@ mod tests {
         assert_eq!(
             list_backups(history_dir, Some("archive.")).unwrap().len(),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_list_backups_ignores_symlinked_backup_files() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+        let outside = temp.path().join("outside.jsonl");
+        fs::write(&outside, "outside\n").unwrap();
+        symlink(&outside, history_dir.join("issues.20260307_120000.jsonl")).unwrap();
+
+        let backups = list_backups(history_dir, None).unwrap();
+        assert!(backups.is_empty(), "symlinked backup files must be ignored");
+    }
+
+    #[test]
+    fn test_prune_backups_returns_error_on_partial_deletion_failure() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "issue\n").unwrap();
+
+        let backup_path = history_dir.join("issues.20260307_120000_000000.jsonl");
+        fs::write(&backup_path, "backup\n").unwrap();
+        write_backup_metadata(&beads_dir, &target_path, &backup_path).unwrap();
+
+        fs::remove_file(backup_metadata_path(&backup_path)).unwrap();
+        fs::create_dir(backup_metadata_path(&backup_path)).unwrap();
+
+        let err = prune_backups(&history_dir, 0, None).unwrap_err();
+        match err {
+            BeadsError::Config(msg) => {
+                assert!(
+                    msg.contains("Failed to delete backup"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_list_backups_marks_invalid_metadata_without_guessing_target() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+        let backup_name = "issues.20260307_120000.jsonl";
+        let backup_path = history_dir.join(backup_name);
+        fs::write(&backup_path, "backup\n").unwrap();
+        fs::write(backup_metadata_path(&backup_path), "{not-json").unwrap();
+
+        let backups = list_backups(history_dir, None).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            backups[0].target_key,
+            format!("invalid-metadata:{backup_name}")
+        );
+        assert_eq!(
+            backups[0].target_path,
+            invalid_metadata_target_path(backup_name)
         );
     }
 

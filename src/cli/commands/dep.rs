@@ -2,13 +2,13 @@
 
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
-    OutputFormat, resolve_output_format_basic,
+    OutputFormat, resolve_output_format_basic_with_outer_mode,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::truncate_title;
 use crate::model::DependencyType;
-use crate::output::{OutputContext, OutputMode};
+use crate::output::{OutputContext, OutputMode, Theme};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use rich_rust::prelude::*;
@@ -53,7 +53,7 @@ pub fn execute(
             &resolver,
             &all_ids,
             &external_db_paths,
-            json,
+            ctx,
             quiet,
             !use_color,
         ),
@@ -99,10 +99,14 @@ struct DepListItem {
 /// JSON output for dep tree
 #[derive(Serialize)]
 struct TreeNode {
+    #[serde(skip_serializing)]
+    node_key: String,
     id: String,
     title: String,
     depth: usize,
     parent_id: Option<String>,
+    #[serde(skip_serializing)]
+    parent_key: Option<String>,
     priority: i32,
     status: String,
     truncated: bool,
@@ -191,6 +195,8 @@ fn dep_add(
         } else {
             ctx.json_pretty(&result);
         }
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
     } else if added {
         if ctx.is_rich() {
             // Rich mode: Show detailed visual feedback
@@ -264,6 +270,8 @@ fn dep_remove(
         } else {
             ctx.json_pretty(&result);
         }
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
     } else if removed {
         if ctx.is_rich() {
             ctx.success(&format!(
@@ -295,11 +303,17 @@ fn dep_list(
     resolver: &IdResolver,
     all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
-    json: bool,
+    outer_ctx: &OutputContext,
     quiet: bool,
     no_color: bool,
 ) -> Result<()> {
-    let output_format = resolve_output_format_basic(args.format, json, false);
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        args.format,
+        outer_ctx.is_json(),
+        outer_ctx.is_toon(),
+        outer_ctx.is_quiet(),
+        false,
+    );
     let ctx = OutputContext::from_output_format(output_format, quiet, no_color);
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
 
@@ -426,66 +440,111 @@ fn render_dep_list_rich(
     let (deps, dependents): (Vec<_>, Vec<_>) =
         items.iter().partition(|item| item.issue_id == issue_id);
 
-    let mut content = String::new();
+    let mut content = Text::new("");
 
     // Show dependencies (what this issue depends on)
     if !deps.is_empty() && matches!(direction, DepDirection::Down | DepDirection::Both) {
-        content.push_str(&format!("[bold]Depends on ({}):[/]\n", deps.len()));
-        for (i, item) in deps.iter().enumerate() {
-            let prefix = if i == deps.len() - 1 {
-                "└──"
-            } else {
-                "├──"
-            };
-            let status_indicator = format_status_indicator(&item.status);
-            content.push_str(&format!(
-                "{} {} {} {}\n",
-                prefix, item.depends_on_id, status_indicator, item.title
-            ));
-        }
+        append_dep_list_section(
+            &mut content,
+            &dep_list_section_title(true, deps.len()),
+            &deps,
+            true,
+            theme,
+        );
     }
 
     // Add separator if showing both directions
     if !deps.is_empty() && !dependents.is_empty() && matches!(direction, DepDirection::Both) {
-        content.push('\n');
+        content.append("\n");
     }
 
     // Show dependents (what depends on this issue)
     if !dependents.is_empty() && matches!(direction, DepDirection::Up | DepDirection::Both) {
-        content.push_str(&format!(
-            "[bold]Blocked by this ({}):[/]\n",
-            dependents.len()
-        ));
-        for (i, item) in dependents.iter().enumerate() {
-            let prefix = if i == dependents.len() - 1 {
-                "└──"
-            } else {
-                "├──"
-            };
-            let status_indicator = format_status_indicator(&item.status);
-            content.push_str(&format!(
-                "{} {} {} {}\n",
-                prefix, item.issue_id, status_indicator, item.title
-            ));
-        }
+        append_dep_list_section(
+            &mut content,
+            &dep_list_section_title(false, dependents.len()),
+            &dependents,
+            false,
+            theme,
+        );
     }
 
-    let panel = Panel::from_text(&content)
-        .title(Text::new(format!("Dependencies for {}", issue_id)))
+    let panel = Panel::from_rich_text(&content, ctx.width())
+        .title(Text::new(dep_list_panel_title(direction, issue_id)))
+        .box_style(theme.box_style)
         .border_style(theme.panel_border.clone());
 
     ctx.render(&panel);
 }
 
-/// Format status indicator with appropriate styling hints
-fn format_status_indicator(status: &str) -> String {
-    match status {
-        "open" => "[green][open][/]".to_string(),
-        "in_progress" => "[yellow][in-progress][/]".to_string(),
-        "closed" => "[dim][closed] ✓[/]".to_string(),
-        "blocked" => "[red][blocked][/]".to_string(),
-        _ => format!("[{}]", status),
+fn dep_list_panel_title(direction: DepDirection, issue_id: &str) -> String {
+    match direction {
+        DepDirection::Down => format!("Dependencies for {issue_id}"),
+        DepDirection::Up => format!("Dependents for {issue_id}"),
+        DepDirection::Both => format!("Dependency relations for {issue_id}"),
     }
+}
+
+fn dep_list_section_title(is_dependency_section: bool, count: usize) -> String {
+    let label = if is_dependency_section {
+        "Dependencies"
+    } else {
+        "Dependents"
+    };
+    format!("{label} ({count}):")
+}
+
+fn append_dep_list_section(
+    content: &mut Text,
+    title: &str,
+    items: &[&DepListItem],
+    use_depends_on_id: bool,
+    theme: &Theme,
+) {
+    content.append_styled(&format!("{title}\n"), theme.emphasis.clone());
+
+    for (i, item) in items.iter().enumerate() {
+        let prefix = if i == items.len() - 1 {
+            "└── "
+        } else {
+            "├── "
+        };
+        let target_id = if use_depends_on_id {
+            &item.depends_on_id
+        } else {
+            &item.issue_id
+        };
+
+        content.append_styled(prefix, theme.dimmed.clone());
+        content.append_styled(target_id, theme.issue_id.clone());
+        content.append(" ");
+        content.append_styled(&format!("({}) ", item.dep_type), theme.muted.clone());
+        append_dep_list_status(content, &item.status, theme);
+        content.append(" ");
+        content.append_styled(&item.title, theme.issue_title.clone());
+        content.append("\n");
+    }
+}
+
+fn dep_list_status_label(status: &str) -> &str {
+    match status {
+        "open" => "[open]",
+        "in_progress" => "[in-progress]",
+        "closed" => "[closed] ✓",
+        "blocked" => "[blocked]",
+        _ => status,
+    }
+}
+
+fn append_dep_list_status(content: &mut Text, status: &str, theme: &Theme) {
+    let style = match status {
+        "open" => theme.status_open.clone(),
+        "in_progress" => theme.status_in_progress.clone(),
+        "closed" => theme.status_closed.clone(),
+        "blocked" => theme.status_blocked.clone(),
+        _ => theme.dimmed.clone(),
+    };
+    content.append_styled(dep_list_status_label(status), style);
 }
 
 fn apply_external_dep_list_metadata(
@@ -512,7 +571,8 @@ fn apply_external_dep_list_metadata(
             "blocked".to_string()
         };
 
-        if item.title.is_empty() {
+        let placeholder_title = external_id.strip_prefix("external:").unwrap_or(external_id);
+        if item.title.is_empty() || item.title == placeholder_title {
             let prefix = if satisfied { "✓" } else { "⏳" };
             item.title = parse_external_dep_id(external_id).map_or_else(
                 || format!("{prefix} {external_id}"),
@@ -520,6 +580,50 @@ fn apply_external_dep_list_metadata(
             );
         }
     }
+}
+
+fn resolve_dep_tree_node_metadata(
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &crate::model::Issue,
+    node_id: &str,
+    external_statuses: &HashMap<String, bool>,
+) -> Result<(String, i32, String)> {
+    if node_id == root_id {
+        return Ok((
+            root_issue.title.clone(),
+            root_issue.priority.0,
+            root_issue.status.as_str().to_string(),
+        ));
+    }
+
+    if node_id.starts_with("external:") {
+        let satisfied = external_statuses.get(node_id).copied().unwrap_or(false);
+        let status = if satisfied { "closed" } else { "blocked" };
+        let prefix = if satisfied { "✓" } else { "⏳" };
+        let title = if let Some((project, capability)) = parse_external_dep_id(node_id) {
+            format!("{prefix} {project}:{capability}")
+        } else {
+            format!("{prefix} {node_id}")
+        };
+        return Ok((title, 2, status.to_string()));
+    }
+
+    let issue = storage.get_issue(node_id)?.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "dependency tree references missing issue {node_id}"
+        ))
+    })?;
+
+    Ok((
+        issue.title.clone(),
+        issue.priority.0,
+        issue.status.as_str().to_string(),
+    ))
+}
+
+fn dep_tree_truncated(depth: usize, max_depth: usize, dependency_count: usize) -> bool {
+    depth >= max_depth && dependency_count > 0
 }
 
 #[allow(clippy::too_many_lines)]
@@ -545,6 +649,7 @@ fn dep_tree(
         id: String,
         depth: usize,
         parent_id: Option<String>,
+        parent_key: Option<String>,
         path: Vec<String>,
     }
 
@@ -557,8 +662,10 @@ fn dep_tree(
         id: root_id.clone(),
         depth: 0,
         parent_id: None,
+        parent_key: None,
         path: Vec::new(),
     }];
+    let mut next_node_key = 0usize;
 
     while let Some(item) = queue.pop() {
         // Cycle detection: check if current ID is already in the path
@@ -566,42 +673,32 @@ fn dep_tree(
             continue;
         }
 
-        let issue = if item.id == root_id {
-            Some(root_issue.clone())
-        } else if item.id.starts_with("external:") {
-            None
-        } else {
-            storage.get_issue(&item.id)?
-        };
+        let node_key = format!("n{next_node_key}");
+        next_node_key += 1;
 
-        let (title, priority, status) = if let Some(ref issue) = issue {
-            (
-                issue.title.clone(),
-                issue.priority.0,
-                issue.status.as_str().to_string(),
-            )
-        } else if item.id.starts_with("external:") {
-            let satisfied = external_statuses.get(&item.id).copied().unwrap_or(false);
-            let status = if satisfied { "closed" } else { "blocked" };
-            let prefix = if satisfied { "✓" } else { "⏳" };
-            let title = if let Some((project, capability)) = parse_external_dep_id(&item.id) {
-                format!("{prefix} {project}:{capability}")
-            } else {
-                format!("{prefix} {}", item.id)
-            };
-            (title, 2, status.to_string())
-        } else {
-            // Missing issue
-            (item.id.clone(), 2, "unknown".to_string())
-        };
+        let (title, priority, status) = resolve_dep_tree_node_metadata(
+            storage,
+            &root_id,
+            &root_issue,
+            &item.id,
+            &external_statuses,
+        )?;
 
-        let truncated = item.depth >= args.max_depth;
+        let mut dependencies = Vec::new();
+        let truncated = if item.id.starts_with("external:") {
+            false
+        } else {
+            dependencies = storage.get_dependencies(&item.id)?;
+            dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
+        };
 
         nodes.push(TreeNode {
+            node_key: node_key.clone(),
             id: item.id.clone(),
             title,
             depth: item.depth,
             parent_id: item.parent_id.clone(),
+            parent_key: item.parent_key.clone(),
             priority,
             status,
             truncated,
@@ -611,9 +708,6 @@ fn dep_tree(
         if item.depth < args.max_depth && !item.id.starts_with("external:") {
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
-
-            // Get dependencies (issues that this one depends on)
-            let mut dependencies = storage.get_dependencies(&item.id)?;
 
             // Get full issue details for sorting
             // This is slightly inefficient (N queries), but necessary for sorting by priority.
@@ -631,6 +725,7 @@ fn dep_tree(
                     id: dep_id,
                     depth: item.depth + 1,
                     parent_id: Some(item.id.clone()),
+                    parent_key: Some(node_key.clone()),
                     path: new_path.clone(),
                 });
             }
@@ -646,26 +741,13 @@ fn dep_tree(
         return Ok(());
     }
 
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     // Mermaid format output
     if args.format.eq_ignore_ascii_case("mermaid") {
-        // Use println! directly to avoid rich_rust markup interpretation
-        println!("graph TD");
-        // Output node definitions
-        for node in &nodes {
-            // Escape quotes in title for mermaid
-            let escaped_title = node.title.replace('"', "'");
-            println!(
-                "    {}[\"{}: {} [P{}]\"]",
-                node.id, node.id, escaped_title, node.priority
-            );
-        }
-        // Output edges (parent --> child shows dependency direction)
-        for node in &nodes {
-            if let Some(ref parent_id) = node.parent_id {
-                // parent_id depends on node.id, so show parent_id --> node.id
-                println!("    {} --> {}", parent_id, node.id);
-            }
-        }
+        render_dep_tree_mermaid(&nodes);
         return Ok(());
     }
 
@@ -697,6 +779,30 @@ fn dep_tree(
     }
 
     Ok(())
+}
+
+fn sanitize_mermaid_label(text: &str) -> String {
+    text.replace('"', "'").replace(['\n', '\r'], " ")
+}
+
+fn render_dep_tree_mermaid(nodes: &[TreeNode]) {
+    // Use println! directly to avoid rich_rust markup interpretation
+    println!("graph TD");
+
+    for node in nodes {
+        let escaped_id = sanitize_mermaid_label(&node.id);
+        let escaped_title = sanitize_mermaid_label(&node.title);
+        println!(
+            "    {}[\"{}: {} [P{}]\"]",
+            node.node_key, escaped_id, escaped_title, node.priority
+        );
+    }
+
+    for node in nodes {
+        if let Some(parent_key) = node.parent_key.as_deref() {
+            println!("    {parent_key} --> {}", node.node_key);
+        }
+    }
 }
 
 /// Render dependency tree in rich mode using Tree component
@@ -762,10 +868,10 @@ fn build_tree_node_rich(
 
     let mut tree_node = rich_rust::renderables::TreeNode::new(Text::new(label));
 
-    // Find and add children (nodes whose parent_id matches this node's id)
+    // Find and add children by instance key so duplicate issue IDs stay distinct.
     for child in all_nodes
         .iter()
-        .filter(|n| n.parent_id.as_ref() == Some(&node.id))
+        .filter(|n| n.parent_key.as_ref() == Some(&node.node_key))
     {
         let child_node = build_tree_node_rich(child, all_nodes);
         tree_node = tree_node.child(child_node);
@@ -804,6 +910,10 @@ fn dep_cycles(
         } else {
             ctx.json_pretty(&result);
         }
+        return Ok(());
+    }
+
+    if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
 
@@ -1294,6 +1404,33 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_external_dep_list_metadata_rewrites_generated_placeholder_title() {
+        init_test_logging();
+        info!(
+            "test_apply_external_dep_list_metadata_rewrites_generated_placeholder_title: starting"
+        );
+        let mut items = vec![DepListItem {
+            issue_id: "bd-001".to_string(),
+            depends_on_id: "external:proj:cap".to_string(),
+            dep_type: "blocks".to_string(),
+            title: "proj:cap".to_string(),
+            status: "open".to_string(),
+            priority: 2,
+        }];
+
+        let mut statuses = HashMap::new();
+        statuses.insert("external:proj:cap".to_string(), false);
+
+        apply_external_dep_list_metadata(&mut items, &statuses);
+
+        assert_eq!(items[0].status, "blocked");
+        assert_eq!(items[0].title, "⏳ proj:cap");
+        info!(
+            "test_apply_external_dep_list_metadata_rewrites_generated_placeholder_title: assertions passed"
+        );
+    }
+
+    #[test]
     fn test_apply_external_dep_list_metadata_external_issue_id() {
         init_test_logging();
         info!("test_apply_external_dep_list_metadata_external_issue_id: starting");
@@ -1314,6 +1451,78 @@ mod tests {
         assert_eq!(items[0].status, "closed");
         assert_eq!(items[0].title, "✓ proj:cap");
         info!("test_apply_external_dep_list_metadata_external_issue_id: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_list_section_title_uses_neutral_dependents_label() {
+        init_test_logging();
+        info!("test_dep_list_section_title_uses_neutral_dependents_label: starting");
+        assert_eq!(dep_list_section_title(true, 2), "Dependencies (2):");
+        assert_eq!(dep_list_section_title(false, 3), "Dependents (3):");
+        info!("test_dep_list_section_title_uses_neutral_dependents_label: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_list_panel_title_matches_direction() {
+        init_test_logging();
+        info!("test_dep_list_panel_title_matches_direction: starting");
+        assert_eq!(
+            dep_list_panel_title(DepDirection::Down, "bd-1"),
+            "Dependencies for bd-1"
+        );
+        assert_eq!(
+            dep_list_panel_title(DepDirection::Up, "bd-1"),
+            "Dependents for bd-1"
+        );
+        assert_eq!(
+            dep_list_panel_title(DepDirection::Both, "bd-1"),
+            "Dependency relations for bd-1"
+        );
+        info!("test_dep_list_panel_title_matches_direction: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_list_status_label_formats_known_statuses() {
+        init_test_logging();
+        info!("test_dep_list_status_label_formats_known_statuses: starting");
+        assert_eq!(dep_list_status_label("open"), "[open]");
+        assert_eq!(dep_list_status_label("closed"), "[closed] ✓");
+        assert_eq!(dep_list_status_label("custom"), "custom");
+        info!("test_dep_list_status_label_formats_known_statuses: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_tree_truncated_only_when_children_are_omitted() {
+        init_test_logging();
+        info!("test_dep_tree_truncated_only_when_children_are_omitted: starting");
+        assert!(!dep_tree_truncated(2, 2, 0));
+        assert!(dep_tree_truncated(2, 2, 1));
+        assert!(!dep_tree_truncated(1, 2, 3));
+        info!("test_dep_tree_truncated_only_when_children_are_omitted: assertions passed");
+    }
+
+    #[test]
+    fn test_resolve_dep_tree_node_metadata_errors_on_missing_internal_issue() {
+        init_test_logging();
+        info!("test_resolve_dep_tree_node_metadata_errors_on_missing_internal_issue: starting");
+        let storage = SqliteStorage::open_memory().unwrap();
+        let root_issue = make_test_issue("bd-root", "Root");
+        let statuses = HashMap::new();
+
+        let error = resolve_dep_tree_node_metadata(
+            &storage,
+            "bd-root",
+            &root_issue,
+            "bd-missing",
+            &statuses,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, BeadsError::Config(_)));
+        assert!(error.to_string().contains("bd-missing"));
+        info!(
+            "test_resolve_dep_tree_node_metadata_errors_on_missing_internal_issue: assertions passed"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history;
-use crate::sync::validate_temp_file_path;
+use crate::sync::{require_safe_sync_overwrite_path, validate_temp_file_path};
 use rich_rust::prelude::*;
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
@@ -43,6 +43,29 @@ impl Drop for TempRestoreGuard {
         if !self.persist && self.path.exists() {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+fn ensure_regular_backup_file(backup_path: &Path, backup_name: &str) -> Result<()> {
+    match fs::symlink_metadata(backup_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(BeadsError::Config(format!(
+                    "History backup '{backup_name}' must not be a symlink"
+                )));
+            }
+            if !file_type.is_file() {
+                return Err(BeadsError::Config(format!(
+                    "History backup '{backup_name}' must be a regular file"
+                )));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(BeadsError::Config(format!(
+            "Backup file not found: {backup_name}"
+        ))),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -199,11 +222,7 @@ fn diff_backup(
 ) -> Result<()> {
     let backup_name = validated_backup_filename(filename)?;
     let backup_path = history_dir.join(&backup_name);
-    if !backup_path.exists() {
-        return Err(BeadsError::Config(format!(
-            "Backup file not found: {backup_name}"
-        )));
-    }
+    ensure_regular_backup_file(&backup_path, &backup_name)?;
 
     let current_path = current_jsonl_path_for_backup(beads_dir, &backup_name, active_jsonl_path)?;
     let current_name = current_path
@@ -308,11 +327,7 @@ fn restore_backup(
 ) -> Result<()> {
     let backup_name = validated_backup_filename(filename)?;
     let backup_path = history_dir.join(&backup_name);
-    if !backup_path.exists() {
-        return Err(BeadsError::Config(format!(
-            "Backup file not found: {backup_name}"
-        )));
-    }
+    ensure_regular_backup_file(&backup_path, &backup_name)?;
 
     let target_path = current_jsonl_path_for_backup(beads_dir, &backup_name, active_jsonl_path)?;
     let target_name = target_path
@@ -351,6 +366,15 @@ fn restore_backup(
     io::copy(&mut reader, &mut writer)?;
     writer.sync_all()?;
     drop(writer);
+    if force && target_path.exists() {
+        require_safe_sync_overwrite_path(
+            &target_path,
+            beads_dir,
+            true,
+            "overwrite history restore target",
+        )?;
+        fs::remove_file(&target_path)?;
+    }
     fs::rename(&temp_path, &target_path)?;
     temp_guard.persist();
 
@@ -543,35 +567,27 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_current_jsonl_path_for_backup_issues_stem() {
+    fn test_current_jsonl_path_for_backup_rejects_missing_target_metadata() {
         let temp = TempDir::new().unwrap();
-        let path = current_jsonl_path_for_backup(temp.path(), "issues.20260220_120000.jsonl", None)
-            .unwrap();
-        assert_eq!(path, temp.path().join("issues.jsonl"));
-    }
-
-    #[test]
-    fn test_current_jsonl_path_for_backup_custom_stem_with_dot() {
-        let temp = TempDir::new().unwrap();
-        let path = current_jsonl_path_for_backup(
-            temp.path(),
-            "issues.snapshot.20260220_120000.jsonl",
-            None,
+        let history_dir = temp.path().join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::write(
+            history_dir.join("issues.20260220_120000.jsonl"),
+            "backup-state\n",
         )
         .unwrap();
-        assert_eq!(path, temp.path().join("issues.snapshot.jsonl"));
-    }
 
-    #[test]
-    fn test_current_jsonl_path_for_backup_high_precision_timestamp() {
-        let temp = TempDir::new().unwrap();
-        let path = current_jsonl_path_for_backup(
-            temp.path(),
-            "issues.snapshot.20260220_120000_123456.1.jsonl",
-            None,
-        )
-        .unwrap();
-        assert_eq!(path, temp.path().join("issues.snapshot.jsonl"));
+        let err = current_jsonl_path_for_backup(temp.path(), "issues.20260220_120000.jsonl", None)
+            .unwrap_err();
+        match err {
+            BeadsError::Config(msg) => {
+                assert!(
+                    msg.contains("missing target metadata"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -610,18 +626,36 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_backup_uses_backup_stem_target_path() {
+    fn test_restore_backup_uses_metadata_target_path() {
         let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path();
+        let beads_dir = temp.path().join(".beads");
         let history_dir = beads_dir.join(".br_history");
-        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&beads_dir).unwrap();
 
-        let backup_name = "custom.20260220_120000.jsonl";
-        fs::write(history_dir.join(backup_name), "new-state\n").unwrap();
-        fs::write(beads_dir.join("custom.jsonl"), "old-state\n").unwrap();
+        let target_path = beads_dir.join("custom.jsonl");
+        fs::write(&target_path, "new-state\n").unwrap();
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+        fs::write(&target_path, "old-state\n").unwrap();
 
         let ctx = OutputContext::from_flags(false, true, true);
-        restore_backup(beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap();
+        restore_backup(&beads_dir, &history_dir, &backup_name, true, None, &ctx).unwrap();
 
         assert_eq!(
             fs::read_to_string(beads_dir.join("custom.jsonl")).unwrap(),
@@ -710,19 +744,38 @@ mod tests {
     #[test]
     fn test_restore_backup_cleans_temp_file_when_rename_fails() {
         let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path();
+        let beads_dir = temp.path().join(".beads");
         let history_dir = beads_dir.join(".br_history");
-        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&beads_dir).unwrap();
 
-        let backup_name = "issues.20260220_120000.jsonl";
-        fs::write(history_dir.join(backup_name), "restored-state\n").unwrap();
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "restored-state\n").unwrap();
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
         let target_dir = beads_dir.join("issues.jsonl");
+        fs::remove_file(&target_dir).unwrap();
         fs::create_dir_all(&target_dir).unwrap();
         fs::write(target_dir.join("occupied.txt"), "keep").unwrap();
 
         let ctx = OutputContext::from_flags(false, true, true);
         let err =
-            restore_backup(beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
+            restore_backup(&beads_dir, &history_dir, &backup_name, true, None, &ctx).unwrap_err();
         assert!(
             matches!(err, BeadsError::Io(_) | BeadsError::Config(_)),
             "unexpected error: {err}"
@@ -775,18 +828,62 @@ mod tests {
     #[test]
     fn test_diff_backup_reports_missing_current_stem_file() {
         let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path();
+        let beads_dir = temp.path().join(".beads");
         let history_dir = beads_dir.join(".br_history");
-        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&beads_dir).unwrap();
 
-        let backup_name = "custom.20260220_120000.jsonl";
-        fs::write(history_dir.join(backup_name), "backup\n").unwrap();
+        let target_path = beads_dir.join("custom.jsonl");
+        fs::write(&target_path, "backup\n").unwrap();
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+        fs::remove_file(&target_path).unwrap();
 
         let ctx = OutputContext::from_flags(false, true, true);
-        let err = diff_backup(beads_dir, &history_dir, backup_name, None, &ctx).unwrap_err();
+        let err = diff_backup(&beads_dir, &history_dir, &backup_name, None, &ctx).unwrap_err();
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Current custom.jsonl not found")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_backup_rejects_symlinked_backup_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let backup_name = "issues.20260220_120000.jsonl";
+        let outside_backup = outside_dir.join("backup.jsonl");
+        fs::write(&outside_backup, "backup\n").unwrap();
+        symlink(&outside_backup, history_dir.join(backup_name)).unwrap();
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        let err =
+            restore_backup(&beads_dir, &history_dir, backup_name, true, None, &ctx).unwrap_err();
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("must not be a symlink")),
             other => panic!("unexpected error: {other:?}"),
         }
     }

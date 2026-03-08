@@ -28,7 +28,7 @@ fn parse_created_id(stdout: &str) -> String {
 }
 
 /// Validate that a string contains valid mermaid graph syntax.
-/// Returns the list of nodes and edges parsed from the output.
+/// Returns the list of node labels and edges parsed from the output.
 fn validate_mermaid_syntax(output: &str) -> (Vec<String>, Vec<(String, String)>) {
     let lines: Vec<&str> = output.lines().collect();
 
@@ -49,12 +49,14 @@ fn validate_mermaid_syntax(output: &str) -> (Vec<String>, Vec<(String, String)>)
             continue;
         }
 
-        // Node definition: id["id: title [Pn]"]
+        // Node definition: node_key["issue_id: title [Pn]"]
         if trimmed.contains('[') && trimmed.contains(']') && !trimmed.contains("-->") {
-            // Extract the node ID (part before the bracket)
-            if let Some(bracket_pos) = trimmed.find('[') {
-                let node_id = trimmed[..bracket_pos].trim();
-                nodes.push(node_id.to_string());
+            if let (Some(label_start), Some(label_end)) =
+                (trimmed.find("[\""), trimmed.rfind("\"]"))
+                && label_end > label_start + 2
+            {
+                let label = &trimmed[label_start + 2..label_end];
+                nodes.push(label.to_string());
             }
         }
         // Edge definition: id --> id
@@ -96,7 +98,9 @@ fn e2e_dep_tree_mermaid_single_node_no_deps() {
     // Single node with no dependencies
     assert_eq!(nodes.len(), 1, "Should have exactly one node");
     assert!(
-        nodes.contains(&issue_id),
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{issue_id}: "))),
         "Node list should contain the issue"
     );
     assert!(edges.is_empty(), "Single node should have no edges");
@@ -141,9 +145,24 @@ fn e2e_dep_tree_mermaid_linear_chain() {
 
     // Should have 3 nodes
     assert_eq!(nodes.len(), 3, "Linear chain should have 3 nodes");
-    assert!(nodes.contains(&id_a), "Should contain A");
-    assert!(nodes.contains(&id_b), "Should contain B");
-    assert!(nodes.contains(&id_c), "Should contain C");
+    assert!(
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_a}: "))),
+        "Should contain A"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_b}: "))),
+        "Should contain B"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_c}: "))),
+        "Should contain C"
+    );
 
     // Should have 2 edges
     assert_eq!(edges.len(), 2, "Linear chain should have 2 edges");
@@ -225,7 +244,10 @@ fn e2e_dep_tree_mermaid_diamond_shape() {
     let (nodes, edges) = validate_mermaid_syntax(&tree.stdout);
 
     // Diamond shape: D should appear twice (once under B, once under C)
-    let d_count = nodes.iter().filter(|n| *n == &id_d).count();
+    let d_count = nodes
+        .iter()
+        .filter(|label| label.starts_with(&format!("{id_d}: ")))
+        .count();
     assert_eq!(
         d_count, 2,
         "Diamond convergence node D should appear twice in mermaid output"
@@ -281,15 +303,34 @@ fn e2e_dep_tree_mermaid_max_depth_truncation() {
 
     // Depth 0 = A, Depth 1 = B, Depth 2 = C (truncated)
     assert_eq!(nodes.len(), 3, "max-depth=2 should show 3 nodes");
-    assert!(nodes.contains(&id_a), "Should contain A");
-    assert!(nodes.contains(&id_b), "Should contain B");
-    assert!(nodes.contains(&id_c), "Should contain C (truncated)");
     assert!(
-        !nodes.contains(&id_d),
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_a}: "))),
+        "Should contain A"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_b}: "))),
+        "Should contain B"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_c}: "))),
+        "Should contain C (truncated)"
+    );
+    assert!(
+        !nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_d}: "))),
         "Should NOT contain D (beyond depth)"
     );
     assert!(
-        !nodes.contains(&id_e),
+        !nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{id_e}: "))),
         "Should NOT contain E (beyond depth)"
     );
 
@@ -332,6 +373,68 @@ fn e2e_dep_tree_mermaid_title_with_quotes() {
     );
 
     info!("e2e_dep_tree_mermaid_title_with_quotes: assertions passed");
+}
+
+#[test]
+fn e2e_dep_tree_mermaid_external_dependency_uses_safe_node_ids() {
+    common::init_test_logging();
+    info!("e2e_dep_tree_mermaid_external_dependency_uses_safe_node_ids: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Root issue"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &issue_id, "external:proj:cap"],
+        "dep_external",
+    );
+    assert!(
+        dep.status.success(),
+        "external dep add failed: {}",
+        dep.stderr
+    );
+
+    let tree = run_br(
+        &workspace,
+        ["dep", "tree", &issue_id, "--format=mermaid"],
+        "tree_mermaid_external",
+    );
+    assert!(tree.status.success(), "dep tree failed: {}", tree.stderr);
+
+    let (nodes, edges) = validate_mermaid_syntax(&tree.stdout);
+    assert_eq!(nodes.len(), 2, "Should include local and external nodes");
+    assert_eq!(
+        edges.len(),
+        1,
+        "Should have one edge to the external dependency"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|label| label.starts_with(&format!("{issue_id}: "))),
+        "Should include the local issue label"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|label| label.starts_with("external:proj:cap: ")),
+        "Should include the external dependency label"
+    );
+    assert!(
+        tree.stdout.contains("⏳ proj:cap"),
+        "Unsatisfied external dependency should retain its placeholder status label"
+    );
+    assert!(
+        !tree.stdout.contains("external:proj:cap[\""),
+        "External dependency ID should not be used directly as Mermaid node syntax"
+    );
+
+    info!("e2e_dep_tree_mermaid_external_dependency_uses_safe_node_ids: assertions passed");
 }
 
 #[test]
@@ -378,7 +481,9 @@ fn e2e_dep_tree_mermaid_vs_json_consistency() {
     for json_node in &json_nodes {
         let node_id = json_node["id"].as_str().unwrap();
         assert!(
-            mermaid_nodes.contains(&node_id.to_string()),
+            mermaid_nodes
+                .iter()
+                .any(|label| label.starts_with(&format!("{node_id}: "))),
             "Mermaid output missing node: {}",
             node_id
         );
@@ -463,8 +568,8 @@ fn e2e_dep_tree_mermaid_output_valid_mermaid_diagram() {
     );
 
     // Should have node definitions with proper format
-    // Format: id["id: title [Pn]"]
-    let node_pattern = |id: &str| format!("{}[\"", id);
+    // Format: node_key["id: title [Pn]"]
+    let node_pattern = |id: &str| format!("[\"{}: ", id);
     assert!(
         output.contains(&node_pattern(&id_epic)),
         "Should have epic node definition"
@@ -606,12 +711,11 @@ fn e2e_dep_tree_mermaid_quiet_mode() {
     );
     assert!(tree.status.success(), "dep tree failed: {}", tree.stderr);
 
-    // In quiet mode, stdout should be empty or minimal
-    // (Note: --quiet may not affect mermaid output depending on implementation)
     // Let's just verify it doesn't crash
     assert!(
-        tree.status.success(),
-        "Quiet mode with mermaid format should not crash"
+        tree.stdout.trim().is_empty(),
+        "quiet mode should suppress mermaid stdout: '{}'",
+        tree.stdout
     );
 
     info!("e2e_dep_tree_mermaid_quiet_mode: assertions passed");

@@ -52,6 +52,13 @@ struct AllGraphOutput {
     total_components: usize,
 }
 
+#[derive(Debug)]
+struct SingleGraphTraversal {
+    traversal_order: Vec<String>,
+    issues_by_id: HashMap<String, Issue>,
+    edges: Vec<(String, String)>,
+}
+
 /// Execute the graph command.
 ///
 /// # Errors
@@ -92,66 +99,21 @@ fn graph_single(
             id: root_id.to_string(),
         })?;
 
-    // DFS to find all dependents (reverse deps)
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut stack: Vec<(String, usize)> = Vec::new();
-    let mut nodes: Vec<GraphNode> = Vec::new();
-    let mut edges: Vec<(String, String)> = Vec::new();
-
-    // Start with root
-    stack.push((root_id.to_string(), 0));
-    visited.insert(root_id.to_string());
-
-    while let Some((current_id, depth)) = stack.pop() {
-        let issue = if current_id == root_id {
-            root_issue.clone()
-        } else {
-            storage.get_issue(&current_id)?.ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "dependency graph references missing issue {current_id}"
-                ))
-            })?
-        };
-
-        nodes.push(GraphNode {
-            id: current_id.clone(),
-            title: issue.title.clone(),
-            status: issue.status.as_str().to_string(),
-            priority: issue.priority.0,
-            depth,
-        });
-
-        // Get dependents (issues that depend on current_id)
-        let mut dependents = storage.get_dependents_with_metadata(&current_id)?;
-
-        // Only include dependency types that affect ready work
-        dependents.retain(|dep| {
-            dep.dep_type
-                .parse::<DependencyType>()
-                .unwrap_or(DependencyType::Blocks)
-                .affects_ready_work()
-        });
-
-        // Sort dependents to ensure deterministic DFS order (stack reverses order)
-        dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
-
-        for dep in dependents.into_iter().rev() {
-            // Record edge: dependent -> current (dependent depends on current)
-            edges.push((dep.id.clone(), current_id.clone()));
-
-            if !visited.contains(&dep.id) {
-                visited.insert(dep.id.clone());
-                stack.push((dep.id.clone(), depth + 1));
-            }
-        }
-    }
+    let traversal = collect_single_graph(storage, root_id, &root_issue)?;
+    let root_nodes = [root_id.to_string()];
+    let depths = calculate_depths_from_dependency_edges(
+        &traversal.traversal_order,
+        &traversal.edges,
+        &root_nodes,
+    );
+    let nodes = build_graph_nodes(&traversal.traversal_order, &traversal.issues_by_id, &depths);
 
     if ctx.is_json() {
         let output = SingleGraphOutput {
             root: root_id.to_string(),
             count: nodes.len(),
             nodes,
-            edges,
+            edges: traversal.edges,
         };
         ctx.json_pretty(&output);
         return Ok(());
@@ -168,29 +130,14 @@ fn graph_single(
     }
 
     if matches!(ctx.mode(), OutputMode::Rich) {
-        render_single_graph_rich(&nodes, &root_issue, ctx);
+        render_single_graph_rich(&nodes, &traversal.edges, &root_issue, ctx);
     } else if compact {
-        // One-liner format: root <- dep1 <- dep2 ...
-        let dependent_ids: Vec<&str> = nodes.iter().skip(1).map(|n| n.id.as_str()).collect();
-        println!("{} <- {}", root_id, dependent_ids.join(" <- "));
-    } else {
-        // Tree-like format
-        println!("Dependents of {} ({} total):", root_id, nodes.len() - 1);
-        println!();
         println!(
-            "  {} [P{}] [{}] (root)",
-            root_issue.title,
-            root_issue.priority.0,
-            root_issue.status.as_str()
+            "{}",
+            format_compact_dependency_edges(root_id, &traversal.edges)
         );
-
-        for node in nodes.iter().skip(1) {
-            let indent = "  ".repeat(node.depth + 1);
-            println!(
-                "{}← {}: {} [P{}] [{}]",
-                indent, node.id, node.title, node.priority, node.status
-            );
-        }
+    } else {
+        render_single_graph_plain(&nodes, &traversal.edges, &root_issue);
     }
 
     Ok(())
@@ -373,9 +320,10 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                 } else {
                     component.roots.join(", ")
                 };
+                let parent_map = build_parent_map(&component.edges);
                 // Detailed view
                 println!(
-                    "Component {} ({} issues, roots: {}):",
+                    "Component {} ({} issues, roots: {}, by depth):",
                     i + 1,
                     component.nodes.len(),
                     roots
@@ -388,9 +336,16 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                     } else {
                         ""
                     };
+                    let parents = format_parent_list(parent_map.get(&node.id).map(Vec::as_slice));
                     println!(
-                        "{}{}: {} [P{}] [{}]{}",
-                        indent, node.id, node.title, node.priority, node.status, root_marker
+                        "{}{}: {} [P{}] [{}]{}{}",
+                        indent,
+                        node.id,
+                        node.title,
+                        node.priority,
+                        node.status,
+                        root_marker,
+                        parents
                     );
                 }
                 println!();
@@ -411,77 +366,392 @@ fn calculate_depths(
     nodes: &[String],
     component_set: &HashSet<&String>,
 ) -> (HashMap<String, usize>, Vec<String>) {
-    let mut depths: HashMap<String, usize> = HashMap::new();
+    let dependency_edges = dependency_edges_for_component(all_dependencies, nodes, component_set);
+    let dependency_map = build_dependency_map(nodes, &dependency_edges);
+    let roots: Vec<String> = nodes
+        .iter()
+        .filter(|node_id| dependency_map.get(*node_id).is_none_or(Vec::is_empty))
+        .cloned()
+        .collect();
+    let depths = calculate_depths_from_dependency_edges(nodes, &dependency_edges, &roots);
+    (depths, roots)
+}
 
-    // Get dependencies for each node (filtered to component)
-    let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
-    // Also build reverse map (dependents) for efficient traversal
-    let mut dependents_map: HashMap<String, Vec<String>> = HashMap::new();
+fn dependency_edges_for_component(
+    all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
+    nodes: &[String],
+    component_set: &HashSet<&String>,
+) -> Vec<(String, String)> {
+    let mut dependency_edges = Vec::new();
 
     for node_id in nodes {
         if let Some(deps) = all_dependencies.get(node_id) {
-            let filtered: Vec<String> = deps
-                .iter()
-                .filter(|d| d.dep_type.affects_ready_work())
-                .map(|d| d.depends_on_id.clone())
-                .filter(|d| component_set.contains(d))
-                .collect();
+            for dependency in deps {
+                if !dependency.dep_type.affects_ready_work() {
+                    continue;
+                }
 
-            for dep_id in &filtered {
-                dependents_map
-                    .entry(dep_id.clone())
-                    .or_default()
-                    .push(node_id.clone());
-            }
-
-            deps_map.insert(node_id.clone(), filtered);
-        } else {
-            deps_map.insert(node_id.clone(), Vec::new());
-        }
-    }
-
-    // Find roots (nodes with no dependencies in component)
-    let roots: Vec<String> = nodes
-        .iter()
-        .filter(|n| deps_map.get(*n).is_none_or(Vec::is_empty))
-        .cloned()
-        .collect();
-
-    // Max depth to prevent infinite loops in cycles
-    let max_depth = nodes.len();
-
-    // BFS from each root, tracking maximum depth
-    for root in &roots {
-        let mut queue: VecDeque<(&String, usize)> = VecDeque::new();
-        queue.push_back((root, 0));
-
-        while let Some((current, depth)) = queue.pop_front() {
-            // Prevent infinite loops in cycles
-            if depth > max_depth {
-                continue;
-            }
-
-            // Update depth if this path is longer
-            let entry = depths.entry(current.clone()).or_insert(0);
-            if depth > *entry {
-                *entry = depth;
-            }
-
-            // Find dependents (nodes that depend on current) using the reverse map
-            if let Some(dependents) = dependents_map.get(current) {
-                for dependent_id in dependents {
-                    queue.push_back((dependent_id, depth + 1));
+                if component_set.contains(&dependency.depends_on_id) {
+                    dependency_edges.push((node_id.clone(), dependency.depends_on_id.clone()));
                 }
             }
         }
     }
 
-    // Ensure all nodes have a depth (isolated nodes get 0)
-    for node_id in nodes {
-        depths.entry(node_id.clone()).or_insert(0);
+    dependency_edges
+}
+
+fn collect_single_graph(
+    storage: &SqliteStorage,
+    root_id: &str,
+    root_issue: &Issue,
+) -> Result<SingleGraphTraversal> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![root_id.to_string()];
+    let mut traversal_order: Vec<String> = Vec::new();
+    let mut issues_by_id: HashMap<String, Issue> = HashMap::new();
+    let mut edges: Vec<(String, String)> = Vec::new();
+
+    visited.insert(root_id.to_string());
+
+    while let Some(current_id) = stack.pop() {
+        let issue = if current_id == root_id {
+            root_issue.clone()
+        } else {
+            storage.get_issue(&current_id)?.ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "dependency graph references missing issue {current_id}"
+                ))
+            })?
+        };
+
+        traversal_order.push(current_id.clone());
+        issues_by_id.insert(current_id.clone(), issue);
+
+        let mut dependents = storage.get_dependents_with_metadata(&current_id)?;
+        dependents.retain(|dep| {
+            dep.dep_type
+                .parse::<DependencyType>()
+                .unwrap_or(DependencyType::Blocks)
+                .affects_ready_work()
+        });
+        dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
+
+        for dep in dependents.into_iter().rev() {
+            edges.push((dep.id.clone(), current_id.clone()));
+
+            if visited.insert(dep.id.clone()) {
+                stack.push(dep.id.clone());
+            }
+        }
     }
 
-    (depths, roots)
+    Ok(SingleGraphTraversal {
+        traversal_order,
+        issues_by_id,
+        edges,
+    })
+}
+
+fn build_graph_nodes(
+    traversal_order: &[String],
+    issues_by_id: &HashMap<String, Issue>,
+    depths: &HashMap<String, usize>,
+) -> Vec<GraphNode> {
+    traversal_order
+        .iter()
+        .map(|node_id| {
+            let issue = issues_by_id
+                .get(node_id)
+                .expect("reachable graph node should exist");
+            GraphNode {
+                id: node_id.clone(),
+                title: issue.title.clone(),
+                status: issue.status.as_str().to_string(),
+                priority: issue.priority.0,
+                depth: depths.get(node_id).copied().unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
+fn calculate_depths_from_dependency_edges(
+    nodes: &[String],
+    dependency_edges: &[(String, String)],
+    root_nodes: &[String],
+) -> HashMap<String, usize> {
+    let dependency_map = build_dependency_map(nodes, dependency_edges);
+    let node_to_component = strongly_connected_components(nodes, &dependency_map);
+    let component_count = node_to_component
+        .values()
+        .copied()
+        .max()
+        .map_or(0, |max_component| max_component + 1);
+
+    if component_count == 0 {
+        return HashMap::new();
+    }
+
+    let mut component_children: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut component_indegree = vec![0usize; component_count];
+
+    for (dependent, dependency) in dependency_edges {
+        let dependent_component = *node_to_component
+            .get(dependent)
+            .expect("dependent node should have a component");
+        let dependency_component = *node_to_component
+            .get(dependency)
+            .expect("dependency node should have a component");
+
+        if dependency_component == dependent_component {
+            continue;
+        }
+
+        let inserted = component_children
+            .entry(dependency_component)
+            .or_default()
+            .insert(dependent_component);
+        if inserted {
+            component_indegree[dependent_component] += 1;
+        }
+    }
+
+    let mut component_depths = vec![0usize; component_count];
+    let mut reachable_components: HashSet<usize> = root_nodes
+        .iter()
+        .filter_map(|node_id| node_to_component.get(node_id).copied())
+        .collect();
+
+    let mut queue: VecDeque<usize> = component_indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(component_id, indegree)| (*indegree == 0).then_some(component_id))
+        .collect();
+
+    while let Some(component_id) = queue.pop_front() {
+        if let Some(children) = component_children.get(&component_id) {
+            for child_component in children {
+                if reachable_components.contains(&component_id) {
+                    reachable_components.insert(*child_component);
+                    component_depths[*child_component] =
+                        component_depths[*child_component].max(component_depths[component_id] + 1);
+                }
+
+                component_indegree[*child_component] -= 1;
+                if component_indegree[*child_component] == 0 {
+                    queue.push_back(*child_component);
+                }
+            }
+        }
+    }
+
+    nodes
+        .iter()
+        .map(|node_id| {
+            let component_id = node_to_component
+                .get(node_id)
+                .expect("graph node should have a component");
+            (node_id.clone(), component_depths[*component_id])
+        })
+        .collect()
+}
+
+fn build_dependency_map(
+    nodes: &[String],
+    dependency_edges: &[(String, String)],
+) -> HashMap<String, Vec<String>> {
+    let mut dependency_map: HashMap<String, Vec<String>> = nodes
+        .iter()
+        .cloned()
+        .map(|node_id| (node_id, Vec::new()))
+        .collect();
+
+    for (dependent, dependency) in dependency_edges {
+        dependency_map
+            .entry(dependent.clone())
+            .or_default()
+            .push(dependency.clone());
+    }
+
+    for dependencies in dependency_map.values_mut() {
+        dependencies.sort();
+        dependencies.dedup();
+    }
+
+    dependency_map
+}
+
+fn strongly_connected_components(
+    nodes: &[String],
+    dependency_map: &HashMap<String, Vec<String>>,
+) -> HashMap<String, usize> {
+    let reverse_map = build_reverse_map(nodes, dependency_map);
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut finish_order = Vec::new();
+
+    for node_id in nodes {
+        if visited.contains(node_id) {
+            continue;
+        }
+        dfs_finish_order(node_id, dependency_map, &mut visited, &mut finish_order);
+    }
+
+    let mut component_map = HashMap::new();
+    let mut next_component = 0usize;
+
+    while let Some(node_id) = finish_order.pop() {
+        if component_map.contains_key(&node_id) {
+            continue;
+        }
+
+        let mut stack = vec![node_id.clone()];
+        while let Some(current_id) = stack.pop() {
+            if component_map.contains_key(&current_id) {
+                continue;
+            }
+
+            component_map.insert(current_id.clone(), next_component);
+            if let Some(parents) = reverse_map.get(&current_id) {
+                for parent_id in parents.iter().rev() {
+                    if !component_map.contains_key(parent_id) {
+                        stack.push(parent_id.clone());
+                    }
+                }
+            }
+        }
+
+        next_component += 1;
+    }
+
+    component_map
+}
+
+fn build_reverse_map(
+    nodes: &[String],
+    dependency_map: &HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    let mut reverse_map: HashMap<String, Vec<String>> = nodes
+        .iter()
+        .cloned()
+        .map(|node_id| (node_id, Vec::new()))
+        .collect();
+
+    for (node_id, dependencies) in dependency_map {
+        for dependency_id in dependencies {
+            reverse_map
+                .entry(dependency_id.clone())
+                .or_default()
+                .push(node_id.clone());
+        }
+    }
+
+    for dependents in reverse_map.values_mut() {
+        dependents.sort();
+        dependents.dedup();
+    }
+
+    reverse_map
+}
+
+fn dfs_finish_order(
+    start: &str,
+    dependency_map: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+    finish_order: &mut Vec<String>,
+) {
+    let mut stack = vec![(start.to_string(), false)];
+
+    while let Some((node_id, expanded)) = stack.pop() {
+        if expanded {
+            finish_order.push(node_id);
+            continue;
+        }
+
+        if !visited.insert(node_id.clone()) {
+            continue;
+        }
+
+        stack.push((node_id.clone(), true));
+        if let Some(dependencies) = dependency_map.get(&node_id) {
+            for dependency_id in dependencies.iter().rev() {
+                if !visited.contains(dependency_id) {
+                    stack.push((dependency_id.clone(), false));
+                }
+            }
+        }
+    }
+}
+
+fn build_parent_map(edges: &[(String, String)]) -> HashMap<String, Vec<String>> {
+    let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (dependent, dependency) in edges {
+        parent_map
+            .entry(dependent.clone())
+            .or_default()
+            .push(dependency.clone());
+    }
+
+    for parents in parent_map.values_mut() {
+        parents.sort();
+        parents.dedup();
+    }
+
+    parent_map
+}
+
+fn format_parent_list(parents: Option<&[String]>) -> String {
+    match parents {
+        Some(parents) if !parents.is_empty() => format!(" depends on: {}", parents.join(", ")),
+        _ => String::new(),
+    }
+}
+
+fn format_compact_dependency_edges(root_id: &str, edges: &[(String, String)]) -> String {
+    if edges.is_empty() {
+        return root_id.to_string();
+    }
+
+    let mut grouped_dependents: HashMap<String, Vec<String>> = HashMap::new();
+    for (dependent, dependency) in edges {
+        grouped_dependents
+            .entry(dependency.clone())
+            .or_default()
+            .push(dependent.clone());
+    }
+
+    let mut dependencies: Vec<String> = grouped_dependents.keys().cloned().collect();
+    dependencies.sort_by(|left, right| {
+        if left == root_id {
+            std::cmp::Ordering::Less
+        } else if right == root_id {
+            std::cmp::Ordering::Greater
+        } else {
+            left.cmp(right)
+        }
+    });
+    let includes_root = dependencies
+        .iter()
+        .any(|dependency_id| dependency_id == root_id);
+
+    let parts: Vec<String> = dependencies
+        .iter()
+        .map(|dependency_id| {
+            let dependents = grouped_dependents
+                .get(dependency_id)
+                .expect("grouped dependents should exist");
+            let mut sorted_dependents = dependents.clone();
+            sorted_dependents.sort();
+            sorted_dependents.dedup();
+            format!("{dependency_id} <- {}", sorted_dependents.join(", "))
+        })
+        .collect();
+
+    if includes_root {
+        parts.join("; ")
+    } else {
+        format!("{root_id}; {}", parts.join("; "))
+    }
 }
 
 fn resolve_issue_id(
@@ -499,15 +769,47 @@ fn resolve_issue_id(
         .map(|resolved| resolved.id)
 }
 
+fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], root_issue: &Issue) {
+    let parent_map = build_parent_map(edges);
+    println!(
+        "Dependents of {} by depth ({} total):",
+        root_issue.id,
+        nodes.len() - 1
+    );
+    println!();
+    println!(
+        "  {}: {} [P{}] [{}] (root)",
+        root_issue.id,
+        root_issue.title,
+        root_issue.priority.0,
+        root_issue.status.as_str()
+    );
+
+    for node in nodes.iter().skip(1) {
+        let indent = "  ".repeat(node.depth + 1);
+        let parents = format_parent_list(parent_map.get(&node.id).map(Vec::as_slice));
+        println!(
+            "{}← {}: {} [P{}] [{}]{}",
+            indent, node.id, node.title, node.priority, node.status, parents
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Rich Output Rendering
 // ─────────────────────────────────────────────────────────────
 
 /// Render single graph with rich formatting.
-fn render_single_graph_rich(nodes: &[GraphNode], root_issue: &Issue, ctx: &OutputContext) {
+fn render_single_graph_rich(
+    nodes: &[GraphNode],
+    edges: &[(String, String)],
+    root_issue: &Issue,
+    ctx: &OutputContext,
+) {
     let console = Console::default();
     let theme = ctx.theme();
     let width = ctx.width();
+    let parent_map = build_parent_map(edges);
 
     let mut content = Text::new("");
 
@@ -528,13 +830,17 @@ fn render_single_graph_rich(nodes: &[GraphNode], root_issue: &Issue, ctx: &Outpu
         ),
         theme.dimmed.clone(),
     );
+    content.append_styled(
+        "Layered view; shared dependents list all blockers in this graph.\n\n",
+        theme.dimmed.clone(),
+    );
 
     // Render tree
     for node in nodes {
         let indent = "  ".repeat(node.depth);
 
         // Depth indicator
-        if node.depth == 0 {
+        if node.id == root_issue.id {
             content.append_styled("● ", theme.success.clone());
         } else {
             content.append(&indent);
@@ -558,8 +864,13 @@ fn render_single_graph_rich(nodes: &[GraphNode], root_issue: &Issue, ctx: &Outpu
         let status_style = status_style(&node.status, theme);
         content.append_styled(&format!("[{}]", node.status), status_style);
 
-        if node.depth == 0 {
+        if node.id == root_issue.id {
             content.append_styled(" (root)", theme.dimmed.clone());
+        } else if let Some(parents) = parent_map.get(&node.id) {
+            content.append_styled(
+                &format!(" depends on: {}", parents.join(", ")),
+                theme.dimmed.clone(),
+            );
         }
         content.append("\n");
     }
@@ -617,10 +928,15 @@ fn render_all_graph_rich(
         ),
         theme.section.clone(),
     );
+    content.append_styled(
+        "Layered view; shared dependents list all blockers within each component.\n",
+        theme.dimmed.clone(),
+    );
 
     // Render each component
     for (i, component) in components.iter().enumerate() {
         content.append("\n");
+        let parent_map = build_parent_map(&component.edges);
 
         // Component header
         content.append_styled(&format!("Component {}", i + 1), theme.emphasis.clone());
@@ -668,6 +984,11 @@ fn render_all_graph_rich(
 
             if component.roots.contains(&node.id) {
                 content.append_styled(" (root)", theme.dimmed.clone());
+            } else if let Some(parents) = parent_map.get(&node.id) {
+                content.append_styled(
+                    &format!(" depends on: {}", parents.join(", ")),
+                    theme.dimmed.clone(),
+                );
             }
             content.append("\n");
         }
@@ -1173,17 +1494,16 @@ mod tests {
         storage.create_issue(&i1, "test").unwrap();
         storage.create_issue(&i2, "test").unwrap();
 
-        // Root blocks A
+        let created_at = t1.to_rfc3339();
         storage
-            .add_dependency("bd-1", "root", "waits-for", "test")
-            .unwrap();
-        // A blocks B
-        storage
-            .add_dependency("bd-2", "bd-1", "waits-for", "test")
-            .unwrap();
-        // B blocks A (cycle)
-        storage
-            .add_dependency("bd-1", "bd-2", "waits-for", "test")
+            .execute_test_sql(&format!(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-1', 'root', 'waits-for', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-2', 'bd-1', 'waits-for', '{created_at}', 'test');
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-1', 'bd-2', 'waits-for', '{created_at}', 'test');"
+            ))
             .unwrap();
 
         let ctx = OutputContext::from_flags(true, false, true); // JSON mode
@@ -1192,5 +1512,62 @@ mod tests {
         // If it hangs, the test runner will timeout
         let result = graph_all(&storage, false, &ctx);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_calculate_depths_from_dependency_edges_uses_longest_path() {
+        let nodes = vec![
+            "root".to_string(),
+            "bd-a".to_string(),
+            "bd-b".to_string(),
+            "bd-c".to_string(),
+            "bd-d".to_string(),
+        ];
+        let dependency_edges = vec![
+            ("bd-a".to_string(), "root".to_string()),
+            ("bd-b".to_string(), "root".to_string()),
+            ("bd-c".to_string(), "bd-b".to_string()),
+            ("bd-d".to_string(), "bd-a".to_string()),
+            ("bd-d".to_string(), "bd-c".to_string()),
+        ];
+        let root_nodes = ["root".to_string()];
+
+        let depths = calculate_depths_from_dependency_edges(&nodes, &dependency_edges, &root_nodes);
+
+        assert_eq!(depths.get("root"), Some(&0));
+        assert_eq!(depths.get("bd-a"), Some(&1));
+        assert_eq!(depths.get("bd-b"), Some(&1));
+        assert_eq!(depths.get("bd-c"), Some(&2));
+        assert_eq!(depths.get("bd-d"), Some(&3));
+    }
+
+    #[test]
+    fn test_calculate_depths_from_dependency_edges_collapses_reachable_cycle() {
+        let nodes = vec!["root".to_string(), "bd-a".to_string(), "bd-b".to_string()];
+        let dependency_edges = vec![
+            ("bd-a".to_string(), "root".to_string()),
+            ("bd-b".to_string(), "bd-a".to_string()),
+            ("bd-a".to_string(), "bd-b".to_string()),
+        ];
+        let root_nodes = ["root".to_string()];
+
+        let depths = calculate_depths_from_dependency_edges(&nodes, &dependency_edges, &root_nodes);
+
+        assert_eq!(depths.get("root"), Some(&0));
+        assert_eq!(depths.get("bd-a"), Some(&1));
+        assert_eq!(depths.get("bd-b"), Some(&1));
+    }
+
+    #[test]
+    fn test_format_compact_dependency_edges_preserves_branching() {
+        let edges = vec![
+            ("bd-a".to_string(), "root".to_string()),
+            ("bd-b".to_string(), "root".to_string()),
+            ("bd-c".to_string(), "bd-a".to_string()),
+            ("bd-c".to_string(), "bd-b".to_string()),
+        ];
+
+        let compact = format_compact_dependency_edges("root", &edges);
+        assert_eq!(compact, "root <- bd-a, bd-b; bd-a <- bd-c; bd-b <- bd-c");
     }
 }

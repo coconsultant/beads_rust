@@ -1,11 +1,14 @@
 //! Show command implementation.
 
-use crate::cli::{ShowArgs, resolve_output_format_basic};
+use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{format_priority_label, format_status_icon_colored};
+use crate::format::{
+    IssueDetails, IssueWithDependencyMetadata, format_priority_label, format_status_icon_colored,
+};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::util::id::{IdResolver, ResolverConfig};
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 
 /// Execute the show command.
@@ -39,9 +42,17 @@ pub fn execute(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let use_color = config::should_use_color(&config_layer);
-    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), false);
+    let output_format = resolve_output_format_basic_with_outer_mode(
+        args.format,
+        outer_ctx.is_json(),
+        outer_ctx.is_toon(),
+        outer_ctx.is_quiet(),
+        false,
+    );
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
+    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+    let mut external_statuses: Option<HashMap<String, bool>> = None;
 
     let mut details_list = Vec::new();
     for id_input in target_ids {
@@ -52,7 +63,18 @@ pub fn execute(
         )?;
 
         // Fetch full details including comments and events
-        if let Some(details) = storage.get_issue_details(&resolution.id, true, false, 10)? {
+        if let Some(mut details) = storage.get_issue_details(&resolution.id, true, false, 10)? {
+            if issue_details_have_external_dependencies(&details) {
+                if external_statuses.is_none() {
+                    external_statuses = Some(
+                        storage.resolve_external_dependency_statuses(&external_db_paths, false)?,
+                    );
+                }
+                if let Some(statuses) = external_statuses.as_ref() {
+                    apply_external_dependency_metadata(&mut details.dependencies, statuses);
+                    apply_external_dependency_metadata(&mut details.dependents, statuses);
+                }
+            }
             details_list.push(details);
         } else {
             return Err(BeadsError::IssueNotFound { id: resolution.id });
@@ -87,13 +109,66 @@ pub fn execute(
     Ok(())
 }
 
-fn print_issue_details(details: &crate::format::IssueDetails, use_color: bool) {
+fn issue_details_have_external_dependencies(details: &IssueDetails) -> bool {
+    details
+        .dependencies
+        .iter()
+        .chain(details.dependents.iter())
+        .any(|item| item.id.starts_with("external:"))
+}
+
+fn apply_external_dependency_metadata(
+    items: &mut [IssueWithDependencyMetadata],
+    external_statuses: &HashMap<String, bool>,
+) {
+    for item in items {
+        if !item.id.starts_with("external:") {
+            continue;
+        }
+
+        let satisfied = external_statuses.get(&item.id).copied().unwrap_or(false);
+        item.status = if satisfied {
+            crate::model::Status::Closed
+        } else {
+            crate::model::Status::Blocked
+        };
+
+        let placeholder_title = item.id.strip_prefix("external:").unwrap_or(&item.id);
+        if item.title.is_empty() || item.title == placeholder_title {
+            item.title = format_external_dependency_title(&item.id, satisfied);
+        }
+    }
+}
+
+fn format_external_dependency_title(dep_id: &str, satisfied: bool) -> String {
+    let prefix = if satisfied { "✓" } else { "⏳" };
+    parse_external_dep_id(dep_id).map_or_else(
+        || format!("{prefix} {dep_id}"),
+        |(project, capability)| format!("{prefix} {project}:{capability}"),
+    )
+}
+
+fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
+    let mut parts = dep_id.splitn(3, ':');
+    let prefix = parts.next()?;
+    if prefix != "external" {
+        return None;
+    }
+    let project = parts.next()?.to_string();
+    let capability = parts.next()?.to_string();
+    if project.is_empty() || capability.is_empty() {
+        return None;
+    }
+    Some((project, capability))
+}
+
+fn print_issue_details(details: &IssueDetails, use_color: bool) {
     let output = format_issue_details(details, use_color);
     print!("{output}");
 }
 
 #[allow(clippy::too_many_lines)]
-fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) -> String {
+fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     let mut output = String::new();
     let issue = &details.issue;
     let status_icon = format_status_icon_colored(&issue.status, use_color);
@@ -237,12 +312,13 @@ fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::format_issue_details;
+    use super::{apply_external_dependency_metadata, format_issue_details};
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
     use crate::model::{Comment, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use crate::util::id::{IdResolver, ResolverConfig};
     use chrono::{TimeZone, Utc};
+    use std::collections::HashMap;
     use tracing::info;
 
     fn init_logging() {
@@ -489,5 +565,29 @@ mod tests {
         assert!(output.contains("Comments:"));
         assert!(output.contains("alice: Looks good"));
         info!("test_show_text_includes_dependencies_and_comments: assertions passed");
+    }
+
+    #[test]
+    fn test_apply_external_dependency_metadata_updates_generated_placeholder() {
+        init_logging();
+        info!("test_apply_external_dependency_metadata_updates_generated_placeholder: starting");
+        let mut dependencies = vec![IssueWithDependencyMetadata {
+            id: "external:proj:cap".to_string(),
+            title: "proj:cap".to_string(),
+            status: Status::Blocked,
+            priority: Priority::MEDIUM,
+            dep_type: "blocks".to_string(),
+        }];
+
+        let mut statuses = HashMap::new();
+        statuses.insert("external:proj:cap".to_string(), true);
+
+        apply_external_dependency_metadata(&mut dependencies, &statuses);
+
+        assert_eq!(dependencies[0].status, Status::Closed);
+        assert_eq!(dependencies[0].title, "✓ proj:cap");
+        info!(
+            "test_apply_external_dependency_metadata_updates_generated_placeholder: assertions passed"
+        );
     }
 }

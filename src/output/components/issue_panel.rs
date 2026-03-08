@@ -125,45 +125,13 @@ impl<'a> IssuePanel<'a> {
             self.theme.timestamp.clone(),
         );
 
-        // Dependencies / Dependents
-        if self.show_dependencies {
-            if let Some(details) = self.details {
-                render_dependency_list(
-                    "Dependencies",
-                    &details.dependencies,
-                    &mut content,
-                    self.theme,
-                );
-            } else if !self.issue.dependencies.is_empty() {
-                render_dependency_refs(&self.issue.dependencies, &mut content, self.theme);
-            }
-        }
-
-        if self.show_dependents
-            && let Some(details) = self.details
-        {
-            render_dependency_list("Dependents", &details.dependents, &mut content, self.theme);
-        }
+        self.append_relationships(&mut content);
 
         // Comments
         let comments: &[Comment] = self
             .details
             .map_or(self.issue.comments.as_slice(), |d| d.comments.as_slice());
-        if self.show_comments && !comments.is_empty() {
-            content.append_styled("\nComments:\n", self.theme.emphasis.clone());
-            for comment in comments {
-                content.append("  ");
-                content.append_styled(
-                    &comment.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-                    self.theme.timestamp.clone(),
-                );
-                content.append(" ");
-                content.append_styled(&comment.author, self.theme.username.clone());
-                content.append_styled(": ", self.theme.dimmed.clone());
-                content.append_styled(&comment.body, self.theme.comment.clone());
-                content.append("\n");
-            }
-        }
+        self.append_comments(&mut content, comments);
 
         // Build and print panel — always use terminal width so descriptions
         // are never silently truncated (issue #91).
@@ -179,6 +147,48 @@ impl<'a> IssuePanel<'a> {
             .border_style(self.theme.panel_border.clone());
 
         ctx.render(&panel);
+    }
+
+    fn append_relationships(&self, content: &mut Text) {
+        if self.show_dependencies {
+            if let Some(details) = self.details {
+                render_dependency_list(
+                    "Dependencies",
+                    &details.dependencies,
+                    content,
+                    self.theme,
+                    false,
+                );
+            } else if !self.issue.dependencies.is_empty() {
+                render_dependency_refs(&self.issue.dependencies, content, self.theme);
+            }
+        }
+
+        if self.show_dependents
+            && let Some(details) = self.details
+        {
+            render_dependency_list("Dependents", &details.dependents, content, self.theme, true);
+        }
+    }
+
+    fn append_comments(&self, content: &mut Text, comments: &[Comment]) {
+        if !self.show_comments || comments.is_empty() {
+            return;
+        }
+
+        content.append_styled("\nComments:\n", self.theme.emphasis.clone());
+        for comment in comments {
+            content.append("  ");
+            content.append_styled(
+                &comment.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                self.theme.timestamp.clone(),
+            );
+            content.append(" ");
+            content.append_styled(&comment.author, self.theme.username.clone());
+            content.append_styled(": ", self.theme.dimmed.clone());
+            content.append_styled(&comment.body, self.theme.comment.clone());
+            content.append("\n");
+        }
     }
 }
 
@@ -200,6 +210,7 @@ fn render_dependency_list(
     deps: &[IssueWithDependencyMetadata],
     content: &mut Text,
     theme: &Theme,
+    is_dependent: bool,
 ) {
     if deps.is_empty() {
         return;
@@ -211,7 +222,7 @@ fn render_dependency_list(
     );
     content.append_styled(&format!("{title}:\n"), theme.emphasis.clone());
     for dep in deps {
-        content.append_styled("  → ", theme.dimmed.clone());
+        content.append_styled(dependency_arrow(is_dependent), theme.dimmed.clone());
         content.append_styled(&dep.id, theme.issue_id.clone());
         content.append(" ");
         content.append_styled(
@@ -224,6 +235,10 @@ fn render_dependency_list(
         content.append_styled(&format!("({})", dep.dep_type), theme.muted.clone());
         content.append("\n");
     }
+}
+
+fn dependency_arrow(is_dependent: bool) -> &'static str {
+    if is_dependent { "  ← " } else { "  → " }
 }
 
 fn render_dependency_refs(deps: &[Dependency], content: &mut Text, theme: &Theme) {
@@ -242,5 +257,16 @@ fn render_dependency_refs(deps: &[Dependency], content: &mut Text, theme: &Theme
         content.append(" ");
         content.append_styled(&format!("({})", dep.dep_type), theme.muted.clone());
         content.append("\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dependency_arrow;
+
+    #[test]
+    fn test_dependency_arrow_tracks_direction() {
+        assert_eq!(dependency_arrow(false), "  → ");
+        assert_eq!(dependency_arrow(true), "  ← ");
     }
 }

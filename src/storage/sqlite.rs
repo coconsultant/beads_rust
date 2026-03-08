@@ -1159,14 +1159,6 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
-        if let Some(limit) = filters.limit
-            && limit > 0
-        {
-            sql.push_str(" LIMIT ?");
-            #[allow(clippy::cast_possible_wrap)]
-            params.push(SqliteValue::from(limit as i64));
-        }
-
         let rows = self.conn.query_with_params(&sql, &params)?;
         let mut issues = Vec::new();
         for row in &rows {
@@ -1289,7 +1281,36 @@ impl SqliteStorage {
             params.push(SqliteValue::from(format!("%{escaped}%")));
         }
 
-        sql.push_str(" ORDER BY priority ASC, created_at DESC");
+        if let Some(ref sort_field) = filters.sort {
+            let order = if filters.reverse { "DESC" } else { "ASC" };
+            match sort_field.as_str() {
+                "priority" => {
+                    let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
+                    let _ = write!(
+                        sql,
+                        " ORDER BY priority {order}, created_at {secondary_order}"
+                    );
+                }
+                "created_at" | "created" => {
+                    let order = if filters.reverse { "ASC" } else { "DESC" };
+                    let _ = write!(sql, " ORDER BY created_at {order}");
+                }
+                "updated_at" | "updated" => {
+                    let order = if filters.reverse { "ASC" } else { "DESC" };
+                    let _ = write!(sql, " ORDER BY updated_at {order}");
+                }
+                "title" => {
+                    let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
+                }
+                _ => {
+                    sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                }
+            }
+        } else if filters.reverse {
+            sql.push_str(" ORDER BY priority DESC, created_at ASC");
+        } else {
+            sql.push_str(" ORDER BY priority ASC, created_at DESC");
+        }
 
         if let Some(limit) = filters.limit
             && limit > 0
@@ -1616,7 +1637,11 @@ impl SqliteStorage {
 
     #[allow(clippy::too_many_lines)]
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
-        const MAX_DEPTH: i32 = 50;
+        // Safety bound: propagation converges when no new issues are found
+        // (the loop breaks on `newly_blocked.is_empty()`).  This limit only
+        // guards against pathological cycles that would otherwise spin forever.
+        // If hit, we FAIL LOUDLY rather than silently returning partial results.
+        const MAX_DEPTH: i32 = 10_000;
 
         // Clear existing cache
         conn.execute("DELETE FROM blocked_issues_cache")?;
@@ -1718,11 +1743,11 @@ impl SqliteStorage {
         let mut depth = 0;
         loop {
             if depth >= MAX_DEPTH {
-                tracing::warn!(
-                    "Transitive blocked cache rebuild hit max depth {}",
+                return Err(crate::error::BeadsError::Other(anyhow::anyhow!(
+                    "Transitive blocked-cache propagation did not converge after {} iterations — \
+                     possible cycle in parent-child dependencies",
                     MAX_DEPTH
-                );
-                break;
+                )));
             }
 
             let newly_blocked: Vec<(String, String)> = {
@@ -5224,8 +5249,10 @@ mod tests {
         let created_at = Utc::now().to_rfc3339();
         storage
             .execute_test_sql(&format!(
-                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                 VALUES ('bd-missing', 'bd-b1', 'blocks', '{created_at}', 'tester')"
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-missing', 'bd-b1', 'blocks', '{created_at}', 'tester');
+                 PRAGMA foreign_keys = ON;"
             ))
             .unwrap();
 
@@ -6754,6 +6781,56 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "bd-s-open");
+    }
+
+    #[test]
+    fn test_search_issues_orders_by_updated() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2025, 9, 3, 0, 0, 0).unwrap();
+
+        let older_updated = make_issue(
+            "bd-s-sort-a",
+            "authentication alpha",
+            Status::Open,
+            2,
+            None,
+            t3,
+            None,
+        );
+        let newer_updated = make_issue(
+            "bd-s-sort-b",
+            "authentication beta",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+
+        storage.create_issue(&older_updated, "tester").unwrap();
+        storage.create_issue(&newer_updated, "tester").unwrap();
+        storage
+            .execute_test_sql(&format!(
+                "UPDATE issues SET updated_at = '{}' WHERE id = 'bd-s-sort-a';\n\
+                 UPDATE issues SET updated_at = '{}' WHERE id = 'bd-s-sort-b';",
+                t1.to_rfc3339(),
+                t3.to_rfc3339()
+            ))
+            .unwrap();
+
+        let results = storage
+            .search_issues(
+                "authentication",
+                &ListFilters {
+                    sort: Some("updated".to_string()),
+                    ..ListFilters::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "bd-s-sort-b");
     }
 
     #[test]

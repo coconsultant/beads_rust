@@ -261,6 +261,67 @@ fn e2e_no_color_env_var() {
     );
 }
 
+#[test]
+fn e2e_env_output_format_json_defaults_count_to_structured_output() {
+    let _log = common::test_log("e2e_env_output_format_json_defaults_count_to_structured_output");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Env default JSON count"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let count = common::cli::run_br_with_env(
+        &workspace,
+        ["count"],
+        [("BR_OUTPUT_FORMAT", "json")],
+        "count_env_json",
+    );
+    assert!(
+        count.status.success(),
+        "count with BR_OUTPUT_FORMAT=json failed: {}",
+        count.stderr
+    );
+
+    let payload = extract_json_payload(&count.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON count output");
+    assert!(
+        json.is_object(),
+        "count env-json output should be an object"
+    );
+    assert_eq!(json["count"], 1);
+}
+
+#[test]
+fn e2e_quiet_overrides_env_json_for_list() {
+    let _log = common::test_log("e2e_quiet_overrides_env_json_for_list");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Quiet env JSON list"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let list = common::cli::run_br_with_env(
+        &workspace,
+        ["list", "--quiet"],
+        [("BR_OUTPUT_FORMAT", "json")],
+        "list_quiet_env_json",
+    );
+    assert!(
+        list.status.success(),
+        "list --quiet with BR_OUTPUT_FORMAT=json failed: {}",
+        list.stderr
+    );
+    assert!(
+        list.stdout.trim().is_empty(),
+        "quiet list should not emit env-selected JSON: {}",
+        list.stdout
+    );
+}
+
 // ============================================================================
 // --no-db flag tests
 // ============================================================================
@@ -557,6 +618,93 @@ fn e2e_quiet_flag_list() {
     // Quiet mode should still show results but with minimal decoration
     // Verify it shows the issue title somewhere
     // (exact format depends on implementation)
+}
+
+#[test]
+fn e2e_quiet_flag_dep_subcommands() {
+    let _log = common::test_log("e2e_quiet_flag_dep_subcommands");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create_a = run_br(&workspace, ["create", "Quiet dep A"], "create_a");
+    assert!(
+        create_a.status.success(),
+        "create A failed: {}",
+        create_a.stderr
+    );
+    let create_b = run_br(&workspace, ["create", "Quiet dep B"], "create_b");
+    assert!(
+        create_b.status.success(),
+        "create B failed: {}",
+        create_b.stderr
+    );
+
+    let id_a = create_a
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let id_b = create_b
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let add = run_br(
+        &workspace,
+        ["--quiet", "dep", "add", &id_a, &id_b],
+        "dep_add_quiet",
+    );
+    assert!(
+        add.status.success(),
+        "dep add --quiet failed: {}",
+        add.stderr
+    );
+    assert!(
+        add.stdout.trim().is_empty(),
+        "dep add --quiet should produce no stdout: '{}'",
+        add.stdout
+    );
+
+    let cycles = run_br(&workspace, ["--quiet", "dep", "cycles"], "dep_cycles_quiet");
+    assert!(
+        cycles.status.success(),
+        "dep cycles --quiet failed: {}",
+        cycles.stderr
+    );
+    assert!(
+        cycles.stdout.trim().is_empty(),
+        "dep cycles --quiet should produce no stdout: '{}'",
+        cycles.stdout
+    );
+
+    let remove = run_br(
+        &workspace,
+        ["--quiet", "dep", "remove", &id_a, &id_b],
+        "dep_remove_quiet",
+    );
+    assert!(
+        remove.status.success(),
+        "dep remove --quiet failed: {}",
+        remove.stderr
+    );
+    assert!(
+        remove.stdout.trim().is_empty(),
+        "dep remove --quiet should produce no stdout: '{}'",
+        remove.stdout
+    );
 }
 
 // ============================================================================

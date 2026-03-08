@@ -2,7 +2,7 @@
 //!
 //! Classic bd-style LIKE search across title/description/id with list-like filters.
 
-use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format};
+use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
@@ -55,12 +55,10 @@ pub fn execute(
     };
 
     let mut filters = build_filters(&args.filters)?;
+    let limit = filters.limit.take();
+    filters.sort = None;
+    filters.reverse = false;
     let client_filters = needs_client_filters(&args.filters);
-    let limit = if client_filters {
-        filters.limit.take()
-    } else {
-        None
-    };
 
     let issues = storage.search_issues(query, &filters)?;
     let issues = if client_filters {
@@ -69,7 +67,13 @@ pub fn execute(
         issues
     };
 
-    let output_format = resolve_output_format(args.filters.format, outer_ctx.is_json(), false);
+    let output_format = resolve_output_format_with_outer_mode(
+        args.filters.format,
+        outer_ctx.is_json(),
+        outer_ctx.is_toon(),
+        outer_ctx.is_quiet(),
+        false,
+    );
     let needs_counts = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
 
     // Batch count dependencies/dependents (JSON/TOON output only).
@@ -559,6 +563,113 @@ mod tests {
         let results = storage.search_issues("xyz", &filters).expect("search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "bd-xyz");
+    }
+
+    #[test]
+    fn test_search_respects_sort_before_limit() {
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
+
+        let mut newer_created_but_older_updated = make_issue("bd-a", "Alpha", None, t3);
+        newer_created_but_older_updated.updated_at = t1;
+
+        let mut older_created_but_newer_updated = make_issue("bd-b", "Beta", None, t1);
+        older_created_but_newer_updated.updated_at = t3;
+
+        let mut items = vec![
+            IssueWithCounts {
+                issue: newer_created_but_older_updated,
+                dependency_count: 0,
+                dependent_count: 0,
+            },
+            IssueWithCounts {
+                issue: older_created_but_newer_updated,
+                dependency_count: 0,
+                dependent_count: 0,
+            },
+        ];
+
+        apply_sort(&mut items, Some("updated")).expect("sort");
+        items.truncate(1);
+        assert_eq!(items[0].issue.id, "bd-b");
+    }
+
+    #[test]
+    fn test_search_respects_reverse_without_explicit_sort() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+
+        let older_high_priority = make_issue("bd-old", "match old", None, t1);
+        let newer_low_priority = make_issue("bd-new", "match new", None, t2);
+
+        storage
+            .create_issue(&older_high_priority, "tester")
+            .expect("create");
+        storage
+            .create_issue(&newer_low_priority, "tester")
+            .expect("create");
+
+        let forward = storage
+            .search_issues("match", &ListFilters::default())
+            .expect("search");
+        let reverse = storage
+            .search_issues(
+                "match",
+                &ListFilters {
+                    reverse: true,
+                    ..Default::default()
+                },
+            )
+            .expect("search");
+
+        assert_eq!(forward[0].id, "bd-new");
+        assert_eq!(forward[1].id, "bd-old");
+        assert_eq!(reverse[0].id, "bd-old");
+        assert_eq!(reverse[1].id, "bd-new");
+    }
+
+    #[test]
+    fn test_search_command_pipeline_applies_reverse_once() {
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+
+        let older = make_issue("bd-old", "match old", None, t1);
+        let newer = make_issue("bd-new", "match new", None, t2);
+        storage.create_issue(&older, "tester").expect("create");
+        storage.create_issue(&newer, "tester").expect("create");
+
+        let args = ListArgs {
+            reverse: true,
+            ..Default::default()
+        };
+        let mut filters = build_filters(&args).expect("filters");
+        let limit = filters.limit.take();
+        filters.sort = None;
+        filters.reverse = false;
+
+        let mut issues_with_counts: Vec<IssueWithCounts> = storage
+            .search_issues("match", &filters)
+            .expect("search")
+            .into_iter()
+            .map(|issue| IssueWithCounts {
+                issue,
+                dependency_count: 0,
+                dependent_count: 0,
+            })
+            .collect();
+
+        apply_sort(&mut issues_with_counts, args.sort.as_deref()).expect("sort");
+        if args.reverse {
+            issues_with_counts.reverse();
+        }
+        if let Some(limit) = limit {
+            issues_with_counts.truncate(limit);
+        }
+
+        assert_eq!(issues_with_counts[0].issue.id, "bd-old");
+        assert_eq!(issues_with_counts[1].issue.id, "bd-new");
     }
 
     #[test]

@@ -105,11 +105,22 @@ impl OutputContext {
     }
 
     fn detect_mode(args: &Cli) -> OutputMode {
+        Self::detect_mode_with_env(args, OutputFormat::from_env())
+    }
+
+    fn detect_mode_with_env(args: &Cli, env_output_format: Option<OutputFormat>) -> OutputMode {
         if args.json {
             return OutputMode::Json;
         }
         if args.quiet {
             return OutputMode::Quiet;
+        }
+        if let Some(format) = env_output_format {
+            match format {
+                OutputFormat::Json => return OutputMode::Json,
+                OutputFormat::Toon => return OutputMode::Toon,
+                OutputFormat::Text | OutputFormat::Csv => {}
+            }
         }
         if args.no_color || std::env::var("NO_COLOR").is_ok() {
             return OutputMode::Plain;
@@ -375,5 +386,47 @@ impl OutputContext {
             OutputMode::Quiet => eprintln!("Error: {}", description),
             OutputMode::Json | OutputMode::Toon => {} //
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn detect_mode_uses_env_json_default_when_no_explicit_format_requested() {
+        let cli = Cli::parse_from(["br", "count"]);
+        assert_eq!(
+            OutputContext::detect_mode_with_env(&cli, Some(OutputFormat::Json)),
+            OutputMode::Json
+        );
+    }
+
+    #[test]
+    fn detect_mode_uses_env_toon_default_when_no_explicit_format_requested() {
+        let cli = Cli::parse_from(["br", "count"]);
+        assert_eq!(
+            OutputContext::detect_mode_with_env(&cli, Some(OutputFormat::Toon)),
+            OutputMode::Toon
+        );
+    }
+
+    #[test]
+    fn detect_mode_quiet_overrides_env_machine_format() {
+        let cli = Cli::parse_from(["br", "--quiet", "count"]);
+        assert_eq!(
+            OutputContext::detect_mode_with_env(&cli, Some(OutputFormat::Json)),
+            OutputMode::Quiet
+        );
+    }
+
+    #[test]
+    fn detect_mode_explicit_json_overrides_env_toon_default() {
+        let cli = Cli::parse_from(["br", "--json", "count"]);
+        assert_eq!(
+            OutputContext::detect_mode_with_env(&cli, Some(OutputFormat::Toon)),
+            OutputMode::Json
+        );
     }
 }
