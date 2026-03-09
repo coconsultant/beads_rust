@@ -5,7 +5,7 @@ use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+pub const CURRENT_SCHEMA_VERSION: i32 = 3;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -49,9 +49,9 @@ pub const SCHEMA_SQL: &str = r"
         compacted_at_commit TEXT,
         original_size INTEGER,
         sender TEXT DEFAULT '',
-        ephemeral INTEGER DEFAULT 0,
-        pinned INTEGER DEFAULT 0,
-        is_template INTEGER DEFAULT 0,
+        ephemeral INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        is_template INTEGER NOT NULL DEFAULT 0,
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -87,7 +87,7 @@ pub const SCHEMA_SQL: &str = r"
         WHERE status IN ('open', 'in_progress')
         AND ephemeral = 0
         AND pinned = 0
-        AND (is_template = 0 OR is_template IS NULL);
+        AND is_template = 0;
 
     -- Dependencies
     CREATE TABLE IF NOT EXISTS dependencies (
@@ -443,9 +443,9 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     ("compacted_at_commit", "TEXT"),
     ("original_size", "INTEGER"),
     ("sender", "TEXT DEFAULT ''"),
-    ("ephemeral", "INTEGER DEFAULT 0"),
-    ("pinned", "INTEGER DEFAULT 0"),
-    ("is_template", "INTEGER DEFAULT 0"),
+    ("ephemeral", "INTEGER NOT NULL DEFAULT 0"),
+    ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ("is_template", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -884,6 +884,35 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL")?;
     }
 
+    // Migration: Ensure filter columns are NOT NULL (v3)
+    let user_version = conn
+        .query_row("PRAGMA user_version")?
+        .get(0)
+        .and_then(SqliteValue::as_integer)
+        .unwrap_or(0);
+
+    if user_version < 3 && table_exists(conn, "issues") {
+        tracing::info!("Migrating database to schema version 3 (NOT NULL filter columns)");
+        // 1. Backfill NULL values
+        conn.execute("UPDATE issues SET ephemeral = 0 WHERE ephemeral IS NULL")?;
+        conn.execute("UPDATE issues SET pinned = 0 WHERE pinned IS NULL")?;
+        conn.execute("UPDATE issues SET is_template = 0 WHERE is_template IS NULL")?;
+
+        // 2. Rebuild the table to apply NOT NULL constraints
+        rebuild_issues_table(conn)?;
+
+        // 3. Recreate the optimized ready index
+        conn.execute("DROP INDEX IF EXISTS idx_issues_ready")?;
+        conn.execute(
+            "CREATE INDEX idx_issues_ready
+             ON issues(status, priority, created_at)
+             WHERE status IN ('open', 'in_progress')
+             AND ephemeral = 0
+             AND pinned = 0
+             AND is_template = 0",
+        )?;
+    }
+
     // Note: source_repo and is_template column backfills are handled in
     // run_pre_schema_migrations() via ensure_columns(). Repeating ALTER TABLE
     // here can create duplicate column definitions on some engines.
@@ -913,7 +942,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             WHERE status IN ('open', 'in_progress')
             AND ephemeral = 0
             AND pinned = 0
-            AND (is_template = 0 OR is_template IS NULL);
+            AND is_template = 0;
 
     ",
     )?;
@@ -1428,10 +1457,6 @@ mod tests {
                 issue_id TEXT NOT NULL,
                 depends_on_id TEXT NOT NULL,
                 type TEXT NOT NULL DEFAULT 'blocks',
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                created_by TEXT NOT NULL DEFAULT '',
-                metadata TEXT DEFAULT '{}',
-                thread_id TEXT DEFAULT '',
                 PRIMARY KEY (issue_id, depends_on_id)
             );
             CREATE TABLE comments (

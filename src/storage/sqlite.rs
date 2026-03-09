@@ -1529,14 +1529,14 @@ impl SqliteStorage {
         }
 
         // Ready condition 4: not pinned
-        sql.push_str(" AND (pinned = 0 OR pinned IS NULL)");
+        sql.push_str(" AND pinned = 0");
 
         // Ready condition 5: not ephemeral and not wisp
-        sql.push_str(" AND (ephemeral = 0 OR ephemeral IS NULL)");
+        sql.push_str(" AND ephemeral = 0");
         sql.push_str(" AND id NOT LIKE '%-wisp-%'");
 
         // Exclude templates
-        sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        sql.push_str(" AND is_template = 0");
 
         // Filter by types
         if let Some(ref types) = filters.types
@@ -2036,6 +2036,10 @@ impl SqliteStorage {
     }
 
     /// Check if the project has any external dependencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dependency probe query fails.
     pub fn has_external_dependencies(&self, blocking_only: bool) -> Result<bool> {
         let sql = if blocking_only {
             "SELECT 1 FROM dependencies WHERE depends_on_id LIKE 'external:%' AND type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child') LIMIT 1"
@@ -3348,31 +3352,53 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
-        // Explicit DELETE + INSERT instead of ON CONFLICT because
-        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        // Wrapped in BEGIN IMMEDIATE to make the pair atomic and prevent
-        // a crash between DELETE and INSERT from losing the value.
-        self.conn.execute("BEGIN IMMEDIATE")?;
-        match (|| -> Result<()> {
-            self.conn.execute_with_params(
-                "DELETE FROM config WHERE key = ?",
-                &[SqliteValue::from(key)],
-            )?;
-            self.conn.execute_with_params(
-                "INSERT INTO config (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(value)],
-            )?;
-            Ok(())
-        })() {
-            Ok(()) => {
-                self.conn.execute("COMMIT")?;
-                Ok(())
+        const MAX_RETRIES: u32 = 5;
+        let base_backoff_ms: u64 = 10;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.conn.execute("BEGIN IMMEDIATE") {
+                Ok(_) => {}
+                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK");
-                Err(e)
+
+            let result = (|| -> Result<()> {
+                self.conn.execute_with_params(
+                    "DELETE FROM config WHERE key = ?",
+                    &[SqliteValue::from(key)],
+                )?;
+                self.conn.execute_with_params(
+                    "INSERT INTO config (key, value) VALUES (?, ?)",
+                    &[SqliteValue::from(key), SqliteValue::from(value)],
+                )?;
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => match self.conn.execute("COMMIT") {
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                        let _ = self.conn.execute("ROLLBACK");
+                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        std::thread::sleep(Duration::from_millis(backoff));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = self.conn.execute("ROLLBACK");
+                        return Err(e.into());
+                    }
+                },
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK");
+                    return Err(e);
+                }
             }
         }
+        unreachable!()
     }
 
     /// Delete a config value.
@@ -3763,31 +3789,53 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
-        // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
-        // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            self.conn.execute_with_params(
-                "DELETE FROM metadata WHERE key = ?",
-                &[SqliteValue::from(key)],
-            )?;
-            self.conn.execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(value)],
-            )?;
-            Ok(())
-        })();
+        const MAX_RETRIES: u32 = 5;
+        let base_backoff_ms: u64 = 10;
 
-        match result {
-            Ok(()) => {
-                self.conn.execute("COMMIT")?;
-                Ok(())
+        for attempt in 0..MAX_RETRIES {
+            match self.conn.execute("BEGIN IMMEDIATE") {
+                Ok(_) => {}
+                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK");
-                Err(e)
+
+            let result = (|| -> Result<()> {
+                self.conn.execute_with_params(
+                    "DELETE FROM metadata WHERE key = ?",
+                    &[SqliteValue::from(key)],
+                )?;
+                self.conn.execute_with_params(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    &[SqliteValue::from(key), SqliteValue::from(value)],
+                )?;
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => match self.conn.execute("COMMIT") {
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                        let _ = self.conn.execute("ROLLBACK");
+                        let backoff = base_backoff_ms * 2u64.pow(attempt);
+                        std::thread::sleep(Duration::from_millis(backoff));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = self.conn.execute("ROLLBACK");
+                        return Err(e.into());
+                    }
+                },
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK");
+                    return Err(e);
+                }
             }
         }
+        unreachable!()
     }
 
     /// Delete a metadata key.
