@@ -1501,26 +1501,27 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dep_tree_node_metadata_errors_on_missing_internal_issue() {
+    fn test_resolve_dep_tree_node_metadata_missing_internal_issue() {
         init_test_logging();
-        info!("test_resolve_dep_tree_node_metadata_errors_on_missing_internal_issue: starting");
+        info!("test_resolve_dep_tree_node_metadata_missing_internal_issue: starting");
         let storage = SqliteStorage::open_memory().unwrap();
         let root_issue = make_test_issue("bd-root", "Root");
         let statuses = HashMap::new();
 
-        let error = resolve_dep_tree_node_metadata(
+        let (title, priority, status) = resolve_dep_tree_node_metadata(
             &storage,
             "bd-root",
             &root_issue,
             "bd-missing",
             &statuses,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(error, BeadsError::Config(_)));
-        assert!(error.to_string().contains("bd-missing"));
+        assert_eq!(title, "[missing issue: bd-missing]");
+        assert_eq!(priority, 2);
+        assert_eq!(status, "deleted");
         info!(
-            "test_resolve_dep_tree_node_metadata_errors_on_missing_internal_issue: assertions passed"
+            "test_resolve_dep_tree_node_metadata_missing_internal_issue: assertions passed"
         );
     }
 
