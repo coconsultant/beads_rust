@@ -64,14 +64,14 @@ impl Drop for BackupFileGuard {
     fn drop(&mut self) {
         if !self.persist {
             // Use remove_file directly and ignore NotFound to be TOCTOU-safe.
-            if let Err(cleanup_err) = fs::remove_file(&self.path) {
-                if cleanup_err.kind() != io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        backup = %self.path.display(),
-                        error = %cleanup_err,
-                        "Failed to remove partially written history backup"
-                    );
-                }
+            if let Err(cleanup_err) = fs::remove_file(&self.path)
+                && cleanup_err.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    backup = %self.path.display(),
+                    error = %cleanup_err,
+                    "Failed to remove partially written history backup"
+                );
             }
         }
     }

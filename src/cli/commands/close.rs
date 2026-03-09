@@ -231,6 +231,7 @@ pub fn execute_with_args(
             closed_at: Some(Some(now)),
             close_reason: Some(Some(close_reason.clone())),
             closed_by_session: args.session.clone().map(Some),
+            skip_cache_rebuild: true,
             ..Default::default()
         };
 
@@ -250,10 +251,15 @@ pub fn execute_with_args(
         });
     }
 
+    if !closed_issues.is_empty() {
+        tracing::info!("Rebuilding blocked cache after closing {} issues", closed_issues.len());
+        storage.rebuild_blocked_cache(true)?;
+    }
+
     // Handle suggest-next: find issues that became unblocked
     let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {
         // Rebuild blocked cache to reflect the closure
-        // Note: storage.update_issue already triggered a transactional cache rebuild if status changed.
+        // Note: we just explicitly rebuilt it above.
         // We just need to fetch the new state.
 
         // Find issues that were blocked before but aren't now

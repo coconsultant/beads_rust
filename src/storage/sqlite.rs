@@ -3337,7 +3337,6 @@ impl SqliteStorage {
                         let _ = self.conn.execute("ROLLBACK");
                         let backoff = base_backoff_ms * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
-                        continue;
                     }
                     Err(e) => {
                         let _ = self.conn.execute("ROLLBACK");
@@ -3774,7 +3773,6 @@ impl SqliteStorage {
                         let _ = self.conn.execute("ROLLBACK");
                         let backoff = base_backoff_ms * 2u64.pow(attempt);
                         std::thread::sleep(Duration::from_millis(backoff));
-                        continue;
                     }
                     Err(e) => {
                         let _ = self.conn.execute("ROLLBACK");

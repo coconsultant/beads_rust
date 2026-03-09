@@ -114,6 +114,7 @@ pub fn execute_defer(
         let update = IssueUpdate {
             status: Some(Status::Deferred),
             defer_until: Some(defer_until),
+            skip_cache_rebuild: true,
             ..Default::default()
         };
 
@@ -135,6 +136,15 @@ pub fn execute_defer(
             status: "deferred".to_string(),
             defer_until: defer_until.map(|dt| dt.to_rfc3339()),
         });
+    }
+
+    // Rebuild blocked cache since deferred issues may unblock dependents (or change their blocked reason)
+    if !deferred_issues.is_empty() {
+        tracing::info!(
+            "Rebuilding blocked cache after deferring {} issues",
+            deferred_issues.len()
+        );
+        storage.rebuild_blocked_cache(true)?;
     }
 
     // Output

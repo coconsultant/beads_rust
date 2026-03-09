@@ -118,6 +118,7 @@ pub fn execute(
             deleted_at: Some(None),        // Clear deleted_at
             deleted_by: Some(None),        // Clear deleted_by
             delete_reason: Some(None),     // Clear delete_reason
+            skip_cache_rebuild: true,
             ..Default::default()
         };
 
@@ -141,6 +142,11 @@ pub fn execute(
             status: "open".to_string(),
             closed_at: None,
         });
+    }
+
+    if !reopened_issues.is_empty() {
+        tracing::info!("Rebuilding blocked cache after reopening {} issues", reopened_issues.len());
+        storage.rebuild_blocked_cache(true)?;
     }
 
     // Output
