@@ -1266,8 +1266,8 @@ pub fn export_to_jsonl_with_policy(
         );
 
         // Perform backup before overwriting (if enabled and we have a beads_dir).
-        // We backup any JSONL file that resolves inside `.beads/`, including custom
-        // BEADS_JSONL paths that still target `.beads/`.
+        // We backup any JSONL file that has been validated as safe for sync,
+        // even if it's outside the .beads/ directory (e.g., in repo root).
         let output_abs = if output_path.is_absolute() {
             output_path.to_path_buf()
         } else if let Ok(cwd) = std::env::current_dir() {
@@ -1275,9 +1275,8 @@ pub fn export_to_jsonl_with_policy(
         } else {
             output_path.to_path_buf()
         };
-        if output_abs.starts_with(beads_dir) {
-            history::backup_before_export(beads_dir, &config.history, &output_abs)?;
-        }
+        
+        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
     }
 
     // Get all issues for export (sorted by ID, excludes ephemerals/wisps)

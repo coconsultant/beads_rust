@@ -2035,6 +2035,17 @@ impl SqliteStorage {
         Ok(blocked_issues)
     }
 
+    /// Check if the project has any external dependencies.
+    pub fn has_external_dependencies(&self, blocking_only: bool) -> Result<bool> {
+        let sql = if blocking_only {
+            "SELECT 1 FROM dependencies WHERE depends_on_id LIKE 'external:%' AND type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child') LIMIT 1"
+        } else {
+            "SELECT 1 FROM dependencies WHERE depends_on_id LIKE 'external:%' LIMIT 1"
+        };
+        let rows = self.conn.query(sql)?;
+        Ok(!rows.is_empty())
+    }
+
     /// Resolve external dependency satisfaction for dependencies of this project.
     ///
     /// Returns a map of external dependency IDs to whether they are satisfied.

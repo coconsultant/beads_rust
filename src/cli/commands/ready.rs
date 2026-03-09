@@ -70,21 +70,32 @@ pub fn execute(
     };
 
     info!("Fetching ready issues");
+
+    // Optimization: if there are no external dependencies, we can apply the limit
+    // directly in the SQL query to avoid loading all candidate issues into memory.
+    let has_external = storage.has_external_dependencies(true)?;
+    let mut filters = filters;
+    if !has_external && args.limit > 0 {
+        filters.limit = Some(args.limit);
+    }
+
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
     // Get ready issues from storage (blocked cache only)
     let mut ready_issues = storage.get_ready_issues(&filters, sort_policy)?;
 
-    let external_statuses =
-        storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
-    let external_blockers = storage.external_blockers(&external_statuses)?;
-    if !external_blockers.is_empty() {
-        ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
-    }
+    if has_external {
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+        let external_blockers = storage.external_blockers(&external_statuses)?;
+        if !external_blockers.is_empty() {
+            ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
+        }
 
-    // Apply limit after external filtering
-    if args.limit > 0 && ready_issues.len() > args.limit {
-        ready_issues.truncate(args.limit);
+        // Apply limit after external filtering
+        if args.limit > 0 && ready_issues.len() > args.limit {
+            ready_issues.truncate(args.limit);
+        }
     }
 
     info!(count = ready_issues.len(), "Found ready issues");

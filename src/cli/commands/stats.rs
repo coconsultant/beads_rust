@@ -15,9 +15,8 @@ use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use rich_rust::prelude::*;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use tracing::{debug, info};
 
 /// Execute the stats command.

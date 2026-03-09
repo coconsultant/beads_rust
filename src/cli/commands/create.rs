@@ -134,21 +134,7 @@ pub fn create_issue_impl(
         return Err(BeadsError::validation("title", "cannot be empty"));
     }
 
-    // 2. Generate ID
-    let now = Utc::now();
-    let count = storage.count_issues()?;
-
-    let id_input = NewIdInput {
-        title,
-        description: None,
-        creator: None,
-        now,
-        issue_count: count,
-        id_config: &config.id_config,
-    };
-    let id = generate_new_id(storage, args.parent.as_deref(), &id_input)?;
-
-    // 3. Parse fields
+    // 2. Parse fields
     let priority = if let Some(p) = &args.priority {
         Priority::from_str(p)?
     } else {
@@ -505,6 +491,12 @@ fn execute_import(
             eprintln!("✗ Failed to create issue: title cannot be empty");
             continue;
         }
+        let description = parsed.description.clone();
+        let priority_override = parsed.priority.clone();
+        let issue_type_override = parsed.issue_type.clone();
+        let assignee = parsed.assignee.or_else(|| args.assignee.clone());
+        let design = parsed.design.clone();
+        let acceptance_criteria = parsed.acceptance_criteria.clone();
 
         let mut retries = 0;
         let mut final_id = String::new();
@@ -513,7 +505,7 @@ fn execute_import(
         loop {
             let id_input = NewIdInput {
                 title: &title,
-                description: parsed.description.as_deref(),
+                description: description.as_deref(),
                 creator: None,
                 now,
                 issue_count: count,
@@ -527,7 +519,7 @@ fn execute_import(
                 }
             };
 
-            let priority = if let Some(ref p) = parsed.priority {
+            let priority = if let Some(ref p) = priority_override {
                 match Priority::from_str(p) {
                     Ok(value) => value,
                     Err(err) => {
@@ -539,7 +531,7 @@ fn execute_import(
                 default_priority
             };
 
-            let issue_type = if let Some(ref t) = parsed.issue_type {
+            let issue_type = if let Some(ref t) = issue_type_override {
                 match IssueType::from_str(t) {
                     Ok(value) => value,
                     Err(err) => {
@@ -554,21 +546,21 @@ fn execute_import(
             let mut issue = Issue {
                 id: id.clone(),
                 title: title.clone(),
-                description: parsed.description.clone(),
+                description: description.clone(),
                 status: import_status.clone(),
                 priority,
                 issue_type,
                 created_at: now,
                 updated_at: now,
-                assignee: parsed.assignee.or_else(|| args.assignee.clone()),
+                assignee: assignee.clone(),
                 owner: args.owner.clone(),
                 estimated_minutes: args.estimate,
                 due_at,
                 defer_until,
                 external_ref: args.external_ref.clone(),
                 ephemeral: args.ephemeral,
-                design: parsed.design,
-                acceptance_criteria: parsed.acceptance_criteria,
+                design: design.clone(),
+                acceptance_criteria: acceptance_criteria.clone(),
                 content_hash: None,
                 notes: None,
                 // Keep import hashes actor-independent so identical markdown imports
@@ -629,7 +621,9 @@ fn execute_import(
             for dep_str in deps {
                 let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
                 if !valid {
-                    eprintln!("warning: skipping invalid dependency type '{type_str}' for issue {id}");
+                    eprintln!(
+                        "warning: skipping invalid dependency type '{type_str}' for issue {id}"
+                    );
                     continue;
                 }
                 if type_str.eq_ignore_ascii_case("blocked-by") {
