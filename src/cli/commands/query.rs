@@ -288,6 +288,10 @@ fn query_save(
 
     info!(name, "Saved query created");
 
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     if ctx.is_json() {
         let output = QueryActionOutput {
             status: "ok".to_string(),
@@ -360,6 +364,10 @@ fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> R
     // Sort by name
     queries.sort_by(|a, b| a.name.cmp(&b.name));
 
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     if ctx.is_json() {
         let output = QueryListOutput {
             count: queries.len(),
@@ -404,6 +412,10 @@ fn query_delete(
     }
 
     info!(name, "Saved query deleted");
+
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
 
     if ctx.is_json() {
         let output = QueryActionOutput {

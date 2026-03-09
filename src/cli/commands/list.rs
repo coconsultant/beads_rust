@@ -31,18 +31,6 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
-    let use_color = config::should_use_color(&config_layer);
-    let max_width = if std::io::stdout().is_terminal() {
-        Some(terminal_width())
-    } else {
-        None
-    };
-    let format_options = TextFormatOptions {
-        use_color,
-        max_width,
-        wrap: args.wrap,
-    };
 
     // Build filter from args
     let mut filters = build_filters(args)?;
@@ -93,9 +81,11 @@ pub fn execute(
         outer_ctx.inherited_output_mode(),
         false,
     );
+    let quiet = cli.quiet.unwrap_or(false);
+    let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
 
     // Warn on stderr when results were truncated (skip for structured output)
-    if truncated && !matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
+    if truncated && !quiet && !matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
         if client_filters {
             // Exact total known from client-side filtering
             eprintln!(
@@ -111,11 +101,23 @@ pub fn execute(
             );
         }
     }
-    let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
-    if matches!(ctx.mode(), OutputMode::Quiet) {
+    if matches!(early_ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let max_width = if std::io::stdout().is_terminal() {
+        Some(terminal_width())
+    } else {
+        None
+    };
+    let format_options = TextFormatOptions {
+        use_color,
+        max_width,
+        wrap: args.wrap,
+    };
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     // Output
     match output_format {

@@ -57,6 +57,8 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         || !args.set_labels.is_empty()
         || args.parent.is_some();
 
+    validate_mutable_target_issues(&storage_ctx.storage, &resolved_ids, has_updates)?;
+
     // Validate labels before making any database changes
     for label in &args.add_label {
         LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
@@ -224,6 +226,31 @@ fn resolve_target_ids(
     Ok(resolved_ids.into_iter().map(|r| r.id).collect())
 }
 
+fn validate_mutable_target_issues(
+    storage: &SqliteStorage,
+    ids: &[String],
+    has_updates: bool,
+) -> Result<()> {
+    if !has_updates {
+        return Ok(());
+    }
+
+    for id in ids {
+        if storage
+            .get_issue(id)?
+            .as_ref()
+            .is_some_and(|issue| issue.status == Status::Tombstone)
+        {
+            return Err(BeadsError::validation(
+                "issue",
+                format!("cannot update tombstone issue: {id}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result<IssueUpdate> {
     let status = if args.claim {
         Some(Status::InProgress)
@@ -368,7 +395,8 @@ fn parse_date(s: &str) -> Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::logging::init_test_logging;
-    use crate::model::Priority;
+    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::storage::SqliteStorage;
     use chrono::{Datelike, Timelike};
     use tracing::info;
 
@@ -536,5 +564,63 @@ mod tests {
         let update = build_update(&args, "test_actor", false).unwrap();
         assert!(update.is_empty());
         info!("test_build_update_empty: assertions passed");
+    }
+
+    #[test]
+    fn test_validate_mutable_target_issues_rejects_tombstone() {
+        init_test_logging();
+        info!("test_validate_mutable_target_issues_rejects_tombstone: starting");
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-tombstone".to_string(),
+            title: "Deleted issue".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .delete_issue("bd-tombstone", "tester", "delete for update test", None)
+            .unwrap();
+
+        let err = validate_mutable_target_issues(&storage, &["bd-tombstone".to_string()], true)
+            .unwrap_err();
+
+        match err {
+            BeadsError::Validation { field, reason } => {
+                assert_eq!(field, "issue");
+                assert!(reason.contains("cannot update tombstone issue"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        info!("test_validate_mutable_target_issues_rejects_tombstone: assertions passed");
+    }
+
+    #[test]
+    fn test_validate_mutable_target_issues_allows_open_issue() {
+        init_test_logging();
+        info!("test_validate_mutable_target_issues_allows_open_issue: starting");
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-open".to_string(),
+            title: "Open issue".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+
+        validate_mutable_target_issues(&storage, &["bd-open".to_string()], true).unwrap();
+
+        info!("test_validate_mutable_target_issues_allows_open_issue: assertions passed");
     }
 }

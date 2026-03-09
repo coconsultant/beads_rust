@@ -43,6 +43,12 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 "cannot be combined with title arguments",
             ));
         }
+        if args.parent.is_some() {
+            return Err(BeadsError::validation(
+                "parent",
+                "--parent is not supported with --file",
+            ));
+        }
         if args.dry_run {
             return Err(BeadsError::validation(
                 "dry_run",
@@ -632,6 +638,10 @@ fn execute_import(
                     eprintln!("warning: skipping self-dependency for issue {id}");
                     continue;
                 }
+                if is_marker_only_dependency(&dep_id) {
+                    eprintln!("warning: skipping invalid dependency '{dep_id}' for issue {id}");
+                    continue;
+                }
 
                 let dep_type: DependencyType = type_str.parse().expect("from_str is infallible");
 
@@ -701,6 +711,10 @@ fn execute_import(
 
     storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
+}
+
+fn is_marker_only_dependency(dep_id: &str) -> bool {
+    matches!(dep_id.trim(), "-" | "*" | "+")
 }
 
 fn parse_optional_date(s: Option<&str>) -> Result<Option<DateTime<Utc>>> {

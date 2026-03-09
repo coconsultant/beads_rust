@@ -81,6 +81,10 @@ pub fn execute(
         None
     });
 
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     match by {
         None => {
             if ctx.is_json() {

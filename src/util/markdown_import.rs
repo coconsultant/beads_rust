@@ -139,6 +139,7 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
 ///
 /// Returns an error if the content cannot be parsed into issues.
 pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
+    let has_non_whitespace_content = content.lines().any(|line| !line.trim().is_empty());
     let mut issues = Vec::new();
     let mut current_issue: Option<ParsedIssue> = None;
     let mut current_section = Section::BeforeH3;
@@ -201,6 +202,13 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
         issues.push(issue);
     }
 
+    if issues.is_empty() && has_non_whitespace_content {
+        return Err(BeadsError::validation(
+            "file",
+            "no issues found; expected '## Title' headers",
+        ));
+    }
+
     Ok(issues)
 }
 
@@ -259,21 +267,53 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
 fn split_list_content(content: &str) -> Vec<String> {
     let mut result = Vec::new();
     for line in content.lines() {
+        let line = strip_markdown_list_prefix(line).trim();
+        if line.is_empty() {
+            continue;
+        }
         if line.contains(',') {
             result.extend(
                 line.split(',')
                     .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
+                    .filter(|s| !s.is_empty() && !is_marker_only_token(s)),
             );
         } else {
             result.extend(
                 line.split_whitespace()
                     .map(str::to_string)
-                    .filter(|s| !s.is_empty()),
+                    .filter(|s| !s.is_empty() && !is_marker_only_token(s)),
             );
         }
     }
     result
+}
+
+fn strip_markdown_list_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return strip_markdown_checkbox_prefix(rest);
+        }
+    }
+
+    strip_markdown_checkbox_prefix(trimmed)
+}
+
+fn strip_markdown_checkbox_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+
+    for marker in ["[ ] ", "[x] ", "[X] "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return rest;
+        }
+    }
+
+    trimmed
+}
+
+fn is_marker_only_token(token: &str) -> bool {
+    matches!(token.trim(), "-" | "*" | "+")
 }
 
 /// Validate a dependency type string.
@@ -416,6 +456,21 @@ blocks:bd-123, bd-456, related:bd-789
     }
 
     #[test]
+    fn test_dependencies_markdown_bullets_ignore_list_markers() {
+        let content = r"## Test Issue
+### Dependencies
+- bd-123
+- [ ] related:bd-456
+* external:github#123
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(
+            issues[0].dependencies,
+            vec!["bd-123", "related:bd-456", "external:github#123"]
+        );
+    }
+
+    #[test]
     fn test_acceptance_criteria_alias() {
         let content = r"## Test Issue
 ### Acceptance
@@ -480,6 +535,12 @@ This is the actual description.
     #[test]
     fn test_parse_markdown_file_rejects_parent_dir() {
         let err = parse_markdown_file(Path::new("../issues.md")).unwrap_err();
+        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
+    }
+
+    #[test]
+    fn test_parse_markdown_content_rejects_non_empty_content_without_issue_headers() {
+        let err = parse_markdown_content("### Description\nNo issue header here.\n").unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
     }
 

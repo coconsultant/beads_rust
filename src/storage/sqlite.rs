@@ -2016,13 +2016,23 @@ impl SqliteStorage {
         blocking_only: bool,
     ) -> Result<HashMap<String, bool>> {
         let external_ids = self.list_external_dependency_ids(blocking_only)?;
+        Ok(Self::resolve_external_dependency_statuses_for_ids(
+            &external_ids,
+            external_db_paths,
+        ))
+    }
+
+    pub(crate) fn resolve_external_dependency_statuses_for_ids(
+        external_ids: &HashSet<String>,
+        external_db_paths: &HashMap<String, PathBuf>,
+    ) -> HashMap<String, bool> {
         if external_ids.is_empty() {
-            return Ok(HashMap::new());
+            return HashMap::new();
         }
 
         let mut project_caps: HashMap<String, HashSet<String>> = HashMap::new();
         let mut parsed: HashMap<String, (String, String)> = HashMap::new();
-        for dep_id in &external_ids {
+        for dep_id in external_ids {
             if let Some((project, capability)) = parse_external_dependency(dep_id) {
                 project_caps
                     .entry(project.clone())
@@ -2060,15 +2070,17 @@ impl SqliteStorage {
 
         let mut statuses = HashMap::new();
         for dep_id in external_ids {
-            let is_satisfied = parsed.get(&dep_id).is_some_and(|(project, capability)| {
-                satisfied
-                    .get(project)
-                    .is_some_and(|caps| caps.contains(capability))
-            });
-            statuses.insert(dep_id, is_satisfied);
+            let is_satisfied = parsed
+                .get(dep_id.as_str())
+                .is_some_and(|(project, capability)| {
+                    satisfied
+                        .get(project)
+                        .is_some_and(|caps| caps.contains(capability))
+                });
+            statuses.insert(dep_id.clone(), is_satisfied);
         }
 
-        Ok(statuses)
+        statuses
     }
 
     /// Compute blockers caused by unsatisfied external dependencies.
@@ -4262,24 +4274,72 @@ fn query_external_project_capabilities(
 
     for chunk in labels.chunks(SQLITE_VAR_LIMIT) {
         let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-        let sql = format!(
-            "SELECT DISTINCT l.label
-             FROM labels l
-             INNER JOIN issues i ON i.id = l.issue_id
-             WHERE i.status IN ('closed', 'tombstone') AND l.label IN ({})",
+        let label_sql = format!(
+            "SELECT label, issue_id
+             FROM labels
+             WHERE label IN ({})",
             placeholders.join(",")
         );
-        let params: Vec<SqliteValue> = chunk
+        let label_params: Vec<SqliteValue> = chunk
             .iter()
             .map(|label| SqliteValue::from(label.as_str()))
             .collect();
-        let rows = conn.query_with_params(&sql, &params)?;
+        let rows = conn.query_with_params(&label_sql, &label_params)?;
 
+        let mut issue_ids_by_capability: HashMap<String, HashSet<String>> = HashMap::new();
         for row in &rows {
-            if let Some(label) = row.get(0).and_then(SqliteValue::as_text)
-                && let Some(cap) = label.strip_prefix("provides:")
+            let Some(label) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(issue_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(capability) = label.strip_prefix("provides:") else {
+                continue;
+            };
+            issue_ids_by_capability
+                .entry(capability.to_string())
+                .or_default()
+                .insert(issue_id.to_string());
+        }
+
+        if issue_ids_by_capability.is_empty() {
+            continue;
+        }
+
+        let candidate_issue_ids: Vec<String> = issue_ids_by_capability
+            .values()
+            .flat_map(|issue_ids| issue_ids.iter().cloned())
+            .collect();
+        let mut closed_issue_ids = HashSet::new();
+
+        for issue_chunk in candidate_issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let issue_placeholders: Vec<&str> = issue_chunk.iter().map(|_| "?").collect();
+            let issue_sql = format!(
+                "SELECT id
+                 FROM issues
+                 WHERE status IN ('closed', 'tombstone') AND id IN ({})",
+                issue_placeholders.join(",")
+            );
+            let issue_params: Vec<SqliteValue> = issue_chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+            let issue_rows = conn.query_with_params(&issue_sql, &issue_params)?;
+
+            for row in &issue_rows {
+                if let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) {
+                    closed_issue_ids.insert(issue_id.to_string());
+                }
+            }
+        }
+
+        for (capability, issue_ids) in issue_ids_by_capability {
+            if issue_ids
+                .iter()
+                .any(|issue_id| closed_issue_ids.contains(issue_id))
             {
-                satisfied.insert(cap.to_string());
+                satisfied.insert(capability);
             }
         }
     }

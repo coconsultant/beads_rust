@@ -4,8 +4,8 @@
 
 use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic_with_outer_mode};
 use crate::config::{
-    CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, load_config,
-    open_storage_with_cli, should_use_color,
+    CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, open_storage_with_cli,
+    should_use_color,
 };
 use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput};
@@ -32,9 +32,9 @@ pub fn execute(
 
     let beads_dir = discover_beads_dir_with_cli(overrides)?;
     let storage_ctx = open_storage_with_cli(&beads_dir, overrides)?;
+    let config_layer = storage_ctx.load_config(overrides)?;
     let storage = &storage_ctx.storage;
 
-    let config_layer = load_config(&beads_dir, Some(storage), overrides)?;
     let external_db_paths = external_project_db_paths(&config_layer, &beads_dir);
     let use_color = should_use_color(&config_layer);
     let output_format = resolve_output_format_basic_with_outer_mode(

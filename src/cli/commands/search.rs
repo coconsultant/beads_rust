@@ -41,7 +41,53 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+
+    let mut filters = build_filters(&args.filters)?;
+    let client_filters = needs_client_filters(&args.filters);
+    let needs_post_query_ordering = requires_post_query_ordering(&args.filters, client_filters);
+    let limit = if needs_post_query_ordering {
+        filters.limit.take()
+    } else {
+        None
+    };
+    if needs_post_query_ordering {
+        filters.sort = None;
+        filters.reverse = false;
+    }
+
+    let issues = storage.search_issues(query, &filters)?;
+    let mut issues = if client_filters {
+        apply_client_filters(issues, &args.filters)?
+    } else {
+        issues
+    };
+
+    if needs_post_query_ordering {
+        apply_issue_sort(&mut issues, args.filters.sort.as_deref())?;
+        if args.filters.reverse {
+            issues.reverse();
+        }
+        if let Some(limit) = limit
+            && limit > 0
+            && issues.len() > limit
+        {
+            issues.truncate(limit);
+        }
+    }
+
+    let output_format = resolve_output_format_with_outer_mode(
+        args.filters.format,
+        outer_ctx.inherited_output_mode(),
+        false,
+    );
+
+    let quiet = cli.quiet.unwrap_or(false);
+    let early_ctx = OutputContext::from_output_format(output_format, quiet, true);
+    if matches!(early_ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
+    let config_layer = storage_ctx.load_config(cli)?;
     let use_color = config::should_use_color(&config_layer);
     let max_width = if std::io::stdout().is_terminal() {
         Some(terminal_width())
@@ -53,43 +99,7 @@ pub fn execute(
         max_width,
         wrap: args.filters.wrap,
     };
-
-    let mut filters = build_filters(&args.filters)?;
-    let limit = filters.limit.take();
-    filters.sort = None;
-    filters.reverse = false;
-    let client_filters = needs_client_filters(&args.filters);
-
-    let issues = storage.search_issues(query, &filters)?;
-    let mut issues = if client_filters {
-        apply_client_filters(issues, &args.filters)?
-    } else {
-        issues
-    };
-
-    apply_issue_sort(&mut issues, args.filters.sort.as_deref())?;
-    if args.filters.reverse {
-        issues.reverse();
-    }
-    if let Some(limit) = limit
-        && limit > 0
-        && issues.len() > limit
-    {
-        issues.truncate(limit);
-    }
-
-    let output_format = resolve_output_format_with_outer_mode(
-        args.filters.format,
-        outer_ctx.inherited_output_mode(),
-        false,
-    );
-
-    let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
-
-    if matches!(ctx.mode(), OutputMode::Quiet) {
-        return Ok(());
-    }
 
     match output_format {
         OutputFormat::Json => {
@@ -342,6 +352,10 @@ fn needs_client_filters(args: &ListArgs) -> bool {
         || args.overdue
 }
 
+fn requires_post_query_ordering(args: &ListArgs, client_filters: bool) -> bool {
+    client_filters || args.sort.is_some()
+}
+
 fn apply_client_filters(
     issues: Vec<crate::model::Issue>,
     args: &ListArgs,
@@ -564,6 +578,30 @@ mod tests {
         };
 
         assert!(!needs_client_filters(&args));
+    }
+
+    #[test]
+    fn test_requires_post_query_ordering_only_for_client_filters_or_explicit_sort() {
+        let args = ListArgs::default();
+        assert!(!requires_post_query_ordering(&args, false));
+
+        let args = ListArgs {
+            reverse: true,
+            ..ListArgs::default()
+        };
+        assert!(!requires_post_query_ordering(&args, false));
+
+        let args = ListArgs {
+            sort: Some("updated".to_string()),
+            ..ListArgs::default()
+        };
+        assert!(requires_post_query_ordering(&args, false));
+
+        let args = ListArgs {
+            desc_contains: Some("needle".to_string()),
+            ..ListArgs::default()
+        };
+        assert!(requires_post_query_ordering(&args, true));
     }
 
     #[test]

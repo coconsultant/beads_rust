@@ -621,6 +621,41 @@ fn e2e_quiet_flag_list() {
 }
 
 #[test]
+fn e2e_quiet_list_suppresses_truncation_note() {
+    let _log = common::test_log("e2e_quiet_list_suppresses_truncation_note");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    for title in ["Quiet list a", "Quiet list b"] {
+        let create = run_br(&workspace, ["create", title], "create");
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+    }
+
+    let list = run_br(
+        &workspace,
+        ["--quiet", "list", "--limit", "1"],
+        "list_quiet_limit",
+    );
+    assert!(
+        list.status.success(),
+        "list --quiet --limit 1 failed: {}",
+        list.stderr
+    );
+    assert!(
+        !list.stderr.contains("Output truncated"),
+        "quiet list should not emit truncation note: {}",
+        list.stderr
+    );
+    assert!(
+        !list.stderr.contains("Showing 1 of"),
+        "quiet list should not emit client-filter truncation note: {}",
+        list.stderr
+    );
+}
+
+#[test]
 fn e2e_quiet_flag_dep_subcommands() {
     let _log = common::test_log("e2e_quiet_flag_dep_subcommands");
     let workspace = BrWorkspace::new();
@@ -704,6 +739,228 @@ fn e2e_quiet_flag_dep_subcommands() {
         remove.stdout.trim().is_empty(),
         "dep remove --quiet should produce no stdout: '{}'",
         remove.stdout
+    );
+}
+
+#[test]
+fn e2e_quiet_flag_graph_subcommands() {
+    let _log = common::test_log("e2e_quiet_flag_graph_subcommands");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet graph test"],
+        "create_graph_quiet",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let issue_id = create
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    assert!(!issue_id.is_empty(), "expected created issue id in stdout");
+
+    let graph_single = run_br(
+        &workspace,
+        ["--quiet", "graph", &issue_id],
+        "graph_quiet_single",
+    );
+    assert!(
+        graph_single.status.success(),
+        "graph --quiet failed: {}",
+        graph_single.stderr
+    );
+    assert!(
+        graph_single.stdout.trim().is_empty(),
+        "graph --quiet should produce no stdout: '{}'",
+        graph_single.stdout
+    );
+
+    let graph_all = run_br(&workspace, ["--quiet", "graph", "--all"], "graph_quiet_all");
+    assert!(
+        graph_all.status.success(),
+        "graph --quiet --all failed: {}",
+        graph_all.stderr
+    );
+    assert!(
+        graph_all.stdout.trim().is_empty(),
+        "graph --quiet --all should produce no stdout: '{}'",
+        graph_all.stdout
+    );
+}
+
+#[test]
+fn e2e_quiet_flag_comments_subcommands() {
+    let _log = common::test_log("e2e_quiet_flag_comments_subcommands");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet comments test"],
+        "create_comments_quiet",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let issue_id = create
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    assert!(!issue_id.is_empty(), "expected created issue id in stdout");
+
+    let add = run_br(
+        &workspace,
+        [
+            "--quiet",
+            "comments",
+            "add",
+            &issue_id,
+            "hello quiet comments",
+        ],
+        "comments_add_quiet",
+    );
+    assert!(
+        add.status.success(),
+        "comments add --quiet failed: {}",
+        add.stderr
+    );
+    assert!(
+        add.stdout.trim().is_empty(),
+        "comments add --quiet should produce no stdout: '{}'",
+        add.stdout
+    );
+
+    let list = run_br(
+        &workspace,
+        ["--quiet", "comments", "list", &issue_id],
+        "comments_list_quiet",
+    );
+    assert!(
+        list.status.success(),
+        "comments list --quiet failed: {}",
+        list.stderr
+    );
+    assert!(
+        list.stdout.trim().is_empty(),
+        "comments list --quiet should produce no stdout: '{}'",
+        list.stdout
+    );
+}
+
+#[test]
+fn e2e_quiet_flag_query_subcommands() {
+    let _log = common::test_log("e2e_quiet_flag_query_subcommands");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet query test"],
+        "create_query_quiet",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let save = run_br(
+        &workspace,
+        ["--quiet", "query", "save", "mine", "--status", "open"],
+        "query_save_quiet",
+    );
+    assert!(
+        save.status.success(),
+        "query save --quiet failed: {}",
+        save.stderr
+    );
+    assert!(
+        save.stdout.trim().is_empty(),
+        "query save --quiet should produce no stdout: '{}'",
+        save.stdout
+    );
+
+    let list = run_br(&workspace, ["--quiet", "query", "list"], "query_list_quiet");
+    assert!(
+        list.status.success(),
+        "query list --quiet failed: {}",
+        list.stderr
+    );
+    assert!(
+        list.stdout.trim().is_empty(),
+        "query list --quiet should produce no stdout: '{}'",
+        list.stdout
+    );
+
+    let delete = run_br(
+        &workspace,
+        ["--quiet", "query", "delete", "mine"],
+        "query_delete_quiet",
+    );
+    assert!(
+        delete.status.success(),
+        "query delete --quiet failed: {}",
+        delete.stderr
+    );
+    assert!(
+        delete.stdout.trim().is_empty(),
+        "query delete --quiet should produce no stdout: '{}'",
+        delete.stdout
+    );
+}
+
+#[test]
+fn e2e_quiet_flag_count_and_where() {
+    let _log = common::test_log("e2e_quiet_flag_count_and_where");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet count/where test"],
+        "create_count_where_quiet",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let count = run_br(&workspace, ["--quiet", "count"], "count_quiet");
+    assert!(
+        count.status.success(),
+        "count --quiet failed: {}",
+        count.stderr
+    );
+    assert!(
+        count.stdout.trim().is_empty(),
+        "count --quiet should produce no stdout: '{}'",
+        count.stdout
+    );
+
+    let where_cmd = run_br(&workspace, ["--quiet", "where"], "where_quiet");
+    assert!(
+        where_cmd.status.success(),
+        "where --quiet failed: {}",
+        where_cmd.stderr
+    );
+    assert!(
+        where_cmd.stdout.trim().is_empty(),
+        "where --quiet should produce no stdout: '{}'",
+        where_cmd.stdout
     );
 }
 

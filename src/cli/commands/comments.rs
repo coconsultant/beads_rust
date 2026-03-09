@@ -87,6 +87,10 @@ fn add_comment(
 
     let comment = storage.add_comment(&issue_id, &author, &text)?;
 
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     if ctx.is_json() {
         ctx.json_pretty(&comment);
     } else if ctx.is_rich() {
@@ -121,6 +125,10 @@ fn list_comments_by_id(
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, id)?;
     let comments = storage.get_comments(&issue_id)?;
+
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
 
     if ctx.is_json() {
         ctx.json_pretty(&comments);

@@ -77,6 +77,7 @@ fn ensure_regular_backup_file(backup_path: &Path, backup_name: &str) -> Result<(
 pub fn execute(args: HistoryArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let history_dir = beads_dir.join(".br_history");
+    let _ = history::validate_history_dir_path(&history_dir)?;
 
     match args.command {
         Some(HistoryCommands::Diff { file }) => {
@@ -501,6 +502,16 @@ fn current_jsonl_path_for_backup(
     filename: &str,
     active_jsonl_path: Option<&Path>,
 ) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().ok();
+    current_jsonl_path_for_backup_with_cwd(beads_dir, filename, active_jsonl_path, cwd.as_deref())
+}
+
+fn current_jsonl_path_for_backup_with_cwd(
+    beads_dir: &Path,
+    filename: &str,
+    active_jsonl_path: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<PathBuf> {
     let backup_name = validated_backup_filename(filename)?;
     let target_path = history::resolve_backup_target_path(
         beads_dir,
@@ -518,10 +529,12 @@ fn current_jsonl_path_for_backup(
                 target_path.display()
             ))
         })?;
+        let normalized_target = normalize_jsonl_match_path(&target_path, cwd);
+        let normalized_active = normalize_jsonl_match_path(active_jsonl_path, cwd);
         let canonical_target =
-            dunce::canonicalize(&target_path).unwrap_or_else(|_| target_path.clone());
-        let canonical_active = dunce::canonicalize(active_jsonl_path)
-            .unwrap_or_else(|_| active_jsonl_path.to_path_buf());
+            dunce::canonicalize(&normalized_target).unwrap_or_else(|_| normalized_target.clone());
+        let canonical_active =
+            dunce::canonicalize(&normalized_active).unwrap_or_else(|_| normalized_active.clone());
         if canonical_target != canonical_active {
             return Err(BeadsError::Config(format!(
                 "Backup target '{}' does not match the active JSONL path '{}'",
@@ -532,6 +545,16 @@ fn current_jsonl_path_for_backup(
     }
 
     Ok(target_path)
+}
+
+fn normalize_jsonl_match_path(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(cwd) = cwd {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn validated_backup_filename(filename: &str) -> Result<String> {
@@ -701,6 +724,49 @@ mod tests {
         let resolved =
             current_jsonl_path_for_backup(&beads_dir, &backup_name, Some(&external_target))
                 .unwrap();
+        assert_eq!(resolved, external_target);
+    }
+
+    #[test]
+    fn test_current_jsonl_path_for_backup_accepts_relative_external_active_path_when_missing() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let external_target = external_dir.join("issues.jsonl");
+        fs::write(&external_target, "external-state\n").unwrap();
+
+        let config = history::HistoryConfig {
+            enabled: true,
+            max_count: 10,
+            max_age_days: 30,
+        };
+        history::backup_before_export(&beads_dir, &config, &external_target).unwrap();
+
+        let backup_name = history::list_backups(&history_dir, None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("backup filename");
+
+        fs::remove_file(&external_target).unwrap();
+
+        let resolved = current_jsonl_path_for_backup_with_cwd(
+            &beads_dir,
+            &backup_name,
+            Some(Path::new("external/issues.jsonl")),
+            Some(temp.path()),
+        )
+        .unwrap();
         assert_eq!(resolved, external_target);
     }
 

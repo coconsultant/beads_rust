@@ -69,7 +69,7 @@ pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
-    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
@@ -99,6 +99,10 @@ fn graph_single(
         .ok_or_else(|| BeadsError::IssueNotFound {
             id: root_id.to_string(),
         })?;
+
+    if ctx.is_quiet() {
+        return Ok(());
+    }
 
     let traversal = collect_single_graph(storage, root_id, &root_issue)?;
     let root_nodes = [root_id.to_string()];
@@ -147,6 +151,10 @@ fn graph_single(
 /// Show graph for all `open`/`in_progress`/`blocked` issues.
 #[allow(clippy::too_many_lines)]
 fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Result<()> {
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+
     // Get all open/in_progress/blocked issues
     let filters = ListFilters {
         statuses: Some(vec![Status::Open, Status::InProgress, Status::Blocked]),

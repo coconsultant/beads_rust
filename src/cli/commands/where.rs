@@ -35,6 +35,10 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
         return Err(BeadsError::NotInitialized);
     };
 
+    if matches!(ctx.mode(), crate::output::OutputMode::Quiet) {
+        return Ok(());
+    }
+
     if ctx.is_json() {
         ctx.json_pretty(&output);
     } else if ctx.is_rich() {

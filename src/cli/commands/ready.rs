@@ -31,9 +31,9 @@ pub fn execute(
     // Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
     let storage = &storage_ctx.storage;
 
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
     let use_color = config::should_use_color(&config_layer);
     let max_width = if std::io::stdout().is_terminal() {
@@ -92,7 +92,6 @@ pub fn execute(
             ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
         }
 
-        // Apply limit after external filtering
         if args.limit > 0 && ready_issues.len() > args.limit {
             ready_issues.truncate(args.limit);
         }

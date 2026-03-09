@@ -106,6 +106,58 @@ fn e2e_error_handling() {
 }
 
 #[test]
+fn e2e_update_tombstone_rejected() {
+    let _log = common::test_log("e2e_update_tombstone_rejected");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "To delete", "--json"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id");
+
+    let delete = run_br(
+        &workspace,
+        [
+            "delete",
+            id,
+            "--force",
+            "--reason",
+            "Delete for update regression",
+        ],
+        "delete",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+
+    let update = run_br(
+        &workspace,
+        ["update", id, "--status", "open", "--json"],
+        "update_tombstone",
+    );
+    assert!(!update.status.success(), "tombstone update should fail");
+    assert_eq!(update.status.code(), Some(4), "exit code should be 4");
+
+    let json = parse_error_json(&update.stderr).expect("should be valid error json");
+    assert!(verify_error_structure(&json), "missing required fields");
+    assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot update tombstone issue")),
+        "error should explain that tombstones cannot be updated"
+    );
+
+    let show = run_br(&workspace, ["show", id, "--json"], "show_tombstone");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let show_json: Value =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+    assert_eq!(show_json[0]["status"], "tombstone");
+}
+
+#[test]
 fn e2e_dependency_errors() {
     let _log = common::test_log("e2e_dependency_errors");
     let workspace = BrWorkspace::new();

@@ -798,9 +798,25 @@ pub struct OpenStorageResult {
     pub storage: SqliteStorage,
     pub paths: ConfigPaths,
     pub no_db: bool,
+    startup_layers: Vec<ConfigLayer>,
 }
 
 impl OpenStorageResult {
+    /// Load the full merged config while reusing startup layers already read
+    /// during storage resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSONL prefix inference or DB-backed config loading fails.
+    pub fn load_config(&self, cli: &CliOverrides) -> Result<ConfigLayer> {
+        load_config_from_startup_layers(
+            &self.startup_layers,
+            &self.paths.jsonl_path,
+            Some(&self.storage),
+            cli,
+        )
+    }
+
     /// Flush JSONL if no-db mode is enabled and there are dirty issues.
     ///
     /// # Errors
@@ -846,9 +862,14 @@ impl OpenStorageResult {
 /// Returns an error if configuration loading, JSONL import, or storage setup fails.
 pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<OpenStorageResult> {
     let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    let StartupConfig {
+        paths,
+        layers: startup_layers,
+        ..
+    } = startup;
     let cli_layer = cli.as_layer();
 
-    let mut all_layers = startup.layers.clone();
+    let mut all_layers = startup_layers.clone();
     all_layers.push(cli_layer);
     let merged_layer = ConfigLayer::merge_layers(&all_layers);
 
@@ -861,16 +882,14 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
 
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix =
-            resolve_bootstrap_issue_prefix(&merged_layer, beads_dir, &startup.paths.jsonl_path)?;
+        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, beads_dir, &paths.jsonl_path)?;
         storage.set_config("issue_prefix", &prefix)?;
 
-        if startup.paths.jsonl_path.is_file() {
-            let import_config =
-                import_config_for_resolved_jsonl(beads_dir, &startup.paths.jsonl_path);
+        if paths.jsonl_path.is_file() {
+            let import_config = import_config_for_resolved_jsonl(beads_dir, &paths.jsonl_path);
             import_from_jsonl(
                 &mut storage,
-                &startup.paths.jsonl_path,
+                &paths.jsonl_path,
                 &import_config,
                 Some(&prefix),
             )?;
@@ -878,20 +897,22 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
 
         Ok(OpenStorageResult {
             storage,
-            paths: startup.paths,
+            paths,
             no_db,
+            startup_layers,
         })
     } else {
         let storage = open_sqlite_storage_with_recovery(
             beads_dir,
-            &startup.paths,
+            &paths,
             resolved_lock_timeout,
             &merged_layer,
         )?;
         Ok(OpenStorageResult {
             storage,
-            paths: startup.paths,
+            paths,
             no_db,
+            startup_layers,
         })
     }
 }
@@ -1399,10 +1420,17 @@ pub fn load_config(
     storage: Option<&SqliteStorage>,
     cli: &CliOverrides,
 ) -> Result<ConfigLayer> {
-    let defaults = default_config_layer();
-
-    // Load startup config once. This includes legacy user, user, project, and env layers.
     let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    load_config_from_startup_layers(&startup.layers, &startup.paths.jsonl_path, storage, cli)
+}
+
+fn load_config_from_startup_layers(
+    startup_layers: &[ConfigLayer],
+    jsonl_path: &Path,
+    storage: Option<&SqliteStorage>,
+    cli: &CliOverrides,
+) -> Result<ConfigLayer> {
+    let defaults = default_config_layer();
 
     // Infer issue prefix from the first issue in JSONL so workspaces with
     // non-"bd" prefixes don't silently fall back to "bd" when the DB layer
@@ -1410,7 +1438,7 @@ pub fn load_config(
     // Uses a fast single-line read (not full-file scan) since this runs on
     // every command.
     let mut jsonl_inferred = ConfigLayer::default();
-    if let Some(prefix) = first_prefix_from_jsonl(&startup.paths.jsonl_path)? {
+    if let Some(prefix) = first_prefix_from_jsonl(jsonl_path)? {
         jsonl_inferred
             .runtime
             .insert("issue_prefix".to_string(), prefix);
@@ -1423,7 +1451,7 @@ pub fn load_config(
     let cli_layer = cli.as_layer();
 
     let mut layers = vec![defaults, jsonl_inferred, db_layer];
-    layers.extend(startup.layers);
+    layers.extend(startup_layers.iter().cloned());
     layers.push(cli_layer);
 
     Ok(ConfigLayer::merge_layers(&layers))
@@ -3453,6 +3481,36 @@ routing:
                 .expect("read backed-up sentinel"),
             "keep me"
         );
+    }
+
+    #[test]
+    fn open_storage_result_load_config_matches_direct_load_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(
+            beads_dir.join("config.yaml"),
+            "issue_prefix: proj\ncolor: false\n",
+        )
+        .expect("write project config");
+
+        let cli = CliOverrides {
+            display_color: Some(false),
+            ..CliOverrides::default()
+        };
+        let mut storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
+        storage_ctx
+            .storage
+            .set_config("issue_prefix", "db-prefix")
+            .expect("set issue_prefix");
+
+        let direct =
+            load_config(&beads_dir, Some(&storage_ctx.storage), &cli).expect("direct load config");
+        let reused = storage_ctx
+            .load_config(&cli)
+            .expect("reused startup load config");
+
+        assert_eq!(reused, direct);
     }
 
     #[test]

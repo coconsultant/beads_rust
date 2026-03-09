@@ -184,6 +184,46 @@ fn backup_metadata_path(backup_path: &Path) -> PathBuf {
     backup_path.with_extension("jsonl.meta.json")
 }
 
+pub(crate) fn validate_history_dir_path(history_dir: &Path) -> Result<bool> {
+    match fs::symlink_metadata(history_dir) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(BeadsError::Config(format!(
+                    "History directory '{}' must not be a symlink",
+                    history_dir.display()
+                )));
+            }
+            if !file_type.is_dir() {
+                return Err(BeadsError::Config(format!(
+                    "History directory '{}' must be a directory",
+                    history_dir.display()
+                )));
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(BeadsError::Io(err)),
+    }
+}
+
+fn ensure_history_dir_path(history_dir: &Path) -> Result<()> {
+    if validate_history_dir_path(history_dir)? {
+        return Ok(());
+    }
+
+    fs::create_dir_all(history_dir).map_err(BeadsError::Io)?;
+
+    if validate_history_dir_path(history_dir)? {
+        Ok(())
+    } else {
+        Err(BeadsError::Config(format!(
+            "Failed to create history directory '{}'",
+            history_dir.display()
+        )))
+    }
+}
+
 fn history_artifact_metadata(path: &Path, label: &str) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -394,10 +434,7 @@ pub fn backup_before_export(
         return Ok(());
     }
 
-    // Create history directory if it doesn't exist
-    if !history_dir.exists() {
-        fs::create_dir_all(&history_dir).map_err(BeadsError::Io)?;
-    }
+    ensure_history_dir_path(&history_dir)?;
 
     // Determine backup filename based on target filename
     let file_stem = target_path
@@ -486,7 +523,7 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) 
 ///
 /// Returns an error if the directory cannot be read.
 pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<Vec<BackupEntry>> {
-    if !history_dir.exists() {
+    if !validate_history_dir_path(history_dir)? {
         return Ok(Vec::new());
     }
 
@@ -941,6 +978,28 @@ mod tests {
         assert!(backups.is_empty(), "symlinked backup files must be ignored");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_list_backups_rejects_symlinked_history_directory() {
+        let temp = TempDir::new().unwrap();
+        let outside_dir = temp.path().join("outside");
+        let history_dir = temp.path().join(".br_history");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("issues.20260307_120000.jsonl"), "backup\n").unwrap();
+        symlink(&outside_dir, &history_dir).unwrap();
+
+        let err = list_backups(&history_dir, None).unwrap_err();
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("must not be a symlink"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_prune_backups_returns_error_on_partial_deletion_failure() {
         let temp = TempDir::new().unwrap();
@@ -1017,6 +1076,38 @@ mod tests {
             fs::read_to_string(&metadata_target).unwrap(),
             "do-not-touch",
             "existing metadata symlink target should not be overwritten"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_before_export_rejects_symlinked_history_directory() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, &history_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        fs::write(&target_path, "issue\n").unwrap();
+
+        let err =
+            backup_before_export(&beads_dir, &HistoryConfig::default(), &target_path).unwrap_err();
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("must not be a symlink"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "symlinked history directory must not receive backups"
         );
     }
 }

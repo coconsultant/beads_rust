@@ -15,6 +15,7 @@ use crate::sync::{
     export_temp_path, export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl,
     import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
     require_safe_sync_overwrite_path, save_base_snapshot, three_way_merge,
+    validate_sync_path_with_external,
 };
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -186,16 +187,6 @@ fn validate_sync_paths(
         ))
     })?;
 
-    let jsonl_parent = jsonl_path.parent().ok_or_else(|| {
-        BeadsError::Config("JSONL path must include a parent directory".to_string())
-    })?;
-    let canonical_parent = dunce::canonicalize(jsonl_parent).map_err(|e| {
-        BeadsError::Config(format!(
-            "JSONL directory does not exist or is not accessible: {} ({e})",
-            jsonl_parent.display()
-        ))
-    })?;
-
     let jsonl_path = if jsonl_path.exists() {
         dunce::canonicalize(jsonl_path).map_err(|e| {
             BeadsError::Config(format!(
@@ -204,10 +195,13 @@ fn validate_sync_paths(
             ))
         })?
     } else {
+        let jsonl_parent = jsonl_path.parent().ok_or_else(|| {
+            BeadsError::Config("JSONL path must include a parent directory".to_string())
+        })?;
         let file_name = jsonl_path
             .file_name()
             .ok_or_else(|| BeadsError::Config("JSONL path must include a filename".to_string()))?;
-        canonical_parent.join(file_name)
+        resolve_sync_parent_path(jsonl_parent)?.join(file_name)
     };
 
     let extension = jsonl_path
@@ -244,10 +238,12 @@ fn validate_sync_paths(
         );
         return Err(BeadsError::Config(format!(
             "Refusing to use JSONL path inside .git directory: {}.\n\
-             Move the JSONL path outside .git to proceed.",
+            Move the JSONL path outside .git to proceed.",
             jsonl_path.display()
         )));
     }
+
+    validate_sync_path_with_external(&jsonl_path, &canonical_beads, allow_external_jsonl)?;
 
     debug!(
         jsonl_path = %jsonl_path.display(),
@@ -264,6 +260,29 @@ fn validate_sync_paths(
         beads_dir: canonical_beads,
         is_external,
     })
+}
+
+fn resolve_sync_parent_path(jsonl_parent: &Path) -> Result<PathBuf> {
+    if jsonl_parent.exists() {
+        return dunce::canonicalize(jsonl_parent).map_err(|e| {
+            BeadsError::Config(format!(
+                "JSONL directory is not accessible: {} ({e})",
+                jsonl_parent.display()
+            ))
+        });
+    }
+
+    if jsonl_parent.is_absolute() {
+        return Ok(jsonl_parent.to_path_buf());
+    }
+
+    let cwd = std::env::current_dir().map_err(|e| {
+        BeadsError::Config(format!(
+            "Failed to resolve current directory for JSONL path {}: {e}",
+            jsonl_parent.display()
+        ))
+    })?;
+    Ok(cwd.join(jsonl_parent))
 }
 
 fn contains_git_dir(path: &Path) -> bool {
@@ -1413,9 +1432,13 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 
 #[cfg(test)]
 mod tests {
+    use super::validate_sync_paths;
+    use crate::error::BeadsError;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
+    use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
@@ -1482,5 +1505,55 @@ mod tests {
 
         let dirty_ids = storage.get_dirty_issue_ids().unwrap();
         assert!(!dirty_ids.is_empty());
+    }
+
+    #[test]
+    fn test_validate_sync_paths_allows_missing_internal_parent_directory() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let jsonl_path = beads_dir.join("nested").join("issues.jsonl");
+        let policy = validate_sync_paths(&beads_dir, &jsonl_path, false).expect("path policy");
+
+        assert_eq!(policy.jsonl_path, jsonl_path);
+        assert!(!policy.is_external);
+    }
+
+    #[test]
+    fn test_validate_sync_paths_allows_missing_external_parent_directory_with_opt_in() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let jsonl_path = temp
+            .path()
+            .join("external")
+            .join("nested")
+            .join("issues.jsonl");
+        let policy = validate_sync_paths(&beads_dir, &jsonl_path, true).expect("path policy");
+
+        assert_eq!(policy.jsonl_path, jsonl_path);
+        assert!(policy.is_external);
+    }
+
+    #[test]
+    fn test_validate_sync_paths_rejects_traversal_for_missing_external_parent() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let traversal_path = PathBuf::from("../outside/issues.jsonl");
+        let err = validate_sync_paths(&beads_dir, &traversal_path, true).unwrap_err();
+
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("traversal"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
