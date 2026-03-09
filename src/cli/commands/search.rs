@@ -581,7 +581,10 @@ mod tests {
         let mut older_created_but_newer_updated = make_issue("bd-b", "Beta", None, t1);
         older_created_but_newer_updated.updated_at = t3;
 
-        let mut items = vec![newer_created_but_older_updated, older_created_but_newer_updated];
+        let mut items = vec![
+            newer_created_but_older_updated,
+            older_created_but_newer_updated,
+        ];
 
         apply_issue_sort(&mut items, Some("updated")).expect("sort");
         items.truncate(1);
@@ -643,9 +646,7 @@ mod tests {
         filters.sort = None;
         filters.reverse = false;
 
-        let mut issues = storage
-            .search_issues("match", &filters)
-            .expect("search");
+        let mut issues = storage.search_issues("match", &filters).expect("search");
 
         apply_issue_sort(&mut issues, args.sort.as_deref()).expect("sort");
         if args.reverse {

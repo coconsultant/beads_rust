@@ -147,17 +147,28 @@ pub fn execute_defer(
         storage.rebuild_blocked_cache(true)?;
     }
 
-    // Output
+    render_defer_output(&deferred_issues, &deferred_full, &skipped_issues, args, ctx)?;
+
+    storage_ctx.flush_no_db_if_dirty()?;
+    Ok(())
+}
+
+fn render_defer_output(
+    deferred_issues: &[DeferredIssue],
+    deferred_full: &[Issue],
+    skipped_issues: &[SkippedIssue],
+    args: &DeferArgs,
+    ctx: &OutputContext,
+) -> Result<()> {
     let use_json = ctx.is_json() || args.robot;
     if use_json {
-        // bd outputs a bare array of updated issues
         let json_output: Vec<ReadyIssue> = deferred_full.iter().map(ReadyIssue::from).collect();
         let json = serde_json::to_string_pretty(&json_output)?;
         println!("{json}");
     } else if matches!(ctx.mode(), OutputMode::Rich) {
-        render_defer_rich(&deferred_issues, &skipped_issues, ctx);
+        render_defer_rich(deferred_issues, skipped_issues, ctx);
     } else {
-        for deferred in &deferred_issues {
+        for deferred in deferred_issues {
             print!("\u{23f1} Deferred {}: {}", deferred.id, deferred.title);
             if let Some(ref until) = deferred.defer_until {
                 println!(" (until {until})");
@@ -165,7 +176,7 @@ pub fn execute_defer(
                 println!(" (indefinitely)");
             }
         }
-        for skipped in &skipped_issues {
+        for skipped in skipped_issues {
             println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
         }
         if deferred_issues.is_empty() && skipped_issues.is_empty() {
@@ -173,7 +184,6 @@ pub fn execute_defer(
         }
     }
 
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 

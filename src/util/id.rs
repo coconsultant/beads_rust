@@ -216,8 +216,10 @@ pub fn compute_id_hash(input: &str, length: usize) -> String {
         s = format!("{s:0>length$}");
     }
 
-    // Take the first `length` chars
-    s.chars().take(length).collect()
+    // Take the last `length` characters to ensure full entropy from
+    // the least significant digits of the base36 encoding.
+    let start = s.len().saturating_sub(length);
+    s.chars().skip(start).collect()
 }
 
 fn base36_encode(mut num: u64) -> String {
