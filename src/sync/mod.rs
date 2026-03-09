@@ -2299,89 +2299,69 @@ pub fn import_from_jsonl(
     // Step 1: Conflict marker scan
     ensure_no_conflict_markers(input_path)?;
 
-    // Step 2: Parse JSONL with 2MB buffer
-    let spinner = create_spinner("Reading JSONL", config.show_progress);
+    // Step 2: Parse, Normalize, and Validate JSONL
+    let spinner = create_spinner("Parsing and validating issues", config.show_progress);
     let file = File::open(input_path)?;
     let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
     let mut issues = Vec::new();
-    let mut seen_ids_in_file = HashSet::new();
+    let mut id_to_index = std::collections::HashMap::new();
+    let mut mismatches = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let issue: Issue = serde_json::from_str(&line).map_err(|e| {
+        let mut issue: Issue = serde_json::from_str(&line).map_err(|e| {
             BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
         })?;
 
-        // Detect duplicate IDs within the same file (protect against corrupted syncs)
-        if !seen_ids_in_file.insert(issue.id.clone()) {
+        // 1. Normalize (Step 3)
+        normalize_issue(&mut issue);
+
+        // 2. Validate (Step 3.5)
+        if let Err(errors) = IssueValidator::validate(&issue) {
+            let details = errors.join(", ");
+            return Err(BeadsError::Config(format!(
+                "Validation failed for issue {} at line {}: {}",
+                issue.id, line_num + 1, details
+            )));
+        }
+
+        // 3. Prefix Check (Step 4)
+        if !config.skip_prefix_validation && let Some(prefix) = expected_prefix {
+            if !id_matches_expected_prefix(&issue.id, prefix) {
+                if issue.status != crate::model::Status::Tombstone {
+                    if !config.rename_on_import {
+                        return Err(BeadsError::Config(format!(
+                            "Prefix mismatch at line {}: expected '{}', found issue '{}'",
+                            line_num + 1, prefix, issue.id
+                        )));
+                    }
+                    mismatches.push(issue.id.clone());
+                }
+            }
+        }
+
+        // 4. Deduplicate
+        if let Some(&index) = id_to_index.get(&issue.id) {
             tracing::warn!(
                 line = line_num + 1,
                 id = %issue.id,
                 "Duplicate issue ID in JSONL; using the last occurrence"
             );
-            // Remove previous occurrence to keep order stable-ish while updating
-            issues.retain(|i: &Issue| i.id != issue.id);
+            issues[index] = issue;
+        } else {
+            id_to_index.insert(issue.id.clone(), issues.len());
+            issues.push(issue);
         }
-        issues.push(issue);
     }
-    spinner.finish_with_message("Read JSONL");
+    spinner.finish_with_message("Parsed and validated issues");
 
     let mut result = ImportResult::default();
 
-    // Step 3: Normalize issues
-    for issue in &mut issues {
-        normalize_issue(issue);
-    }
-
-    // Step 3.5: Validate issues (schema/logic constraints)
-    for issue in &issues {
-        if let Err(errors) = IssueValidator::validate(issue) {
-            let details = errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(BeadsError::Config(format!(
-                "Validation failed for issue {}: {}",
-                issue.id, details
-            )));
-        }
-    }
-
-    // Step 4: Prefix validation (if enabled and prefix provided)
-    if !config.skip_prefix_validation
-        && let Some(prefix) = expected_prefix
-    {
-        let mut mismatches = Vec::new();
-        for issue in &issues {
-            // Check if ID starts with expected prefix
-            if !id_matches_expected_prefix(&issue.id, prefix) {
-                // Skip tombstones with wrong prefix (silently drop)
-                if issue.status == crate::model::Status::Tombstone {
-                    continue;
-                }
-                mismatches.push(issue.id.clone());
-            }
-        }
-
-        if !mismatches.is_empty() && !config.rename_on_import {
-            return Err(BeadsError::Config(format!(
-                "Prefix mismatch: expected '{}', found issues: {}",
-                prefix,
-                mismatches
-                    .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-
-        // Fix: Rename issues with wrong prefix if requested
-        if config.rename_on_import && !mismatches.is_empty() {
+    // Step 5: Handle renames if requested
+    if config.rename_on_import {
             use crate::util::id::{IdConfig, IdGenerator};
 
             let mismatch_set: std::collections::HashSet<String> =

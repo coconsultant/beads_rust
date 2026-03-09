@@ -9,7 +9,6 @@ use crate::output::{OutputContext, OutputMode};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use tracing::{debug, info};
 
 /// Prefix for saved query keys in the config table.
@@ -239,13 +238,25 @@ pub fn execute(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    ensure_query_storage_available(&storage_ctx)?;
 
     match command {
         QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, ctx),
-        QueryCommands::Run(args) => query_run(args, &storage_ctx.storage, cli, &beads_dir, ctx),
+        QueryCommands::Run(args) => query_run(args, &storage_ctx.storage, cli, ctx),
         QueryCommands::List => query_list(&storage_ctx.storage, ctx),
         QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, ctx),
     }
+}
+
+fn ensure_query_storage_available(storage_ctx: &config::OpenStorageResult) -> Result<()> {
+    if storage_ctx.no_db {
+        return Err(BeadsError::validation(
+            "no_db",
+            "--no-db is not supported for query commands because saved queries are stored only in the database",
+        ));
+    }
+
+    Ok(())
 }
 
 fn query_save(
@@ -312,7 +323,6 @@ fn query_run(
     args: &QueryRunArgs,
     storage: &crate::storage::SqliteStorage,
     cli: &config::CliOverrides,
-    _beads_dir: &Path,
     ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();

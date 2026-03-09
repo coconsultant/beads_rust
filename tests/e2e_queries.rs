@@ -1020,6 +1020,52 @@ fn e2e_saved_queries_errors() {
     );
 }
 
+#[test]
+fn e2e_saved_queries_reject_no_db_mode() {
+    let _log = common::test_log("e2e_saved_queries_reject_no_db_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "saved_query_no_db_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let save = run_br(
+        &workspace,
+        ["query", "save", "existing-query", "--status", "open"],
+        "saved_query_no_db_seed",
+    );
+    assert!(
+        save.status.success(),
+        "seed query save failed: {}",
+        save.stderr
+    );
+
+    for (name, args) in [
+        (
+            "saved_query_no_db_save",
+            vec!["--no-db", "query", "save", "temp-query", "--status", "open"],
+        ),
+        ("saved_query_no_db_list", vec!["--no-db", "query", "list"]),
+        (
+            "saved_query_no_db_run",
+            vec!["--no-db", "query", "run", "existing-query"],
+        ),
+        (
+            "saved_query_no_db_delete",
+            vec!["--no-db", "query", "delete", "existing-query"],
+        ),
+    ] {
+        let result = run_br(&workspace, args, name);
+        assert!(!result.status.success(), "{name} should fail");
+        assert!(
+            result
+                .stderr
+                .contains("--no-db is not supported for query commands"),
+            "{name} should explain that query commands require the database: {}",
+            result.stderr
+        );
+    }
+}
+
 /// E2E test: CLI args override saved query filters at run time.
 #[test]
 fn e2e_saved_queries_run_with_overrides() {

@@ -195,6 +195,8 @@ fn render_defer_output(
             serde_json::to_string_pretty(&result)?
         };
         println!("{json}");
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_defer_rich(deferred_issues, skipped_issues, ctx);
     } else {
@@ -354,6 +356,8 @@ fn render_undefer_output(
             serde_json::to_string_pretty(&result)?
         };
         println!("{json}");
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_undefer_rich(undeferred_issues, skipped_issues, ctx);
     } else {

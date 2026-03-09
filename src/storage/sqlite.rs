@@ -259,22 +259,35 @@ impl SqliteStorage {
             return Ok(0);
         }
 
+        const CHUNK_SIZE: usize = 900;
         let now = Utc::now().to_rfc3339();
         let mut count = 0;
-        for (issue_id, content_hash) in exports {
-            self.conn.execute_with_params(
-                "DELETE FROM export_hashes WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id.as_str())],
-            )?;
-            self.conn.execute_with_params(
-                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-                &[
-                    SqliteValue::from(issue_id.as_str()),
-                    SqliteValue::from(content_hash.as_str()),
-                    SqliteValue::from(now.as_str()),
-                ],
-            )?;
-            count += 1;
+
+        for chunk in exports.chunks(CHUNK_SIZE) {
+            // Bulk delete existing hashes for this chunk
+            let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+            let sql = format!(
+                "DELETE FROM export_hashes WHERE issue_id IN ({})",
+                placeholders.join(",")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|(id, _)| SqliteValue::from(id.as_str()))
+                .collect();
+            self.conn.execute_with_params(&sql, &params)?;
+
+            // Insert new hashes
+            for (issue_id, content_hash) in chunk {
+                self.conn.execute_with_params(
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from(content_hash.as_str()),
+                        SqliteValue::from(now.as_str()),
+                    ],
+                )?;
+                count += 1;
+            }
         }
 
         Ok(count)
@@ -347,37 +360,56 @@ impl SqliteStorage {
                 Ok(result) => {
                     let side_effects: Result<()> = (|| {
                         // Write events
-                        for event in &ctx.events {
-                            self.conn.execute_with_params(
-                                "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                &[
-                                    SqliteValue::from(event.issue_id.as_str()),
-                                    SqliteValue::from(event.event_type.as_str()),
-                                    SqliteValue::from(event.actor.as_str()),
-                                    event.old_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                    event.new_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                    event.comment.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                                    SqliteValue::from(event.created_at.to_rfc3339()),
-                                ],
-                            )?;
+                        if !ctx.events.is_empty() {
+                            for event in &ctx.events {
+                                self.conn.execute_with_params(
+                                    "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                    &[
+                                        SqliteValue::from(event.issue_id.as_str()),
+                                        SqliteValue::from(event.event_type.as_str()),
+                                        SqliteValue::from(event.actor.as_str()),
+                                        event.old_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                                        event.new_value.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                                        event.comment.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                                        SqliteValue::from(event.created_at.to_rfc3339()),
+                                    ],
+                                )?;
+                            }
                         }
 
                         // Mark dirty — DELETE + INSERT instead of INSERT OR
                         // REPLACE because fsqlite lacks UNIQUE enforcement.
-                        let now_str = Utc::now().to_rfc3339();
-                        for id in &ctx.dirty_ids {
-                            self.conn.execute_with_params(
-                                "DELETE FROM dirty_issues WHERE issue_id = ?",
-                                &[SqliteValue::from(id.as_str())],
-                            )?;
-                            self.conn.execute_with_params(
-                                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
-                                &[
-                                    SqliteValue::from(id.as_str()),
-                                    SqliteValue::from(now_str.as_str()),
-                                ],
-                            )?;
+                        if !ctx.dirty_ids.is_empty() {
+                            let now_str = Utc::now().to_rfc3339();
+                            const CHUNK_SIZE: usize = 900;
+                            let dirty_vec: Vec<String> = ctx.dirty_ids.iter().cloned().collect();
+
+                            for chunk in dirty_vec.chunks(CHUNK_SIZE) {
+                                // Bulk delete existing dirty flags for this chunk
+                                let placeholders: Vec<String> =
+                                    chunk.iter().map(|_| "?".to_string()).collect();
+                                let sql = format!(
+                                    "DELETE FROM dirty_issues WHERE issue_id IN ({})",
+                                    placeholders.join(",")
+                                );
+                                let params: Vec<SqliteValue> = chunk
+                                    .iter()
+                                    .map(|id| SqliteValue::from(id.as_str()))
+                                    .collect();
+                                self.conn.execute_with_params(&sql, &params)?;
+
+                                // Insert new dirty flags
+                                for id in chunk {
+                                    self.conn.execute_with_params(
+                                        "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                                        &[
+                                            SqliteValue::from(id.as_str()),
+                                            SqliteValue::from(now_str.as_str()),
+                                        ],
+                                    )?;
+                                }
+                            }
                         }
 
                         // Rebuild blocked cache inside the transaction if needed
@@ -4834,7 +4866,9 @@ impl SqliteStorage {
         // Add new dependencies
         let mut seen_deps = HashSet::new();
         for dep in dependencies {
-            if !seen_deps.insert(dep.depends_on_id.as_str()) {
+            // Deduplicate by (target, type) to allow multiple relationship types
+            // between the same issues while preventing identical duplicates.
+            if !seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
                 continue;
             }
             self.conn.execute_with_params(

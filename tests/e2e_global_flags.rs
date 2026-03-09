@@ -964,6 +964,62 @@ fn e2e_quiet_flag_count_and_where() {
     );
 }
 
+#[test]
+fn e2e_quiet_flag_defer_subcommands() {
+    let _log = common::test_log("e2e_quiet_flag_defer_subcommands");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet defer test"],
+        "create_defer_quiet",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let issue_id = create
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    assert!(!issue_id.is_empty(), "expected created issue id in stdout");
+
+    let defer = run_br(&workspace, ["--quiet", "defer", &issue_id], "defer_quiet");
+    assert!(
+        defer.status.success(),
+        "defer --quiet failed: {}",
+        defer.stderr
+    );
+    assert!(
+        defer.stdout.trim().is_empty(),
+        "defer --quiet should produce no stdout: '{}'",
+        defer.stdout
+    );
+
+    let undefer = run_br(
+        &workspace,
+        ["--quiet", "undefer", &issue_id],
+        "undefer_quiet",
+    );
+    assert!(
+        undefer.status.success(),
+        "undefer --quiet failed: {}",
+        undefer.stderr
+    );
+    assert!(
+        undefer.stdout.trim().is_empty(),
+        "undefer --quiet should produce no stdout: '{}'",
+        undefer.stdout
+    );
+}
+
 // ============================================================================
 // --verbose flag tests
 // ============================================================================
