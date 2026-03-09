@@ -9,6 +9,7 @@ use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
     apply_runtime_compatible_schema, apply_schema, runtime_schema_compatible,
 };
+use crate::util::id::parse_id;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -35,6 +36,7 @@ pub struct MutationContext {
     pub events: Vec<Event>,
     pub dirty_ids: HashSet<String>,
     pub invalidate_blocked_cache: bool,
+    pub force_flush: bool,
 }
 
 impl MutationContext {
@@ -46,6 +48,7 @@ impl MutationContext {
             events: Vec::new(),
             dirty_ids: HashSet::new(),
             invalidate_blocked_cache: false,
+            force_flush: false,
         }
     }
 
@@ -140,6 +143,78 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
         })
+    }
+
+    /// Detect recoverable on-disk anomalies that should trigger JSONL rebuild.
+    ///
+    /// These checks run after the database opens successfully because some
+    /// malformed states remain queryable enough to reach startup, then fail on
+    /// the next single-row lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if probing the database fails.
+    pub(crate) fn detect_recoverable_open_anomaly(&self) -> Result<Option<String>> {
+        let duplicate_schema_rows = self.conn.query(
+            "SELECT type, name, COUNT(*) AS row_count
+             FROM sqlite_master
+             WHERE name IN ('blocked_issues_cache', 'idx_blocked_cache_blocked_at')
+             GROUP BY type, name
+             HAVING COUNT(*) > 1
+             ORDER BY row_count DESC, name ASC
+             LIMIT 1",
+        )?;
+        if let Some(row) = duplicate_schema_rows.first() {
+            let object_type = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("object");
+            let name = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("unknown");
+            let row_count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(2);
+            return Ok(Some(format!(
+                "sqlite_master contains duplicate {object_type} entries for '{name}' ({row_count} rows)"
+            )));
+        }
+
+        if let Some((key, row_count)) = self.first_duplicate_kv_key("config")? {
+            return Ok(Some(format!(
+                "config contains duplicate rows for key '{key}' ({row_count} rows)"
+            )));
+        }
+
+        if let Some((key, row_count)) = self.first_duplicate_kv_key("metadata")? {
+            return Ok(Some(format!(
+                "metadata contains duplicate rows for key '{key}' ({row_count} rows)"
+            )));
+        }
+
+        Ok(None)
+    }
+
+    fn first_duplicate_kv_key(&self, table: &str) -> Result<Option<(String, i64)>> {
+        let sql = format!(
+            "SELECT key, COUNT(*) AS row_count
+             FROM {table}
+             GROUP BY key
+             HAVING COUNT(*) > 1
+             ORDER BY row_count DESC, key ASC
+             LIMIT 1"
+        );
+        let rows = self.conn.query(&sql)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+
+        let key = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .unwrap_or("")
+            .to_string();
+        let row_count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(2);
+        Ok(Some((key, row_count)))
     }
 
     /// Execute a raw SQL statement (no parameters, no result).
@@ -290,6 +365,7 @@ impl SqliteStorage {
 
                         // Mark dirty — DELETE + INSERT instead of INSERT OR
                         // REPLACE because fsqlite lacks UNIQUE enforcement.
+                        let now_str = Utc::now().to_rfc3339();
                         for id in &ctx.dirty_ids {
                             self.conn.execute_with_params(
                                 "DELETE FROM dirty_issues WHERE issue_id = ?",
@@ -299,7 +375,7 @@ impl SqliteStorage {
                                 "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
                                 &[
                                     SqliteValue::from(id.as_str()),
-                                    SqliteValue::from(Utc::now().to_rfc3339()),
+                                    SqliteValue::from(now_str.as_str()),
                                 ],
                             )?;
                         }
@@ -307,6 +383,17 @@ impl SqliteStorage {
                         // Rebuild blocked cache inside the transaction if needed
                         if ctx.invalidate_blocked_cache {
                             Self::rebuild_blocked_cache_impl(&self.conn)?;
+                        }
+
+                        if ctx.force_flush {
+                            self.conn.execute_with_params(
+                                "DELETE FROM metadata WHERE key = 'needs_flush'",
+                                &[],
+                            )?;
+                            self.conn.execute_with_params(
+                                "INSERT INTO metadata (key, value) VALUES ('needs_flush', 'true')",
+                                &[],
+                            )?;
                         }
 
                         Ok(())
@@ -363,11 +450,9 @@ impl SqliteStorage {
                 &[SqliteValue::from(issue.id.as_str())],
             )?;
             if !existing.is_empty() {
-                return Err(BeadsError::Database(
-                    fsqlite_error::FrankenError::UniqueViolation {
-                        columns: format!("issues.id = {}", issue.id),
-                    },
-                ));
+                return Err(BeadsError::IdCollision {
+                    id: issue.id.clone(),
+                });
             }
 
             let status_str = issue.status.as_str();
@@ -430,8 +515,21 @@ impl SqliteStorage {
                 ],
             )?;
 
+            // Update child counter if this is a hierarchical ID
+            if let Ok(parsed) = parse_id(&issue.id)
+                && !parsed.is_root()
+                && let Some(parent) = parsed.parent()
+                && let Some(&child_num) = parsed.child_path.last()
+            {
+                Self::update_child_counter_in_tx(conn, &parent, child_num)?;
+            }
+
             // Insert Labels
+            let mut seen_labels = HashSet::new();
             for label in &issue.labels {
+                if !seen_labels.insert(label.as_str()) {
+                    continue;
+                }
                 conn.execute_with_params(
                     "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
                     &[SqliteValue::from(issue.id.as_str()), SqliteValue::from(label.as_str())],
@@ -444,7 +542,11 @@ impl SqliteStorage {
             }
 
             // Insert Dependencies
+            let mut seen_deps = HashSet::new();
             for dep in &issue.dependencies {
+                if !seen_deps.insert(dep.depends_on_id.as_str()) {
+                    continue;
+                }
                 // Check cycle if blocking
                 if dep.dep_type.is_blocking()
                     && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, true)?
@@ -681,6 +783,19 @@ impl SqliteStorage {
                         issue.closed_at = Some(now);
                         add_update("closed_at", SqliteValue::from(now.to_rfc3339()));
                     }
+                } else if *status == Status::Tombstone {
+                    let reason = updates.close_reason.as_ref().and_then(Clone::clone);
+                    ctx.record_event(EventType::Deleted, id, reason.clone());
+
+                    let now = Utc::now();
+                    issue.deleted_at = Some(now);
+                    issue.deleted_by = Some(actor.to_string());
+                    issue.delete_reason.clone_from(&reason);
+                    add_update("deleted_at", SqliteValue::from(now.to_rfc3339()));
+                    add_update("deleted_by", SqliteValue::from(actor));
+                    if let Some(r) = reason {
+                        add_update("delete_reason", SqliteValue::from(r));
+                    }
                 } else {
                     if was_terminal && !status.is_terminal() {
                         ctx.record_event(EventType::Reopened, id, None);
@@ -689,6 +804,14 @@ impl SqliteStorage {
                         // Reopening (or fixing state): Clear closed_at if it was set
                         issue.closed_at = None;
                         add_update("closed_at", SqliteValue::Null);
+                    }
+                    if issue.deleted_at.is_some() {
+                        issue.deleted_at = None;
+                        issue.deleted_by = None;
+                        issue.delete_reason = None;
+                        add_update("deleted_at", SqliteValue::Null);
+                        add_update("deleted_by", SqliteValue::Null);
+                        add_update("delete_reason", SqliteValue::Null);
                     }
                 }
 
@@ -937,9 +1060,30 @@ impl SqliteStorage {
                 "DELETE FROM dependencies WHERE depends_on_id = ?",
                 &[SqliteValue::from(id)],
             )?;
+            conn.execute_with_params(
+                "DELETE FROM events WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM dirty_issues WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM export_hashes WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM child_counters WHERE parent_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
             conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
 
             ctx.invalidate_cache();
+            ctx.force_flush = true;
 
             Ok(())
         })
@@ -1157,6 +1301,14 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority DESC, created_at ASC");
         } else {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
+        }
+
+        if let Some(limit) = filters.limit
+            && limit > 0
+        {
+            sql.push_str(" LIMIT ?");
+            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+            params.push(SqliteValue::from(limit_i64));
         }
 
         let rows = self.conn.query_with_params(&sql, &params)?;
@@ -1633,6 +1785,54 @@ impl SqliteStorage {
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_blocked_cache_in_tx(&self) -> Result<usize> {
         Self::rebuild_blocked_cache_impl(&self.conn)
+    }
+
+    /// Rebuild the child counters table from all existing issues.
+    ///
+    /// Useful after a full import or manual database manipulation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild fails.
+    pub(crate) fn rebuild_child_counters_in_tx(&self) -> Result<usize> {
+        Self::rebuild_child_counters_impl(&self.conn)
+    }
+
+    fn rebuild_child_counters_impl(conn: &Connection) -> Result<usize> {
+        // Clear existing counters
+        conn.execute("DELETE FROM child_counters")?;
+
+        // Find all hierarchical IDs
+        let rows = conn.query("SELECT id FROM issues WHERE id LIKE '%.%'")?;
+        let mut max_children: HashMap<String, u32> = HashMap::new();
+
+        for row in &rows {
+            if let Some(id) = row.get(0).and_then(SqliteValue::as_text)
+                && let Ok(parsed) = parse_id(id)
+                && !parsed.is_root()
+                && let Some(parent) = parsed.parent()
+                && let Some(&child_num) = parsed.child_path.last()
+            {
+                let entry = max_children.entry(parent).or_insert(0);
+                if child_num > *entry {
+                    *entry = child_num;
+                }
+            }
+        }
+
+        let mut count = 0;
+        for (parent_id, last_child) in max_children {
+            conn.execute_with_params(
+                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(parent_id.as_str()),
+                    SqliteValue::from(i64::from(last_child)),
+                ],
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2463,7 +2663,11 @@ impl SqliteStorage {
                 &[SqliteValue::from(issue_id)],
             )?;
 
+            let mut seen_labels = HashSet::new();
             for label in &desired_labels {
+                if !seen_labels.insert(label.as_str()) {
+                    continue;
+                }
                 conn.execute_with_params(
                     "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
                     &[
@@ -2916,6 +3120,21 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn next_child_number(&self, parent_id: &str) -> Result<u32> {
+        // First, check the child_counters table (source of truth)
+        match self.conn.query_row_with_params(
+            "SELECT last_child FROM child_counters WHERE parent_id = ?",
+            &[SqliteValue::from(parent_id)],
+        ) {
+            Ok(row) => {
+                if let Some(last_child) = row.get(0).and_then(SqliteValue::as_integer) {
+                    return Ok(u32::try_from(last_child).unwrap_or(0).saturating_add(1));
+                }
+            }
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // Fallback: Scan issues table for legacy data or missing counter
         // Find all existing child IDs matching the pattern {parent_id}.N
         // Escape LIKE wildcards in parent_id to prevent injection
         let escaped_parent = escape_like_pattern(parent_id);
@@ -2947,6 +3166,40 @@ impl SqliteStorage {
 
         // Use saturating_add to prevent overflow (extremely unlikely but safe)
         Ok(max_child.saturating_add(1))
+    }
+
+    /// Internal helper to update a child counter within a transaction.
+    fn update_child_counter_in_tx(
+        conn: &Connection,
+        parent_id: &str,
+        child_number: u32,
+    ) -> Result<()> {
+        // Check current value
+        let current_max = match conn.query_row_with_params(
+            "SELECT last_child FROM child_counters WHERE parent_id = ?",
+            &[SqliteValue::from(parent_id)],
+        ) {
+            Ok(row) => row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => 0,
+            Err(e) => return Err(e.into()),
+        };
+
+        if i64::from(child_number) > current_max {
+            // DELETE + INSERT to simulate UPSERT (fsqlite limitation)
+            conn.execute_with_params(
+                "DELETE FROM child_counters WHERE parent_id = ?",
+                &[SqliteValue::from(parent_id)],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(parent_id),
+                    SqliteValue::from(i64::from(child_number)),
+                ],
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Count dependencies for multiple issues efficiently.
@@ -3501,15 +3754,29 @@ impl SqliteStorage {
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
         // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
         // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        self.conn.execute_with_params(
-            "INSERT INTO metadata (key, value) VALUES (?, ?)",
-            &[SqliteValue::from(key), SqliteValue::from(value)],
-        )?;
-        Ok(())
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Delete a metadata key.
@@ -4387,7 +4654,11 @@ impl SqliteStorage {
         )?;
 
         // Add new labels
+        let mut seen_labels = HashSet::new();
         for label in labels {
+            if !seen_labels.insert(label.as_str()) {
+                continue;
+            }
             self.conn.execute_with_params(
                 "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
                 &[
@@ -4417,7 +4688,11 @@ impl SqliteStorage {
         )?;
 
         // Add new dependencies
+        let mut seen_deps = HashSet::new();
         for dep in dependencies {
+            if !seen_deps.insert(dep.depends_on_id.as_str()) {
+                continue;
+            }
             self.conn.execute_with_params(
                 "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",

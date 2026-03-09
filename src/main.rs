@@ -3,11 +3,13 @@ use beads_rust::cli::{Cli, Commands, OutputFormat};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
+use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{auto_flush, auto_import_if_stale};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use tracing::debug;
 
 #[allow(clippy::too_many_lines)]
@@ -17,24 +19,70 @@ fn main() {
     let cli = Cli::parse();
     let json_error_mode = should_render_errors_as_json(&cli);
     let output_ctx = OutputContext::from_args(&cli);
+    let is_mutating = is_mutating_command(&cli.command);
+    let needs_bootstrap_context = should_auto_import(&cli.command);
 
     // Initialize logging
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
         eprintln!("Failed to initialize logging: {e}");
-        // Don't exit, just continue without logging or with basic stderr
     }
 
     let overrides = build_cli_overrides(&cli);
 
-    // Track if this command potentially mutates data (for auto-flush)
-    let is_mutating = is_mutating_command(&cli.command);
+    // Phase 1: Startup & Discovery (One-time)
+    let ctx = match StartupContext::init(&overrides) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            if needs_bootstrap_context {
+                handle_error(&e, json_error_mode);
+            }
+            StartupContext::empty(overrides.clone())
+        }
+    };
 
-    if should_auto_import(&cli.command)
-        && let Err(e) = run_auto_import(&overrides, cli.allow_stale)
+    // Phase 2: Open Storage (One-time)
+    let should_preopen_storage = ctx.is_initialized()
+        && !ctx.no_db()
+        && (needs_bootstrap_context || (is_mutating && !ctx.no_auto_flush()));
+    let mut storage_result = if should_preopen_storage {
+        match open_storage_from_ctx(&ctx) {
+            Ok(res) => Some(res),
+            Err(e) => {
+                if needs_bootstrap_context {
+                    handle_error(&e, json_error_mode);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 3: Auto-Import
+    if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+        && should_auto_import(&cli.command)
+        && !ctx.no_auto_import()
     {
-        handle_error(&e, json_error_mode);
+        let expected_prefix = match res.storage.get_config("issue_prefix") {
+            Ok(p) => p,
+            Err(e) => {
+                handle_error(&e, json_error_mode);
+            }
+        };
+        let outcome = auto_import_if_stale(
+            &mut res.storage,
+            &paths.beads_dir,
+            &paths.jsonl_path,
+            expected_prefix.as_deref(),
+            cli.allow_stale,
+            false, // ctx.no_auto_import already checked above
+        );
+        if let Err(e) = outcome {
+            handle_error(&e, json_error_mode);
+        }
     }
 
+    // Phase 4: Command Execution
     let result = match cli.command {
         Commands::Init {
             prefix,
@@ -129,10 +177,88 @@ fn main() {
         handle_error(&e, json_error_mode);
     }
 
-    // Auto-flush after successful mutating commands (unless no-auto-flush or no-db)
-    if is_mutating {
-        run_auto_flush(&overrides);
+    // Phase 5: Auto-Flush
+    if is_mutating
+        && !ctx.no_auto_flush()
+        && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+        && let Err(e) = auto_flush(&mut res.storage, &paths.beads_dir, &paths.jsonl_path)
+    {
+        debug!(?e, "Auto-flush failed (non-fatal)");
     }
+}
+
+struct StartupContext {
+    overrides: config::CliOverrides,
+    beads_dir: Option<PathBuf>,
+    paths: Option<config::ConfigPaths>,
+    config: Option<config::ConfigLayer>,
+}
+
+impl StartupContext {
+    fn init(overrides: &config::CliOverrides) -> Result<Self> {
+        let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
+        let startup = config::load_startup_config_with_paths(&beads_dir, overrides.db.as_ref())?;
+
+        // Merge startup config with CLI overrides to form the effective bootstrap config
+        let mut final_config = startup.merged_config.clone();
+        final_config.merge_from(&overrides.as_layer());
+
+        Ok(Self {
+            overrides: overrides.clone(),
+            beads_dir: Some(beads_dir),
+            paths: Some(startup.paths),
+            config: Some(final_config),
+        })
+    }
+
+    fn empty(overrides: config::CliOverrides) -> Self {
+        Self {
+            overrides,
+            beads_dir: None,
+            paths: None,
+            config: None,
+        }
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.beads_dir.is_some()
+    }
+
+    fn no_db(&self) -> bool {
+        self.config
+            .as_ref()
+            .and_then(config::no_db_from_layer)
+            .unwrap_or(false)
+    }
+
+    fn no_auto_import(&self) -> bool {
+        self.config
+            .as_ref()
+            .and_then(config::no_auto_import_from_layer)
+            .unwrap_or(false)
+    }
+
+    fn no_auto_flush(&self) -> bool {
+        self.config
+            .as_ref()
+            .and_then(config::no_auto_flush_from_layer)
+            .unwrap_or(false)
+    }
+}
+
+struct OpenStorageContext {
+    storage: SqliteStorage,
+}
+
+fn open_storage_from_ctx(ctx: &StartupContext) -> Result<OpenStorageContext> {
+    let beads_dir = ctx.beads_dir.as_ref().ok_or(BeadsError::NotInitialized)?;
+    let (storage, _) = config::open_storage(
+        beads_dir,
+        ctx.overrides.db.as_ref(),
+        ctx.overrides.lock_timeout,
+    )?;
+
+    Ok(OpenStorageContext { storage })
 }
 
 /// Determine if a command potentially mutates data.
@@ -170,10 +296,6 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
 
 const fn should_auto_import(cmd: &Commands) -> bool {
     match cmd {
-        // Commands that need auto-import:
-        // - Read-only commands (to ensure fresh data)
-        // - Mutating commands (to avoid overwriting external changes)
-        // - Subcommands (Comments, Dep, Label, Epic, Query)
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -201,7 +323,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Epic { .. }
         | Commands::Query { .. } => true,
 
-        // Explicitly excluded: init, sync, diagnostic, and config commands
         Commands::Init { .. }
         | Commands::Sync(_)
         | Commands::Doctor(_)
@@ -278,139 +399,20 @@ fn should_render_errors_as_json(cli: &Cli) -> bool {
     should_render_errors_as_json_with_env(cli, OutputFormat::from_env())
 }
 
-/// Run auto-import before read-only commands when JSONL is newer.
-fn run_auto_import(overrides: &config::CliOverrides, allow_stale: bool) -> Result<()> {
-    // If not initialized, skip auto-import (e.g. running 'br init')
-    let beads_dir = match config::discover_beads_dir_with_cli(overrides) {
-        Ok(dir) => dir,
-        Err(BeadsError::NotInitialized) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-
-    // Resolve startup config once for both no_db and no_auto_import checks
-    let (skip_db, no_auto_import) = {
-        let startup_layer = config::load_startup_config(&beads_dir).unwrap_or_default();
-        let merged_layer =
-            config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
-        (
-            config::no_db_from_layer(&merged_layer).unwrap_or(false),
-            config::no_auto_import_from_layer(&merged_layer).unwrap_or(false),
-        )
-    };
-
-    if skip_db {
-        return Ok(());
-    }
-
-    let config::OpenStorageResult {
-        mut storage,
-        paths,
-        no_db,
-    } = config::open_storage_with_cli(&beads_dir, overrides)?;
-
-    if no_db {
-        return Ok(());
-    }
-
-    let expected_prefix = storage.get_config("issue_prefix")?;
-    let outcome = auto_import_if_stale(
-        &mut storage,
-        &paths.beads_dir,
-        &paths.jsonl_path,
-        expected_prefix.as_deref(),
-        allow_stale,
-        no_auto_import,
-    )?;
-
-    if outcome.attempted {
-        debug!(
-            imported_count = outcome.imported_count,
-            "Auto-import attempt completed"
-        );
-    }
-
-    Ok(())
-}
-
-/// Run auto-flush after mutating commands.
-///
-/// This discovers the beads directory, opens a fresh storage connection,
-/// and exports any dirty issues to JSONL.
-fn run_auto_flush(overrides: &config::CliOverrides) {
-    // Try to discover beads directory
-    let beads_dir = match config::discover_beads_dir_with_cli(overrides) {
-        Ok(dir) => dir,
-        Err(e) => {
-            debug!(
-                ?e,
-                "Auto-flush skipped: could not discover .beads directory"
-            );
-            return;
-        }
-    };
-
-    // Fast path: skip auto-flush if disabled via config or CLI, or for no_db mode
-    if let Ok(startup_layer) = config::load_startup_config(&beads_dir) {
-        let merged_layer =
-            config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
-        if config::no_auto_flush_from_layer(&merged_layer).unwrap_or(false) {
-            debug!("Auto-flush skipped: disabled by config");
-            return;
-        }
-        if config::no_db_from_layer(&merged_layer).unwrap_or(false) {
-            return;
-        }
-    }
-
-    // Open storage with fresh connection
-    let (mut storage, paths) =
-        match config::open_storage(&beads_dir, overrides.db.as_ref(), overrides.lock_timeout) {
-            Ok(result) => result,
-            Err(e) => {
-                debug!(?e, "Auto-flush skipped: could not open storage");
-                return;
-            }
-        };
-
-    // Run auto-flush
-    match auto_flush(&mut storage, &paths.beads_dir, &paths.jsonl_path) {
-        Ok(result) => {
-            if result.flushed {
-                debug!(
-                    exported = result.exported_count,
-                    hash = %result.content_hash,
-                    "Auto-flush completed"
-                );
-            }
-        }
-        Err(e) => {
-            // Log but don't fail - auto-flush errors shouldn't break the command
-            debug!(?e, "Auto-flush failed (non-fatal)");
-        }
-    }
-}
-
 /// Handle errors with structured output support.
-///
-/// When JSON output is explicitly requested or stdout is not a TTY, outputs
-/// structured JSON to stderr.
-/// Otherwise, outputs human-readable error with optional color.
 fn handle_error(err: &BeadsError, json_mode: bool) -> ! {
     let structured = StructuredError::from_error(err);
     let exit_code = structured.code.exit_code();
 
-    // Determine output mode: JSON if requested or stdout is not a terminal
     let use_json = json_mode || !io::stdout().is_terminal();
 
     if use_json {
-        // Output structured JSON to stderr
         let json = structured.to_json();
         eprintln!(
             "{}",
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
         );
     } else {
-        // Human-readable output with color if stderr is a terminal
         let use_color = io::stderr().is_terminal();
         eprintln!("{}", structured.to_human(use_color));
     }
@@ -540,6 +542,32 @@ mod tests {
         assert!(is_mutating_command(&label_add));
         assert!(!is_mutating_command(&comments_list));
         assert!(is_mutating_command(&comments_add));
+    }
+
+    #[test]
+    fn sync_is_not_auto_imported_or_auto_flushed() {
+        let sync_cmd = Cli::parse_from(["br", "sync"]).command;
+        assert!(!is_mutating_command(&sync_cmd));
+        assert!(!should_auto_import(&sync_cmd));
+    }
+
+    #[test]
+    fn diagnostic_and_config_commands_skip_auto_import() {
+        let cases: &[&[&str]] = &[
+            &["br", "doctor"],
+            &["br", "where"],
+            &["br", "schema"],
+            &["br", "config", "path"],
+            &["br", "history", "list"],
+        ];
+
+        for argv in cases {
+            let command = Cli::parse_from(*argv).command;
+            assert!(
+                !should_auto_import(&command),
+                "command should not auto-import: {command:?}"
+            );
+        }
     }
 
     #[test]

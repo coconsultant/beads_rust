@@ -370,33 +370,20 @@ fn compute_recent_activity(jsonl_path: &Path, hours: u32) -> Option<RecentActivi
     let pathspec = repo_relative_git_path(jsonl_path, &repo_root)?;
     let pathspec_str = pathspec.to_string_lossy().into_owned();
 
-    let mut child = Command::new("git")
+    let output = Command::new("git")
         .args(["log", "--oneline", "--since", &since, "--", &pathspec_str])
         .current_dir(&repo_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .ok()?;
 
-    let stdout = child.stdout.take()?;
-    let reader = BufReader::new(stdout);
-    let commit_count = reader.lines().count();
-
-    let status = child.wait().ok()?;
-    if !status.success() {
-        // Log stderr if available
-        if let Some(stderr) = child.stderr {
-            use std::io::Read;
-            let mut err_msg = String::new();
-            if std::io::BufReader::new(stderr)
-                .read_to_string(&mut err_msg)
-                .is_ok()
-            {
-                debug!(stderr = %err_msg, "Git log failed");
-            }
-        }
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        debug!(stderr = %err_msg, "Git log failed");
         return None;
     }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let commit_count = stdout_str.lines().count();
 
     Some(RecentActivity {
         hours_tracked: hours,

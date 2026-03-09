@@ -12,9 +12,9 @@ use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
     METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, count_issues_in_jsonl,
-    export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl, import_from_jsonl,
-    load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
-    save_base_snapshot, three_way_merge,
+    export_temp_path, export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl,
+    import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
+    require_safe_sync_overwrite_path, save_base_snapshot, three_way_merge,
 };
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -235,7 +235,7 @@ fn validate_sync_paths(
     }
 
     let manifest_path = canonical_beads.join(".manifest.json");
-    let jsonl_temp_path = jsonl_path.with_extension("jsonl.tmp");
+    let jsonl_temp_path = export_temp_path(&jsonl_path);
 
     if contains_git_dir(&jsonl_path) {
         warn!(
@@ -1209,8 +1209,8 @@ fn execute_merge(
 
     // 4. Perform Merge
     let context = MergeContext::new(base, left, right);
-    // Currently hardcoded to PreferNewer (Last Write Wins).
-    // Future work: support configurable conflict strategy via CLI args if needed.
+    // Keep the current merge behavior explicit until the CLI surface for
+    // configurable conflict resolution is wired through end-to-end.
     let strategy = ConflictResolution::PreferNewer;
     let tombstones = None;
 
@@ -1255,6 +1255,9 @@ fn execute_merge(
 
     // Rebuild cache
     storage.rebuild_blocked_cache(true)?;
+    // Merge can introduce hierarchical IDs via upsert; refresh counters before
+    // the next child-ID allocation trusts them.
+    storage.rebuild_child_counters_in_tx()?;
 
     // Save Base Snapshot
     let new_base: HashMap<_, _> = report

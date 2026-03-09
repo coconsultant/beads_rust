@@ -20,6 +20,15 @@ pub struct CreateConfig {
     pub actor: String,
 }
 
+struct NewIdInput<'a> {
+    title: &'a str,
+    description: Option<&'a str>,
+    creator: Option<&'a str>,
+    now: DateTime<Utc>,
+    issue_count: usize,
+    id_config: &'a crate::util::id::IdConfig,
+}
+
 /// Execute the create command.
 ///
 /// # Errors
@@ -127,66 +136,17 @@ pub fn create_issue_impl(
 
     // 2. Generate ID
     let now = Utc::now();
+    let count = storage.count_issues()?;
 
-    // When a parent is specified, generate a child ID (parent.1, parent.2, etc.)
-    // instead of a random hash-based ID
-    let id = if let Some(parent_id) = &args.parent {
-        // Verify parent exists
-        if !storage.id_exists(parent_id)? {
-            return Err(BeadsError::IssueNotFound {
-                id: parent_id.clone(),
-            });
-        }
-
-        // Find next available child number
-        let next_num = storage.next_child_number(parent_id)?;
-        let candidate = child_id(parent_id, next_num);
-
-        // Double-check the ID doesn't exist (race condition safety)
-        if storage.id_exists(&candidate)? {
-            // Extremely unlikely, but handle by incrementing
-            let mut num = next_num + 1;
-            loop {
-                let alt = child_id(parent_id, num);
-                if !storage.id_exists(&alt)? {
-                    break alt;
-                }
-                num += 1;
-                if num > next_num.saturating_add(100) {
-                    return Err(BeadsError::validation(
-                        "parent",
-                        "could not find available child ID",
-                    ));
-                }
-            }
-        } else {
-            candidate
-        }
-    } else {
-        // Standard ID generation for non-child issues
-        let id_gen = IdGenerator::new(config.id_config.clone());
-        let count = storage.count_issues()?;
-        let id_check_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
-        let generated_id = id_gen.generate(
-            title,
-            None, // description
-            None, // creator
-            now,
-            count,
-            |id| match storage.id_exists(id) {
-                Ok(exists) => exists,
-                Err(e) => {
-                    id_check_err.set(Some(format!("Failed to check ID existence: {e}")));
-                    // Treat as "exists" to force retry with a different ID
-                    true
-                }
-            },
-        );
-        if let Some(err_msg) = id_check_err.into_inner() {
-            return Err(anyhow::anyhow!(err_msg).into());
-        }
-        generated_id
+    let id_input = NewIdInput {
+        title,
+        description: None,
+        creator: None,
+        now,
+        issue_count: count,
+        id_config: &config.id_config,
     };
+    let id = generate_new_id(storage, args.parent.as_deref(), &id_input)?;
 
     // 3. Parse fields
     let priority = if let Some(p) = &args.priority {
@@ -211,78 +171,168 @@ pub fn create_issue_impl(
         Status::Open
     };
 
-    // Set closed_at if status is Closed or Tombstone
-    let closed_at = if matches!(status, Status::Closed | Status::Tombstone) {
-        Some(now)
-    } else {
-        None
-    };
+    let mut retries = 0;
+    loop {
+        // 2. Generate ID
+        let now = Utc::now();
+        let count = storage.count_issues()?;
 
-    // 4. Construct Issue
-    let mut issue = Issue {
-        id: id.clone(),
-        title: title.clone(),
-        description: args.description.clone(),
-        status,
-        priority,
-        issue_type,
-        created_at: now,
-        updated_at: now,
-        assignee: args.assignee.clone(),
-        owner: args.owner.clone(),
-        estimated_minutes: args.estimate,
-        due_at,
-        defer_until,
-        external_ref: args.external_ref.clone(),
-        ephemeral: args.ephemeral,
-        // Defaults
-        content_hash: None,
-        design: None,
-        acceptance_criteria: None,
-        notes: None,
-        created_by: Some(config.actor.clone()),
-        closed_at,
-        close_reason: None,
-        closed_by_session: None,
-        source_system: None,
-        source_repo: None,
-        deleted_at: None,
-        deleted_by: None,
-        delete_reason: None,
-        original_type: None,
-        compaction_level: None,
-        compacted_at: None,
-        compacted_at_commit: None,
-        original_size: None,
-        sender: None,
-        pinned: false,
-        is_template: false,
-        labels: vec![],
-        dependencies: vec![],
-        comments: vec![],
-    };
+        let id_input = NewIdInput {
+            title,
+            description: None,
+            creator: None,
+            now,
+            issue_count: count,
+            id_config: &config.id_config,
+        };
+        let id = generate_new_id(storage, args.parent.as_deref(), &id_input)?;
 
-    // Compute content hash
-    issue.content_hash = Some(issue.compute_content_hash());
+        // Set closed_at if status is Closed or Tombstone
+        let closed_at = if matches!(status, Status::Closed | Status::Tombstone) {
+            Some(now)
+        } else {
+            None
+        };
 
-    // 5. Validate Issue
-    IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
+        // 4. Construct Issue
+        let mut issue = Issue {
+            id: id.clone(),
+            title: title.clone(),
+            description: args.description.clone(),
+            status: status.clone(),
+            priority,
+            issue_type: issue_type.clone(),
+            created_at: now,
+            updated_at: now,
+            assignee: args.assignee.clone(),
+            owner: args.owner.clone(),
+            estimated_minutes: args.estimate,
+            due_at,
+            defer_until,
+            external_ref: args.external_ref.clone(),
+            ephemeral: args.ephemeral,
+            // Defaults
+            content_hash: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            created_by: Some(config.actor.clone()),
+            closed_at,
+            close_reason: None,
+            closed_by_session: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        };
 
-    // 5b. Validate Relations (fail fast before DB writes)
-    validate_relations(args, &id)?;
+        // Compute content hash
+        issue.content_hash = Some(issue.compute_content_hash());
 
-    // 6. Populate Relations (labels & dependencies)
-    populate_relations(&mut issue, args, &config.actor, now);
+        // 5. Validate Issue
+        IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
 
-    // 7. Dry Run check - return early
-    if args.dry_run {
-        return Ok(issue);
+        // 5b. Validate Relations (fail fast before DB writes)
+        validate_relations(args, &id)?;
+
+        // 6. Populate Relations (labels & dependencies)
+        populate_relations(&mut issue, args, &config.actor, now);
+
+        // 7. Dry Run check - return early
+        if args.dry_run {
+            return Ok(issue);
+        }
+
+        // 8. Create (atomic)
+        match storage.create_issue(&issue, &config.actor) {
+            Ok(()) => return Ok(issue),
+            Err(BeadsError::IdCollision { .. }) => {
+                if retries >= 10 {
+                    return Err(BeadsError::IdCollision { id });
+                }
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * retries));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
+}
 
-    // 8. Create (atomic)
-    storage.create_issue(&issue, &config.actor)?;
+/// Generate a new ID, supporting both hierarchical and hash-based formats.
+fn generate_new_id(
+    storage: &SqliteStorage,
+    parent_id: Option<&str>,
+    input: &NewIdInput<'_>,
+) -> Result<String> {
+    if let Some(parent_id) = parent_id {
+        // Verify parent exists
+        if !storage.id_exists(parent_id)? {
+            return Err(BeadsError::IssueNotFound {
+                id: parent_id.to_string(),
+            });
+        }
 
-    Ok(issue)
+        // Find next available child number
+        let next_num = storage.next_child_number(parent_id)?;
+        let candidate = child_id(parent_id, next_num);
+
+        // Double-check the ID doesn't exist (race condition safety)
+        if storage.id_exists(&candidate)? {
+            // Extremely unlikely, but handle by incrementing
+            let mut num = next_num + 1;
+            loop {
+                let alt = child_id(parent_id, num);
+                if !storage.id_exists(&alt)? {
+                    return Ok(alt);
+                }
+                num += 1;
+                if num > next_num.saturating_add(100) {
+                    return Err(BeadsError::validation(
+                        "parent",
+                        "could not find available child ID",
+                    ));
+                }
+            }
+        } else {
+            Ok(candidate)
+        }
+    } else {
+        // Standard ID generation for non-child issues
+        let id_gen = IdGenerator::new(input.id_config.clone());
+        let id_check_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        let generated_id = id_gen.generate(
+            input.title,
+            input.description,
+            input.creator,
+            input.now,
+            input.issue_count,
+            |id| match storage.id_exists(id) {
+                Ok(exists) => exists,
+                Err(e) => {
+                    id_check_err.set(Some(format!("Failed to check ID existence: {e}")));
+                    // Treat as "exists" to force retry with a different ID
+                    true
+                }
+            },
+        );
+        if let Some(err_msg) = id_check_err.into_inner() {
+            return Err(anyhow::anyhow!(err_msg).into());
+        }
+        Ok(generated_id)
+    }
 }
 
 fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
@@ -443,7 +493,7 @@ fn execute_import(
     };
 
     let storage = &mut storage_ctx.storage;
-    let id_gen = IdGenerator::new(id_config);
+    let mut count = storage.count_issues()?;
 
     // Track created IDs for output
     let mut created_ids = Vec::new();
@@ -456,156 +506,184 @@ fn execute_import(
             continue;
         }
 
-        let count = storage.count_issues()?;
-        let id_check_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
-        let id = id_gen.generate(
-            &title,
-            parsed.description.as_deref(),
-            None,
-            now,
-            count,
-            |id| match storage.id_exists(id) {
-                Ok(exists) => exists,
-                Err(e) => {
-                    id_check_err.set(Some(format!("Failed to check ID existence: {e}")));
-                    true
-                }
-            },
-        );
-        if let Some(err_msg) = id_check_err.into_inner() {
-            return Err(anyhow::anyhow!(err_msg).into());
-        }
+        let mut retries = 0;
+        let mut final_id = String::new();
+        let mut created = false;
 
-        let priority = if let Some(ref p) = parsed.priority {
-            match Priority::from_str(p) {
-                Ok(value) => value,
+        loop {
+            let id_input = NewIdInput {
+                title: &title,
+                description: parsed.description.as_deref(),
+                creator: None,
+                now,
+                issue_count: count,
+                id_config: &id_config,
+            };
+            let id = match generate_new_id(storage, None, &id_input) {
+                Ok(id) => id,
                 Err(err) => {
                     eprintln!("✗ Failed to create {title}: {err}");
-                    continue;
+                    break;
                 }
-            }
-        } else {
-            default_priority
-        };
+            };
 
-        let issue_type = if let Some(ref t) = parsed.issue_type {
-            match IssueType::from_str(t) {
-                Ok(value) => value,
-                Err(err) => {
-                    eprintln!("✗ Failed to create {title}: {err}");
-                    continue;
+            let priority = if let Some(ref p) = parsed.priority {
+                match Priority::from_str(p) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("✗ Failed to create {title}: {err}");
+                        break;
+                    }
                 }
-            }
-        } else {
-            default_issue_type.clone()
-        };
+            } else {
+                default_priority
+            };
 
-        let mut issue = Issue {
-            id: id.clone(),
-            title: title.clone(),
-            description: parsed.description,
-            status: import_status.clone(),
-            priority,
-            issue_type,
-            created_at: now,
-            updated_at: now,
-            assignee: parsed.assignee,
-            owner: args.owner.clone(),
-            estimated_minutes: args.estimate,
-            due_at,
-            defer_until,
-            external_ref: args.external_ref.clone(),
-            ephemeral: args.ephemeral,
-            design: parsed.design,
-            acceptance_criteria: parsed.acceptance_criteria,
-            content_hash: None,
-            notes: None,
-            created_by: None,
-            closed_at: import_closed_at,
-            close_reason: None,
-            closed_by_session: None,
-            source_system: None,
-            source_repo: None,
-            deleted_at: None,
-            deleted_by: None,
-            delete_reason: None,
-            original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
-            sender: None,
-            pinned: false,
-            is_template: false,
-            labels: vec![],
-            dependencies: vec![],
-            comments: vec![],
-        };
+            let issue_type = if let Some(ref t) = parsed.issue_type {
+                match IssueType::from_str(t) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("✗ Failed to create {title}: {err}");
+                        break;
+                    }
+                }
+            } else {
+                default_issue_type.clone()
+            };
 
-        issue.content_hash = Some(issue.compute_content_hash());
-        if let Err(err) =
-            IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)
-        {
-            eprintln!("✗ Failed to create {title}: {err}");
-            continue;
-        }
-
-        // Populate Labels (with validation)
-        let mut labels = parsed.labels;
-        labels.extend(args.labels.clone());
-        for label in labels {
-            let label = label.trim().to_string();
-            if label.is_empty() {
-                continue;
-            }
-            if let Err(err) = LabelValidator::validate(&label) {
-                eprintln!(
-                    "warning: skipping invalid label '{label}' for issue {id}: {}",
-                    err.message
-                );
-                continue;
-            }
-            if !issue.labels.iter().any(|existing| existing == &label) {
-                issue.labels.push(label);
-            }
-        }
-
-        // Populate Dependencies (with validation)
-        let mut deps = parsed.dependencies;
-        deps.extend(args.deps.clone());
-        for dep_str in deps {
-            let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
-            if !valid {
-                eprintln!("warning: skipping invalid dependency type '{type_str}' for issue {id}");
-                continue;
-            }
-            if type_str.eq_ignore_ascii_case("blocked-by") {
-                type_str = "blocks".to_string();
-            }
-            if dep_id == id {
-                eprintln!("warning: skipping self-dependency for issue {id}");
-                continue;
-            }
-
-            let dep_type = type_str
-                .parse()
-                .unwrap_or_else(|_| DependencyType::Custom(type_str.clone()));
-
-            issue.dependencies.push(Dependency {
-                issue_id: id.clone(),
-                depends_on_id: dep_id,
-                dep_type,
+            let mut issue = Issue {
+                id: id.clone(),
+                title: title.clone(),
+                description: parsed.description.clone(),
+                status: import_status.clone(),
+                priority,
+                issue_type,
                 created_at: now,
-                created_by: Some(actor.clone()),
-                metadata: None,
-                thread_id: None,
-            });
+                updated_at: now,
+                assignee: parsed.assignee.or_else(|| args.assignee.clone()),
+                owner: args.owner.clone(),
+                estimated_minutes: args.estimate,
+                due_at,
+                defer_until,
+                external_ref: args.external_ref.clone(),
+                ephemeral: args.ephemeral,
+                design: parsed.design,
+                acceptance_criteria: parsed.acceptance_criteria,
+                content_hash: None,
+                notes: None,
+                // Keep import hashes actor-independent so identical markdown imports
+                // still deduplicate across sync boundaries.
+                created_by: None,
+                closed_at: import_closed_at,
+                close_reason: None,
+                closed_by_session: None,
+                source_system: None,
+                source_repo: None,
+                deleted_at: None,
+                deleted_by: None,
+                delete_reason: None,
+                original_type: None,
+                compaction_level: None,
+                compacted_at: None,
+                compacted_at_commit: None,
+                original_size: None,
+                sender: None,
+                pinned: false,
+                is_template: false,
+                labels: vec![],
+                dependencies: vec![],
+                comments: vec![],
+            };
+
+            issue.content_hash = Some(issue.compute_content_hash());
+            if let Err(err) =
+                IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)
+            {
+                eprintln!("✗ Failed to create {title}: {err}");
+                break;
+            }
+
+            // Populate Labels (with validation)
+            let mut labels = parsed.labels.clone();
+            labels.extend(args.labels.clone());
+            for label in labels {
+                let label = label.trim().to_string();
+                if label.is_empty() {
+                    continue;
+                }
+                if let Err(err) = LabelValidator::validate(&label) {
+                    eprintln!(
+                        "warning: skipping invalid label '{label}' for issue {id}: {}",
+                        err.message
+                    );
+                    continue;
+                }
+                if !issue.labels.iter().any(|existing| existing == &label) {
+                    issue.labels.push(label);
+                }
+            }
+
+            // Populate Dependencies (with validation)
+            let mut deps = parsed.dependencies.clone();
+            deps.extend(args.deps.clone());
+            for dep_str in deps {
+                let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
+                if !valid {
+                    eprintln!("warning: skipping invalid dependency type '{type_str}' for issue {id}");
+                    continue;
+                }
+                if type_str.eq_ignore_ascii_case("blocked-by") {
+                    type_str = "blocks".to_string();
+                }
+                if dep_id == id {
+                    eprintln!("warning: skipping self-dependency for issue {id}");
+                    continue;
+                }
+
+                let dep_type = type_str
+                    .parse()
+                    .unwrap_or_else(|_| DependencyType::Custom(type_str.clone()));
+
+                issue.dependencies.push(Dependency {
+                    issue_id: id.clone(),
+                    depends_on_id: dep_id,
+                    dep_type,
+                    created_at: now,
+                    created_by: Some(actor.clone()),
+                    metadata: None,
+                    thread_id: None,
+                });
+            }
+
+            match storage.create_issue(&issue, &actor) {
+                Ok(()) => {
+                    final_id = id;
+                    created = true;
+                    break;
+                }
+                Err(BeadsError::IdCollision { .. }) => {
+                    if retries >= 10 {
+                        eprintln!("✗ Failed to create {title}: ID collision after 10 retries");
+                        break;
+                    }
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10 * retries));
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("✗ Failed to create {title}: {err}");
+                    break;
+                }
+            }
         }
 
-        if let Err(err) = storage.create_issue(&issue, &actor) {
-            eprintln!("✗ Failed to create {title}: {err}");
+        if !created {
             continue;
         }
+        let id = final_id;
+
+        // Increment count for next ID generation in the loop
+        count += 1;
 
         if ctx.is_json() {
             if let Some(full_issue) = storage.get_issue_for_export(&id)? {

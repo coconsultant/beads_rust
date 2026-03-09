@@ -137,16 +137,21 @@ pub fn execute(
     );
 
     if json {
-        // Print JSON directly - don't rely on ctx.json_pretty() since the
-        // OutputContext may not be in JSON mode when --robot flag is used
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
-        return Ok(());
-    }
+        if args.robot {
+            // Print JSON directly - don't rely on ctx.json_pretty() since the
+            // OutputContext may not be in JSON mode when --robot flag is used
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).expect("Failed to serialize JSON output")
+            );
+            return Ok(());
+        }
 
-    if matches!(ctx.mode(), OutputMode::Rich) {
-        render_changelog_rich(&output, ctx);
-    } else {
-        print_text_output(&output);
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_changelog_rich(&output, ctx);
+        } else {
+            print_text_output(&output);
+        }
     }
 
     Ok(())

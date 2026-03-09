@@ -210,7 +210,11 @@ fn remove_history_artifact_if_present(path: &Path, label: &str) -> Result<()> {
         Ok(metadata) => {
             let file_type = metadata.file_type();
             if file_type.is_symlink() || file_type.is_file() {
-                fs::remove_file(path).map_err(BeadsError::Io)?;
+                if let Err(err) = fs::remove_file(path) {
+                    if err.kind() != io::ErrorKind::NotFound {
+                        return Err(BeadsError::Io(err));
+                    }
+                }
                 return Ok(());
             }
             Err(BeadsError::Config(format!(

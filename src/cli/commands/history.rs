@@ -345,7 +345,8 @@ fn restore_backup(
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp_path = target_path.with_extension("jsonl.tmp");
+    let pid = std::process::id();
+    let temp_path = target_path.with_extension(format!("jsonl.{pid}.tmp"));
     validate_temp_file_path(&temp_path, &target_path, beads_dir, true)?;
     let mut reader = File::open(&backup_path)?;
     let mut writer = OpenOptions::new()
@@ -373,7 +374,11 @@ fn restore_backup(
             true,
             "overwrite history restore target",
         )?;
-        fs::remove_file(&target_path)?;
+        if let Err(err) = fs::remove_file(&target_path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
     }
     fs::rename(&temp_path, &target_path)?;
     temp_guard.persist();
@@ -780,8 +785,9 @@ mod tests {
             matches!(err, BeadsError::Io(_) | BeadsError::Config(_)),
             "unexpected error: {err}"
         );
+        let pid = std::process::id();
         assert!(
-            !beads_dir.join("issues.jsonl.tmp").exists(),
+            !beads_dir.join(format!("issues.jsonl.{pid}.tmp")).exists(),
             "failed restore should clean up the temporary restore file"
         );
     }

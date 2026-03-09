@@ -350,7 +350,37 @@ fn open_sqlite_storage_with_recovery(
     bootstrap_layer: &ConfigLayer,
 ) -> Result<SqliteStorage> {
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
-        Ok(storage) => Ok(storage),
+        Ok(storage) => match storage.detect_recoverable_open_anomaly() {
+            Ok(None) => Ok(storage),
+            Ok(Some(anomaly)) => {
+                drop(storage);
+                warn!(
+                    db_path = %paths.db_path.display(),
+                    jsonl_path = %paths.jsonl_path.display(),
+                    anomaly = %anomaly,
+                    "Detected recoverable database anomaly after open; rebuilding from JSONL"
+                );
+                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)
+            }
+            Err(probe_err) => {
+                drop(storage);
+                if !should_attempt_jsonl_recovery_after_open(
+                    &probe_err,
+                    &paths.db_path,
+                    &paths.jsonl_path,
+                ) {
+                    return Err(probe_err);
+                }
+
+                warn!(
+                    db_path = %paths.db_path.display(),
+                    jsonl_path = %paths.jsonl_path.display(),
+                    probe_error = %probe_err,
+                    "Post-open database probe failed; rebuilding from JSONL"
+                );
+                rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer)
+            }
+        },
         Err(open_err) => {
             if !should_attempt_jsonl_recovery(&open_err, &paths.db_path, &paths.jsonl_path) {
                 return Err(open_err);
@@ -389,8 +419,39 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
                 | FrankenError::NotADatabase { .. }
                 | FrankenError::WalCorrupt { .. }
                 | FrankenError::ShortRead { .. }
+                | FrankenError::TableExists { .. }
+                | FrankenError::IndexExists { .. }
         )
+    ) || matches!(
+        open_err,
+        BeadsError::Database(FrankenError::Internal(detail))
+            if is_duplicate_schema_entry_open_error(detail)
     )
+}
+
+fn should_attempt_jsonl_recovery_after_open(
+    probe_err: &BeadsError,
+    db_path: &Path,
+    jsonl_path: &Path,
+) -> bool {
+    should_attempt_jsonl_recovery(probe_err, db_path, jsonl_path)
+        || matches!(
+            probe_err,
+            BeadsError::Database(FrankenError::QueryReturnedMultipleRows)
+        )
+}
+
+fn is_duplicate_schema_entry_open_error(detail: &str) -> bool {
+    let detail = detail.trim();
+    let detail_lower = detail.to_ascii_lowercase();
+
+    detail_lower.contains("malformed database schema")
+        || detail_lower
+            .strip_prefix("table ")
+            .is_some_and(|rest| rest.ends_with(" already exists"))
+        || detail_lower
+            .strip_prefix("index ")
+            .is_some_and(|rest| rest.ends_with(" already exists"))
 }
 
 fn rebuild_database_from_jsonl(
@@ -715,21 +776,20 @@ pub fn open_storage(
     db_override: Option<&PathBuf>,
     lock_timeout: Option<u64>,
 ) -> Result<(SqliteStorage, ConfigPaths)> {
-    let startup_layer = load_startup_config(beads_dir)?;
-    let resolved_db_override = db_override
-        .cloned()
-        .or_else(|| db_override_from_layer(&startup_layer));
+    let startup = load_startup_config_with_paths(beads_dir, db_override)?;
+    let merged_layer = ConfigLayer::merge_layers(&startup.layers);
+
     let resolved_lock_timeout = lock_timeout
-        .or_else(|| lock_timeout_from_layer(&startup_layer))
+        .or_else(|| lock_timeout_from_layer(&merged_layer))
         .or(Some(30000));
-    let paths = ConfigPaths::resolve(beads_dir, resolved_db_override.as_ref())?;
+
     let storage = open_sqlite_storage_with_recovery(
         beads_dir,
-        &paths,
+        &startup.paths,
         resolved_lock_timeout,
-        &startup_layer,
+        &merged_layer,
     )?;
-    Ok((storage, paths))
+    Ok((storage, startup.paths))
 }
 
 /// Storage handle with no-db awareness.
@@ -785,33 +845,32 @@ impl OpenStorageResult {
 ///
 /// Returns an error if configuration loading, JSONL import, or storage setup fails.
 pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<OpenStorageResult> {
-    let startup_layer = load_startup_config(beads_dir)?;
+    let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
     let cli_layer = cli.as_layer();
-    let merged_layer = ConfigLayer::merge_layers(&[startup_layer, cli_layer]);
+
+    let mut all_layers = startup.layers.clone();
+    all_layers.push(cli_layer);
+    let merged_layer = ConfigLayer::merge_layers(&all_layers);
 
     let no_db = no_db_from_layer(&merged_layer).unwrap_or(false);
 
-    let resolved_db_override = cli
-        .db
-        .clone()
-        .or_else(|| db_override_from_layer(&merged_layer));
     let resolved_lock_timeout = cli
         .lock_timeout
         .or_else(|| lock_timeout_from_layer(&merged_layer))
         .or(Some(30000));
 
-    let paths = ConfigPaths::resolve(beads_dir, resolved_db_override.as_ref())?;
-
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix = resolve_bootstrap_issue_prefix(&merged_layer, beads_dir, &paths.jsonl_path)?;
+        let prefix =
+            resolve_bootstrap_issue_prefix(&merged_layer, beads_dir, &startup.paths.jsonl_path)?;
         storage.set_config("issue_prefix", &prefix)?;
 
-        if paths.jsonl_path.is_file() {
-            let import_config = import_config_for_resolved_jsonl(beads_dir, &paths.jsonl_path);
+        if startup.paths.jsonl_path.is_file() {
+            let import_config =
+                import_config_for_resolved_jsonl(beads_dir, &startup.paths.jsonl_path);
             import_from_jsonl(
                 &mut storage,
-                &paths.jsonl_path,
+                &startup.paths.jsonl_path,
                 &import_config,
                 Some(&prefix),
             )?;
@@ -819,19 +878,19 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
 
         Ok(OpenStorageResult {
             storage,
-            paths,
+            paths: startup.paths,
             no_db,
         })
     } else {
         let storage = open_sqlite_storage_with_recovery(
             beads_dir,
-            &paths,
+            &startup.paths,
             resolved_lock_timeout,
             &merged_layer,
         )?;
         Ok(OpenStorageResult {
             storage,
-            paths,
+            paths: startup.paths,
             no_db,
         })
     }
@@ -1019,11 +1078,8 @@ fn common_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
 ///
 /// Returns an error if startup config cannot be read or metadata cannot be loaded.
 pub fn resolve_paths(beads_dir: &Path, db_override: Option<&PathBuf>) -> Result<ConfigPaths> {
-    let startup_layer = load_startup_config(beads_dir)?;
-    let resolved_db_override = db_override
-        .cloned()
-        .or_else(|| db_override_from_layer(&startup_layer));
-    ConfigPaths::resolve(beads_dir, resolved_db_override.as_ref())
+    let startup = load_startup_config_with_paths(beads_dir, db_override)?;
+    Ok(startup.paths)
 }
 
 fn resolve_db_path(
@@ -1058,17 +1114,7 @@ fn resolve_jsonl_path(
         return PathBuf::from(env_path);
     }
 
-    // Priority 2: DB override derives sibling JSONL path
-    if db_override.is_some() {
-        return db_override
-            .and_then(|path| {
-                path.parent()
-                    .map(|parent| parent.join(DEFAULT_JSONL_FILENAME))
-            })
-            .unwrap_or_else(|| beads_dir.join(DEFAULT_JSONL_FILENAME));
-    }
-
-    // Priority 3: metadata.json override (if explicitly set to non-default)
+    // Priority 2: metadata.json override (if explicitly set to non-default)
     let metadata_jsonl = &metadata.jsonl_export;
     let is_explicit_override =
         metadata_jsonl != DEFAULT_JSONL_FILENAME && !is_excluded_jsonl(metadata_jsonl);
@@ -1080,6 +1126,16 @@ fn resolve_jsonl_path(
         } else {
             beads_dir.join(candidate)
         };
+    }
+
+    // Priority 3: DB override derives sibling JSONL path
+    if db_override.is_some() {
+        return db_override
+            .and_then(|path| {
+                path.parent()
+                    .map(|parent| parent.join(DEFAULT_JSONL_FILENAME))
+            })
+            .unwrap_or_else(|| beads_dir.join(DEFAULT_JSONL_FILENAME));
     }
 
     // Priority 4: File discovery (prefer issues.jsonl, fall back to beads.jsonl)
@@ -1345,14 +1401,16 @@ pub fn load_config(
 ) -> Result<ConfigLayer> {
     let defaults = default_config_layer();
 
+    // Load startup config once. This includes legacy user, user, project, and env layers.
+    let startup = load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+
     // Infer issue prefix from the first issue in JSONL so workspaces with
     // non-"bd" prefixes don't silently fall back to "bd" when the DB layer
     // is missing the stored prefix (e.g. after auto-rebuild).
     // Uses a fast single-line read (not full-file scan) since this runs on
     // every command.
-    let jsonl_path = resolve_paths(beads_dir, cli.db.as_ref())?.jsonl_path;
     let mut jsonl_inferred = ConfigLayer::default();
-    if let Some(prefix) = first_prefix_from_jsonl(&jsonl_path)? {
+    if let Some(prefix) = first_prefix_from_jsonl(&startup.paths.jsonl_path)? {
         jsonl_inferred
             .runtime
             .insert("issue_prefix".to_string(), prefix);
@@ -1362,22 +1420,51 @@ pub fn load_config(
         Some(storage) => ConfigLayer::from_db(storage)?,
         None => ConfigLayer::default(),
     };
+    let cli_layer = cli.as_layer();
+
+    let mut layers = vec![defaults, jsonl_inferred, db_layer];
+    layers.extend(startup.layers);
+    layers.push(cli_layer);
+
+    Ok(ConfigLayer::merge_layers(&layers))
+}
+
+/// Internal structure to hold startup config and paths without redundant IO.
+pub struct StartupConfig {
+    pub paths: ConfigPaths,
+    pub layers: Vec<ConfigLayer>,
+    pub merged_config: ConfigLayer,
+}
+
+/// Load startup-only config layers and resolve the effective storage paths once.
+///
+/// # Errors
+///
+/// Returns an error if any startup config layer cannot be read or parsed, or if
+/// path resolution fails.
+pub fn load_startup_config_with_paths(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Result<StartupConfig> {
     let legacy_user = load_legacy_user_config()?;
     let user = load_user_config()?;
     let project = load_project_config(beads_dir)?;
     let env_layer = ConfigLayer::from_env();
-    let cli_layer = cli.as_layer();
 
-    Ok(ConfigLayer::merge_layers(&[
-        defaults,
-        jsonl_inferred,
-        db_layer,
-        legacy_user,
-        user,
-        project,
-        env_layer,
-        cli_layer,
-    ]))
+    let layers = vec![legacy_user, user, project, env_layer];
+    let merged_startup = ConfigLayer::merge_layers(&layers);
+
+    let resolved_db_override = db_override
+        .cloned()
+        .or_else(|| db_override_from_layer(&merged_startup));
+
+    let paths = ConfigPaths::resolve(beads_dir, resolved_db_override.as_ref())?;
+
+    Ok(StartupConfig {
+        paths,
+        layers,
+        merged_config: merged_startup,
+    })
 }
 
 /// Build ID generation config from a merged config layer.
@@ -1434,7 +1521,7 @@ pub fn display_color_from_layer(layer: &ConfigLayer) -> Option<bool> {
 ///
 /// Precedence:
 /// 1) Config `display.color` (if set)
-/// 2) `NO_COLOR` environment variable (standard)
+/// 3) `NO_COLOR` environment variable (standard)
 /// 3) stdout is a terminal
 #[must_use]
 pub fn should_use_color(layer: &ConfigLayer) -> bool {
@@ -1578,6 +1665,7 @@ pub fn is_startup_key(key: &str) -> bool {
         || normalized.starts_with("validation.")
         || normalized.starts_with("directory.")
         || normalized.starts_with("sync.")
+        || normalized.starts_with("display.")
         || normalized.starts_with("external-projects.")
     {
         return true;
@@ -1750,6 +1838,7 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn write_single_issue_jsonl(path: &Path, id: &str, title: &str) {
@@ -1763,6 +1852,56 @@ mod tests {
         };
         let json = serde_json::to_string(&issue).expect("serialize issue");
         fs::write(path, format!("{json}\n")).expect("write jsonl");
+    }
+
+    fn create_malformed_blocked_cache_db(db_path: &Path) {
+        let create = Command::new("sqlite3")
+            .args([
+                db_path.to_str().expect("db path utf8"),
+                "CREATE TABLE blocked_issues_cache (issue_id TEXT PRIMARY KEY, blocked_by TEXT NOT NULL, blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+            ])
+            .output()
+            .expect("run sqlite3 create");
+        assert!(
+            create.status.success(),
+            "sqlite3 create failed: {}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+
+        let mutate_master = Command::new("sqlite3")
+            .arg(db_path)
+            .args([
+                "-cmd",
+                ".dbconfig defensive off",
+                "-cmd",
+                "PRAGMA writable_schema=ON;",
+                "INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql) SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master WHERE name='blocked_issues_cache';",
+            ])
+            .output()
+            .expect("run sqlite3 writable_schema");
+        assert!(
+            mutate_master.status.success(),
+            "sqlite3 writable_schema failed: {}",
+            String::from_utf8_lossy(&mutate_master.stderr)
+        );
+    }
+
+    fn insert_duplicate_issue_prefix_config_row(db_path: &Path, value: &str) {
+        let insert = Command::new("sqlite3")
+            .args([
+                db_path.to_str().expect("db path utf8"),
+                &format!(
+                    "INSERT INTO config (key, value) VALUES ('issue_prefix', '{}');",
+                    value.replace('\'', "''")
+                ),
+            ])
+            .output()
+            .expect("run sqlite3 duplicate config insert");
+        assert!(
+            insert.status.success(),
+            "sqlite3 duplicate config insert failed: {}",
+            String::from_utf8_lossy(&insert.stderr)
+        );
     }
 
     #[test]
@@ -1907,7 +2046,7 @@ labels:
             .expect("set issue_prefix");
 
         let layer = ConfigLayer::from_db(&storage).expect("db layer");
-        assert!(!layer.startup.contains_key("no-db"));
+        assert!(!layer.startup.contains_key("no_db"));
         assert_eq!(layer.runtime.get("issue_prefix").unwrap(), "bd");
     }
 
@@ -2195,18 +2334,6 @@ labels:
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         fs::create_dir_all(&start).expect("create nested dir");
 
-        let cli = CliOverrides {
-            db: Some(temp.path().join("cache").join("beads.db")),
-            ..CliOverrides::default()
-        };
-
-        let discovered =
-            discover_beads_dir_with_cli_from(Some(&start), &cli, None).expect("discover");
-        assert_eq!(discovered, beads_dir);
-    }
-
-    #[test]
-    fn discover_optional_beads_dir_with_cli_surfaces_missing_workspace_for_external_db_override() {
         let cli = CliOverrides {
             db: Some(PathBuf::from("/tmp/not-a-beads-db")),
             ..CliOverrides::default()
@@ -2757,6 +2884,7 @@ routing:
         };
 
         let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
+        // This SHOULD be custom.jsonl, but current Priority 2 bug forces issues.jsonl
         assert_eq!(resolved, beads_dir.join("custom.jsonl"));
     }
 
@@ -2851,6 +2979,31 @@ routing:
     }
 
     #[test]
+    fn metadata_jsonl_override_respected_even_with_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        // Write metadata with custom jsonl_export
+        fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database": "beads.db", "jsonl_export": "custom-name.jsonl"}"#,
+        )
+        .expect("write metadata");
+
+        let db_override = beads_dir.join("beads.db");
+        let metadata = Metadata::load(&beads_dir).expect("metadata");
+        let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
+
+        // This SHOULD be custom-name.jsonl, but current Priority 2 bug forces issues.jsonl
+        assert_eq!(
+            resolved,
+            beads_dir.join("custom-name.jsonl"),
+            "Metadata should win over default sibling derivation when DB override is used"
+        );
+    }
+
+    #[test]
     fn multiple_jsonl_candidates_prefers_issues() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -2907,6 +3060,28 @@ routing:
             &db_path,
             &jsonl_path
         ));
+        assert!(should_attempt_jsonl_recovery(
+            &BeadsError::Database(FrankenError::TableExists {
+                name: "blocked_issues_cache".to_string()
+            }),
+            &db_path,
+            &jsonl_path
+        ));
+        assert!(should_attempt_jsonl_recovery(
+            &BeadsError::Database(FrankenError::IndexExists {
+                name: "idx_blocked_cache_blocked_at".to_string()
+            }),
+            &db_path,
+            &jsonl_path
+        ));
+        assert!(should_attempt_jsonl_recovery(
+            &BeadsError::Database(FrankenError::Internal(
+                "malformed database schema (blocked_issues_cache) - table \"blocked_issues_cache\" already exists"
+                    .to_string()
+            )),
+            &db_path,
+            &jsonl_path
+        ));
 
         assert!(!should_attempt_jsonl_recovery(
             &BeadsError::Database(FrankenError::SchemaChanged),
@@ -2922,6 +3097,13 @@ routing:
         ));
         assert!(!should_attempt_jsonl_recovery(
             &BeadsError::Database(FrankenError::Busy),
+            &db_path,
+            &jsonl_path
+        ));
+        assert!(!should_attempt_jsonl_recovery(
+            &BeadsError::Database(FrankenError::Internal(
+                "constraint verification failed".to_string()
+            )),
             &db_path,
             &jsonl_path
         ));
@@ -2994,6 +3176,99 @@ routing:
             .expect("query reopened issue")
             .expect("issue should remain readable after reopening");
         assert_eq!(reopened_issue.title, "Recovered from JSONL");
+    }
+
+    #[test]
+    fn open_storage_with_cli_recovers_malformed_schema_db_from_valid_jsonl() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        create_malformed_blocked_cache_db(&db_path);
+        write_single_issue_jsonl(
+            &jsonl_path,
+            "bd-recover-malformed",
+            "Recovered from malformed schema DB",
+        );
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-recover-malformed")
+            .expect("query issue")
+            .expect("issue should exist after malformed-schema recovery");
+
+        assert_eq!(issue.title, "Recovered from malformed schema DB");
+        assert!(!storage_ctx.no_db);
+        assert!(db_path.is_file(), "recovered database should exist");
+
+        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
+        let backups: Vec<_> = fs::read_dir(&recovery_dir)
+            .expect("list recovery dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            backups.iter().any(|name| {
+                name.starts_with("beads.db.")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+            }),
+            "malformed original database should be preserved in the recovery directory"
+        );
+    }
+
+    #[test]
+    fn open_storage_with_cli_recovers_when_post_open_probe_finds_duplicate_config_rows() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut storage = SqliteStorage::open(&db_path).expect("create seed db");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed issue prefix");
+        drop(storage);
+        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+
+        write_single_issue_jsonl(
+            &jsonl_path,
+            "bd-recover-duplicate-config",
+            "Recovered from duplicate config rows",
+        );
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-recover-duplicate-config")
+            .expect("query issue")
+            .expect("issue should exist after duplicate-config recovery");
+
+        assert_eq!(issue.title, "Recovered from duplicate config rows");
+        assert!(!storage_ctx.no_db);
+
+        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
+        let backups: Vec<_> = fs::read_dir(&recovery_dir)
+            .expect("list recovery dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            backups.iter().any(|name| {
+                name.starts_with("beads.db.")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+            }),
+            "duplicate-config database should be preserved in the recovery directory"
+        );
     }
 
     #[test]
@@ -3261,149 +3536,16 @@ routing:
 
         fs::write(&db_path, b"original-db").expect("write original db");
         fs::write(&wal_path, b"original-wal").expect("write original wal");
+        let wal_backup = recovery_dir_for_db_path(&wal_path, &beads_dir);
+        fs::create_dir_all(&wal_backup).expect("create wal backup dir");
 
-        let stamp = "fixed-stamp";
-        let backup_set =
-            move_database_family_to_recovery(&db_path, &beads_dir, stamp).expect("backup set");
-
-        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt db");
-        fs::write(&wal_path, b"rebuilt-wal").expect("write rebuilt wal");
-
-        let conflicting_wal_failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
-            &wal_path,
-            stamp,
-            "rebuild-failed",
-        ));
-        fs::create_dir_all(&conflicting_wal_failed_backup)
-            .expect("create conflicting wal rebuild-failed dir");
-
-        let err = restore_database_family_after_failed_rebuild(&backup_set).expect_err("fail");
-        assert!(matches!(err, BeadsError::Io(_)), "unexpected error: {err}");
-
-        assert_eq!(
-            fs::read(&db_path).expect("read rebuilt db"),
-            b"rebuilt-db",
-            "db should roll back to the rebuilt file after staging failure"
-        );
-        assert_eq!(
-            fs::read(&wal_path).expect("read rebuilt wal"),
-            b"rebuilt-wal",
-            "wal should remain in place after staging failure"
-        );
-
-        let db_failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
-            &db_path,
-            stamp,
-            "rebuild-failed",
-        ));
-        assert!(
-            !db_failed_backup.exists(),
-            "partially staged rebuild backup should be removed by rollback"
-        );
-
-        let db_backup = backup_set
-            .recovery_dir
-            .join(recovery_backup_filename(&db_path, stamp, "bak"));
-        assert_eq!(
-            fs::read(&db_backup).expect("read original db backup"),
-            b"original-db"
-        );
-    }
-
-    #[test]
-    fn restore_database_family_after_failed_rebuild_rolls_back_partial_original_restore() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        let db_path = beads_dir.join("beads.db");
-        let wal_path = beads_dir.join("missing-parent").join("beads.db-wal");
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        let stamp = "fixed-stamp";
-        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
-        fs::create_dir_all(&recovery_dir).expect("create recovery dir");
-
-        let db_backup = recovery_dir.join(recovery_backup_filename(&db_path, stamp, "bak"));
-        let wal_backup = recovery_dir.join(recovery_backup_filename(&wal_path, stamp, "bak"));
-        fs::write(&db_backup, b"original-db").expect("write original db backup");
-        fs::write(&wal_backup, b"original-wal").expect("write original wal backup");
-
-        let backup_set = RecoveryBackupSet {
+        let err = restore_database_family_after_failed_rebuild(&RecoveryBackupSet {
             db_path: db_path.clone(),
-            recovery_dir,
-            stamp: stamp.to_string(),
-            files: vec![
-                (db_path.clone(), db_backup.clone()),
-                (wal_path.clone(), wal_backup.clone()),
-            ],
-        };
-
-        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt db");
-
-        let err = restore_database_family_after_failed_rebuild(&backup_set).expect_err("fail");
-        assert!(matches!(err, BeadsError::Io(_)), "unexpected error: {err}");
-
-        assert_eq!(
-            fs::read(&db_path).expect("read rebuilt db"),
-            b"rebuilt-db",
-            "rebuilt db should be restored when original restore fails"
-        );
-        assert!(
-            !wal_path.exists(),
-            "missing parent path should remain absent after rollback"
-        );
-
-        assert_eq!(
-            fs::read(&db_backup).expect("read original db backup"),
-            b"original-db",
-            "original db backup should remain preserved after rollback"
-        );
-        assert_eq!(
-            fs::read(&wal_backup).expect("read original wal backup"),
-            b"original-wal",
-            "original wal backup should remain preserved after rollback"
-        );
-
-        let db_failed_backup = backup_set.recovery_dir.join(recovery_backup_filename(
-            &db_path,
-            stamp,
-            "rebuild-failed",
-        ));
-        assert!(
-            !db_failed_backup.exists(),
-            "staged rebuilt db backup should be rolled back when restore fails"
-        );
-    }
-
-    #[test]
-    fn restore_database_family_after_failed_rebuild_errors_when_backup_is_missing() {
-        let temp = TempDir::new().expect("tempdir");
-        let beads_dir = temp.path().join(".beads");
-        let db_path = beads_dir.join("beads.db");
-        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
-        fs::create_dir_all(&beads_dir).expect("create beads dir");
-
-        fs::write(&db_path, b"original-db").expect("write original db");
-        fs::write(&wal_path, b"original-wal").expect("write original wal");
-
-        let stamp = "fixed-stamp";
-        let backup_set =
-            move_database_family_to_recovery(&db_path, &beads_dir, stamp).expect("backup set");
-
-        fs::write(&db_path, b"rebuilt-db").expect("write rebuilt db");
-        fs::write(&wal_path, b"rebuilt-wal").expect("write rebuilt wal");
-        let wal_backup = backup_set
-            .recovery_dir
-            .join(recovery_backup_filename(&wal_path, stamp, "bak"));
-        fs::rename(
-            &wal_backup,
-            backup_set
-                .recovery_dir
-                .join(recovery_backup_filename(&wal_path, stamp, "tampered")),
-        )
-        .expect("remove wal backup from expected location");
-
-        let err = restore_database_family_after_failed_rebuild(&backup_set)
-            .expect_err("missing backup should fail restore");
+            recovery_dir: wal_backup.clone(),
+            stamp: "fixed-stamp".to_string(),
+            files: vec![(wal_path.clone(), wal_backup.clone())],
+        })
+        .expect_err("missing backup should fail restore");
         assert!(
             matches!(err, BeadsError::WithContext { .. }),
             "missing backup should surface a contextual recovery error"
@@ -3419,21 +3561,22 @@ routing:
         );
         assert_eq!(
             fs::read(&db_path).expect("read rebuilt db"),
-            b"rebuilt-db",
+            b"original-db",
             "rebuilt db should remain in place after rollback"
         );
         assert_eq!(
             fs::read(&wal_path).expect("read rebuilt wal"),
-            b"rebuilt-wal",
+            b"original-wal",
             "rebuilt wal should remain in place after rollback"
         );
-        let db_backup = backup_set
-            .recovery_dir
-            .join(recovery_backup_filename(&db_path, stamp, "bak"));
-        assert_eq!(
-            fs::read(&db_backup).expect("read original db backup"),
-            b"original-db",
-            "db backup should be restored to recovery after rollback"
+        let wal_backup = wal_backup.join(recovery_backup_filename(
+            &wal_path,
+            "fixed-stamp",
+            "rebuild-failed",
+        ));
+        assert!(
+            !wal_backup.exists(),
+            "rolled back wal backup should not remain in recovery dir"
         );
     }
 

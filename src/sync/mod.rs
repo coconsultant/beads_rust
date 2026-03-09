@@ -22,6 +22,7 @@ use crate::storage::SqliteStorage;
 use crate::sync::history::HistoryConfig;
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, hash_map::RandomState};
@@ -54,6 +55,10 @@ impl Drop for TempFileGuard {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+pub(crate) fn export_temp_path(output_path: &Path) -> PathBuf {
+    output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
 }
 
 /// Configuration for JSONL export.
@@ -1413,7 +1418,7 @@ pub fn export_to_jsonl_with_policy(
     // Ensure parent directory exists
     fs::create_dir_all(parent_dir)?;
 
-    let temp_path = output_path.with_extension("jsonl.tmp");
+    let temp_path = export_temp_path(output_path);
 
     // Validate temp file path (PC-4: temp files must be in same directory as target)
     if let Some(ref beads_dir) = config.beads_dir {
@@ -1743,19 +1748,36 @@ pub struct StalenessCheck {
 pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<StalenessCheck> {
     let dirty_count = storage.get_dirty_issue_count()?;
     let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
+    let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
     let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
     let jsonl_exists = jsonl_path.exists();
 
     let (jsonl_newer, db_newer) = if jsonl_exists {
         let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
 
-        // JSONL is newer if it was modified after last import
+        // Get the latest known sync time (either import or export)
+        let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
+
+        if let Some(import_time) = &last_import_time
+            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(import_time)
+        {
+            latest_sync_ts = Some(ts.with_timezone(&Utc));
+        }
+
+        if let Some(export_time) = &last_export_time
+            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(export_time)
+        {
+            let ts_utc = ts.with_timezone(&Utc);
+            if latest_sync_ts.is_none_or(|latest| ts_utc > latest) {
+                latest_sync_ts = Some(ts_utc);
+            }
+        }
+
+        // JSONL is newer if it was modified after the latest sync
         // If metadata is missing or invalid, assume JSONL is newer (safe default)
-        let mtime_newer = last_import_time.as_ref().is_none_or(|import_time| {
-            chrono::DateTime::parse_from_rfc3339(import_time).map_or(true, |import_ts| {
-                let import_sys_time = std::time::SystemTime::from(import_ts);
-                jsonl_mtime > import_sys_time
-            })
+        let mtime_newer = latest_sync_ts.is_none_or(|sync_ts| {
+            let sync_sys_time = std::time::SystemTime::from(sync_ts);
+            jsonl_mtime > sync_sys_time
         });
 
         let jsonl_newer = if mtime_newer {
@@ -1887,6 +1909,9 @@ pub fn finalize_export(
         // Update metadata
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
+        
+        // Clear force-flush flag if it was set
+        storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
 
         Ok(())
     })() {
@@ -1936,14 +1961,19 @@ pub fn auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
 ) -> Result<AutoFlushResult> {
-    // Check for dirty issues first
+    // Check for dirty issues or forced flush first
     let dirty_count = storage.get_dirty_issue_count()?;
-    if dirty_count == 0 {
+    let needs_flush = storage
+        .get_metadata("needs_flush")?
+        .unwrap_or_else(|| "false".to_string())
+        == "true";
+
+    if dirty_count == 0 && !needs_flush {
         tracing::debug!("Auto-flush: no dirty issues, skipping");
         return Ok(AutoFlushResult::default());
     }
 
-    tracing::debug!(dirty_count, "Auto-flush: exporting dirty issues");
+    tracing::debug!(dirty_count, needs_flush, "Auto-flush: exporting dirty issues");
 
     // Configure export with defaults, including beads_dir for path validation
     let export_config = ExportConfig {
@@ -2516,6 +2546,7 @@ pub fn import_from_jsonl(
             }
 
             storage.rebuild_blocked_cache_in_tx()?;
+            storage.rebuild_child_counters_in_tx()?;
             storage
                 .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
             storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
@@ -2739,7 +2770,17 @@ impl MergeReport {
 }
 
 /// Strategy for resolving conflicts during merge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum ConflictResolution {
     /// Always keep the local (`SQLite`) version.
     #[default]
@@ -2842,6 +2883,10 @@ pub fn merge_issue(
 
         // Case 6: In all three (potentially modified in one or both)
         (Some(b), Some(l), Some(r)) => {
+            if l.content_hash == r.content_hash {
+                return MergeResult::Keep(l.clone());
+            }
+
             let left_changed = l.content_hash != b.content_hash;
             let right_changed = r.content_hash != b.content_hash;
 
@@ -3012,7 +3057,8 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
     jsonl_dir: &Path,
 ) -> Result<()> {
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
-    let temp_path = snapshot_path.with_extension("jsonl.tmp");
+    let pid = std::process::id();
+    let temp_path = snapshot_path.with_extension(format!("jsonl.{pid}.tmp"));
     validate_temp_file_path(&temp_path, &snapshot_path, jsonl_dir, false)?;
 
     let temp_file = OpenOptions::new()
@@ -3145,6 +3191,21 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    #[test]
+    fn export_temp_path_is_pid_scoped_and_sibling_to_target() {
+        let target = Path::new("/tmp/issues.jsonl");
+        let temp = export_temp_path(target);
+
+        assert_eq!(temp.parent(), target.parent());
+        assert_ne!(temp, target);
+        assert!(
+            temp.display()
+                .to_string()
+                .contains(&std::process::id().to_string())
+        );
+        assert!(temp.extension().is_some_and(|ext| ext == "tmp"));
     }
 
     fn make_issue_at(id: &str, title: &str, updated_at: chrono::DateTime<Utc>) -> Issue {

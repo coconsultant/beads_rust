@@ -490,11 +490,19 @@ fn audit_entry_exists(beads_dir: &Path, entry_id: &str) -> Result<bool> {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: AuditEntry = serde_json::from_str(&line).map_err(|err| {
-            BeadsError::Config(format!("Failed to parse audit interaction entry: {err}"))
-        })?;
-        if entry.id.as_deref() == Some(entry_id) {
-            return Ok(true);
+        match serde_json::from_str::<AuditEntry>(&line) {
+            Ok(entry) => {
+                if entry.id.as_deref() == Some(entry_id) {
+                    return Ok(true);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    entry_id = ?entry_id,
+                    error = %err,
+                    "Failed to parse audit interaction entry; skipping"
+                );
+            }
         }
     }
 
