@@ -269,7 +269,7 @@ impl SqliteStorage {
 
         for chunk in exports.chunks(EXPORT_HASH_CHUNK_SIZE) {
             // Bulk delete existing hashes for this chunk
-            let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
                 "DELETE FROM export_hashes WHERE issue_id IN ({})",
                 placeholders.join(",")
@@ -391,8 +391,7 @@ impl SqliteStorage {
 
                             for chunk in dirty_vec.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
                                 // Bulk delete existing dirty flags for this chunk
-                                let placeholders: Vec<String> =
-                                    chunk.iter().map(|_| "?".to_string()).collect();
+                                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
                                 let sql = format!(
                                     "DELETE FROM dirty_issues WHERE issue_id IN ({})",
                                     placeholders.join(",")
@@ -1774,6 +1773,29 @@ impl SqliteStorage {
             }
         }
         Ok(ids)
+    }
+
+    /// Get raw `blocks` dependency edges as (issue_id, depends_on_id) pairs.
+    ///
+    /// This is a lightweight single-table query (no JOINs) suitable for
+    /// callers that already have issues loaded in memory and can filter
+    /// by status themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocks_dep_edges(&self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .conn
+            .query("SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'")?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let issue_id = row.get(0).and_then(SqliteValue::as_text)?.to_string();
+                let depends_on = row.get(1).and_then(SqliteValue::as_text)?.to_string();
+                Some((issue_id, depends_on))
+            })
+            .collect())
     }
 
     /// Check if an issue is blocked (in the blocked cache).
@@ -5127,10 +5149,10 @@ fn comment_from_row(row: &fsqlite::Row) -> Result<Comment> {
 }
 
 fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::<&str>::new();
     let mut deduped = Vec::with_capacity(values.len());
     for value in values {
-        if seen.insert(value.clone()) {
+        if seen.insert(value) {
             deduped.push(value.clone());
         }
     }

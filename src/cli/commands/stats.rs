@@ -15,6 +15,7 @@ use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use rich_rust::prelude::*;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info};
@@ -133,9 +134,25 @@ fn compute_summary(
     let mut epics = Vec::new();
     let mut lead_times = Vec::new();
 
-    // Use only 'blocks' dependency type for stats blocked count (classic bd semantics).
-    // This differs from the ready/blocked commands which use the full blocked cache.
-    let blocked_by_blocks = storage.get_blocked_by_blocks_deps_only()?;
+    // Compute blocked-by-blocks in memory to avoid an expensive double LEFT JOIN
+    // in fsqlite. We already have all issues loaded, so we build a status lookup
+    // and filter the raw dependency edges in Rust.
+    let blocked_by_blocks = {
+        let status_map: HashSet<&str> = issues
+            .iter()
+            .filter(|i| !matches!(i.status, Status::Closed | Status::Tombstone))
+            .map(|i| i.id.as_str())
+            .collect();
+        let edges = storage.get_blocks_dep_edges()?;
+        let mut blocked = HashSet::new();
+        for (issue_id, depends_on_id) in &edges {
+            if status_map.contains(depends_on_id.as_str()) && status_map.contains(issue_id.as_str())
+            {
+                blocked.insert(issue_id.clone());
+            }
+        }
+        blocked
+    };
 
     // Get full blocked cache for accurate Ready count (must match `br ready` behavior)
     let all_blocked_ids = storage.get_blocked_ids()?;
