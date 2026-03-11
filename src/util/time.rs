@@ -174,7 +174,7 @@ pub fn format_relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
     let seconds = duration.num_seconds();
     if seconds < 60 {
-        return format!("just now");
+        return "just now".to_string();
     }
 
     let minutes = duration.num_minutes();

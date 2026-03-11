@@ -378,7 +378,7 @@ impl SqliteStorage {
 
         for (issue_id, content_hash) in exports {
             if let Some(position) = positions.get(issue_id).copied() {
-                deduped[position].1 = content_hash.clone();
+                deduped[position].1.clone_from(content_hash);
             } else {
                 positions.insert(issue_id.clone(), deduped.len());
                 deduped.push((issue_id.clone(), content_hash.clone()));

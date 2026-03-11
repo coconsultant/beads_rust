@@ -274,16 +274,15 @@ pub fn create_issue_impl(
         validate_relations(args, &id)?;
 
         // 6. Populate Relations (labels & dependencies)
-        populate_relations(
-            &mut issue,
-            args,
-            &config.actor,
+        let relation_context = RelationContext {
+            actor: &config.actor,
             now,
-            resolved_parent.as_deref(),
+            resolved_parent: resolved_parent.as_deref(),
             storage,
-            &all_ids,
-            &config.id_config.prefix,
-        )?;
+            all_ids: &all_ids,
+            prefix: &config.id_config.prefix,
+        };
+        populate_relations(&mut issue, args, &relation_context)?;
         // 7. Dry Run check - return early
         if args.dry_run {
             return Ok(issue);
@@ -443,17 +442,21 @@ fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
     Ok(())
 }
 
+struct RelationContext<'a> {
+    actor: &'a str,
+    now: DateTime<Utc>,
+    resolved_parent: Option<&'a str>,
+    storage: &'a crate::storage::SqliteStorage,
+    all_ids: &'a [String],
+    prefix: &'a str,
+}
+
 fn populate_relations(
     issue: &mut Issue,
     args: &CreateArgs,
-    actor: &str,
-    now: DateTime<Utc>,
-    resolved_parent: Option<&str>,
-    storage: &crate::storage::SqliteStorage,
-    all_ids: &[String],
-    prefix: &str,
+    ctx: &RelationContext<'_>,
 ) -> Result<()> {
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(prefix.to_string()));
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(ctx.prefix.to_string()));
 
     // Labels
     for label in &args.labels {
@@ -464,13 +467,13 @@ fn populate_relations(
     }
 
     // Parent
-    if let Some(parent_id) = resolved_parent {
+    if let Some(parent_id) = ctx.resolved_parent {
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: parent_id.to_string(),
             dep_type: DependencyType::ParentChild,
-            created_at: now,
-            created_by: Some(actor.to_string()),
+            created_at: ctx.now,
+            created_by: Some(ctx.actor.to_string()),
             metadata: None,
             thread_id: None,
         });
@@ -493,7 +496,7 @@ fn populate_relations(
             type_str
         };
 
-        let resolved_dep_id = resolve_dependency_id(&resolver, storage, all_ids, dep_id)?;
+        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, ctx.all_ids, dep_id)?;
 
         // from_str is infallible - Custom types are rejected by validate_relations above
         let dep_type: DependencyType = normalized_type.parse().expect("validated above");
@@ -501,8 +504,8 @@ fn populate_relations(
             issue_id: issue.id.clone(),
             depends_on_id: resolved_dep_id,
             dep_type,
-            created_at: now,
-            created_by: Some(actor.to_string()),
+            created_at: ctx.now,
+            created_by: Some(ctx.actor.to_string()),
             metadata: None,
             thread_id: None,
         });
