@@ -13,7 +13,7 @@ use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::str::FromStr;

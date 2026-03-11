@@ -396,18 +396,15 @@ pub fn parse_id(id: &str) -> Result<ParsedId> {
         return Err(BeadsError::InvalidId { id: id.to_string() });
     }
 
-    if !prefix
-        .chars()
-        .all(|c| {
-            c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || c == '_'
-                || c == '-'
-                || c == '.'
-                || c == ':'
-                || c == '#'
-        })
-    {
+    if !prefix.chars().all(|c| {
+        c.is_ascii_lowercase()
+            || c.is_ascii_digit()
+            || c == '_'
+            || c == '-'
+            || c == '.'
+            || c == ':'
+            || c == '#'
+    }) {
         return Err(BeadsError::InvalidId { id: id.to_string() });
     }
 

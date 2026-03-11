@@ -179,26 +179,51 @@ pub fn format_relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
     let minutes = duration.num_minutes();
     if minutes < 60 {
-        return format!("{} minute{} {}", minutes, if minutes == 1 { "" } else { "s" }, suffix);
+        return format!(
+            "{} minute{} {}",
+            minutes,
+            if minutes == 1 { "" } else { "s" },
+            suffix
+        );
     }
 
     let hours = duration.num_hours();
     if hours < 24 {
-        return format!("{} hour{} {}", hours, if hours == 1 { "" } else { "s" }, suffix);
+        return format!(
+            "{} hour{} {}",
+            hours,
+            if hours == 1 { "" } else { "s" },
+            suffix
+        );
     }
 
     let days = duration.num_days();
     if days < 30 {
-        return format!("{} day{} {}", days, if days == 1 { "" } else { "s" }, suffix);
+        return format!(
+            "{} day{} {}",
+            days,
+            if days == 1 { "" } else { "s" },
+            suffix
+        );
     }
 
     let months = days / 30;
     if months < 12 {
-        return format!("{} month{} {}", months, if months == 1 { "" } else { "s" }, suffix);
+        return format!(
+            "{} month{} {}",
+            months,
+            if months == 1 { "" } else { "s" },
+            suffix
+        );
     }
 
     let years = days / 365;
-    format!("{} year{} {}", years, if years == 1 { "" } else { "s" }, suffix)
+    format!(
+        "{} year{} {}",
+        years,
+        if years == 1 { "" } else { "s" },
+        suffix
+    )
 }
 
 fn local_to_utc(naive_dt: &chrono::NaiveDateTime, field_name: &str) -> Result<DateTime<Utc>> {

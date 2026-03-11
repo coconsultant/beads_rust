@@ -557,6 +557,7 @@ fn execute_import(
     let mut count = storage.count_issues()?;
     let mut last_created_id: Option<String> = None;
 
+    let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
     let all_ids = storage.get_all_ids()?;
 
@@ -707,15 +708,16 @@ fn execute_import(
                     type_str = "blocks".to_string();
                 }
 
-                let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &all_ids, &dep_id) {
-                    Ok(resolved_dep) => resolved_dep,
-                    Err(err) => {
-                        dependency_error = Some(format!(
-                            "unresolved dependency '{dep_id}' for issue {id}: {err}"
-                        ));
-                        break;
-                    }
-                };
+                let resolved_dep_id =
+                    match resolve_dependency_id(&resolver, storage, &all_ids, &dep_id) {
+                        Ok(resolved_dep) => resolved_dep,
+                        Err(err) => {
+                            dependency_error = Some(format!(
+                                "unresolved dependency '{dep_id}' for issue {id}: {err}"
+                            ));
+                            break;
+                        }
+                    };
 
                 if resolved_dep_id == id {
                     eprintln!("warning: skipping self-dependency for issue {id}");

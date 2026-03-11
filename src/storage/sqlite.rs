@@ -459,169 +459,100 @@ impl SqliteStorage {
     where
         F: FnMut(&Connection, &mut MutationContext) -> Result<R>,
     {
-        const MAX_RETRIES: u32 = 5;
-        let base_backoff_ms: u64 = 10;
-
-        for attempt in 0..MAX_RETRIES {
-            // BEGIN IMMEDIATE acquires a write lock. If another writer holds
-            // the lock and busy_timeout is configured, fsqlite will retry
-            // internally. If it still fails (or busy_timeout is 0), we retry
-            // at this level with backoff.
-            match self.conn.execute("BEGIN IMMEDIATE") {
-                Ok(_) => {}
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
-                    std::thread::sleep(Duration::from_millis(backoff));
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-
+        self.with_write_transaction(|storage| {
             let mut ctx = MutationContext::new(op, actor);
+            let result = f(&storage.conn, &mut ctx)?;
 
-            match f(&self.conn, &mut ctx) {
-                Ok(result) => {
-                    let side_effects: Result<()> = (|| {
-                        // Write events
-                        if !ctx.events.is_empty() {
-                            for event_chunk in ctx.events.chunks(140) {
-                                let placeholders: Vec<&str> = event_chunk
-                                    .iter()
-                                    .map(|_| "(?, ?, ?, ?, ?, ?, ?)")
-                                    .collect();
-                                let sql = format!(
-                                    "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES {}",
-                                    placeholders.join(", ")
-                                );
-                                let mut params = Vec::with_capacity(event_chunk.len() * 7);
-                                for event in event_chunk {
-                                    params.push(SqliteValue::from(event.issue_id.as_str()));
-                                    params.push(SqliteValue::from(event.event_type.as_str()));
-                                    params.push(SqliteValue::from(event.actor.as_str()));
-                                    params.push(
-                                        event
-                                            .old_value
-                                            .as_deref()
-                                            .map_or(SqliteValue::Null, SqliteValue::from),
-                                    );
-                                    params.push(
-                                        event
-                                            .new_value
-                                            .as_deref()
-                                            .map_or(SqliteValue::Null, SqliteValue::from),
-                                    );
-                                    params.push(
-                                        event
-                                            .comment
-                                            .as_deref()
-                                            .map_or(SqliteValue::Null, SqliteValue::from),
-                                    );
-                                    params.push(SqliteValue::from(event.created_at.to_rfc3339()));
-                                }
-                                self.conn.execute_with_params(&sql, &params)?;
-                            }
-                        }
-
-                        // Mark dirty — DELETE + INSERT instead of INSERT OR
-                        // REPLACE because fsqlite lacks UNIQUE enforcement.
-                        if !ctx.dirty_ids.is_empty() {
-                            let now_str = Utc::now().to_rfc3339();
-                            let dirty_vec: Vec<String> = ctx.dirty_ids.drain().collect();
-
-                            for chunk in dirty_vec.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
-                                // Bulk delete existing dirty flags for this chunk
-                                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-                                let sql = format!(
-                                    "DELETE FROM dirty_issues WHERE issue_id IN ({})",
-                                    placeholders.join(",")
-                                );
-                                let params: Vec<SqliteValue> = chunk
-                                    .iter()
-                                    .map(|id| SqliteValue::from(id.as_str()))
-                                    .collect();
-                                self.conn.execute_with_params(&sql, &params)?;
-
-                                // Insert new dirty flags
-                                for insert_chunk in chunk.chunks(400) {
-                                    let placeholders: Vec<&str> =
-                                        insert_chunk.iter().map(|_| "(?, ?)").collect();
-                                    let insert_sql = format!(
-                                        "INSERT INTO dirty_issues (issue_id, marked_at) VALUES {}",
-                                        placeholders.join(", ")
-                                    );
-                                    let mut insert_params =
-                                        Vec::with_capacity(insert_chunk.len() * 2);
-                                    for id in insert_chunk {
-                                        insert_params.push(SqliteValue::from(id.as_str()));
-                                        insert_params.push(SqliteValue::from(now_str.as_str()));
-                                    }
-                                    self.conn.execute_with_params(&insert_sql, &insert_params)?;
-                                }
-                            }
-                        }
-
-                        // Rebuild blocked cache inside the transaction if needed
-                        if ctx.invalidate_blocked_cache {
-                            Self::rebuild_blocked_cache_impl(&self.conn)?;
-                        }
-
-                        if ctx.force_flush {
-                            self.conn.execute_with_params(
-                                "DELETE FROM metadata WHERE key = 'needs_flush'",
-                                &[],
-                            )?;
-                            self.conn.execute_with_params(
-                                "INSERT INTO metadata (key, value) VALUES ('needs_flush', 'true')",
-                                &[],
-                            )?;
-                        }
-
-                        Ok(())
-                    })();
-
-                    if let Err(err) = side_effects {
-                        let _ = self.conn.execute("ROLLBACK");
-                        if attempt < MAX_RETRIES - 1 && err.is_transient() {
-                            let backoff = base_backoff_ms * 2u64.pow(attempt);
-                            std::thread::sleep(Duration::from_millis(backoff));
-                            continue;
-                        }
-                        return Err(err);
+            // Write events
+            if !ctx.events.is_empty() {
+                for event_chunk in ctx.events.chunks(140) {
+                    let placeholders: Vec<&str> =
+                        event_chunk.iter().map(|_| "(?, ?, ?, ?, ?, ?, ?)").collect();
+                    let sql = format!(
+                        "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES {}",
+                        placeholders.join(", ")
+                    );
+                    let mut params = Vec::with_capacity(event_chunk.len() * 7);
+                    for event in event_chunk {
+                        params.push(SqliteValue::from(event.issue_id.as_str()));
+                        params.push(SqliteValue::from(event.event_type.as_str()));
+                        params.push(SqliteValue::from(event.actor.as_str()));
+                        params.push(
+                            event
+                                .old_value
+                                .as_deref()
+                                .map_or(SqliteValue::Null, SqliteValue::from),
+                        );
+                        params.push(
+                            event
+                                .new_value
+                                .as_deref()
+                                .map_or(SqliteValue::Null, SqliteValue::from),
+                        );
+                        params.push(
+                            event
+                                .comment
+                                .as_deref()
+                                .map_or(SqliteValue::Null, SqliteValue::from),
+                        );
+                        params.push(SqliteValue::from(event.created_at.to_rfc3339()));
                     }
-
-                    // Try to commit
-                    match self.conn.execute("COMMIT") {
-                        Ok(_) => {
-                            // Periodic WAL checkpoint to prevent unbounded WAL growth
-                            self.mutation_count += 1;
-                            if self.mutation_count >= WAL_CHECKPOINT_INTERVAL {
-                                self.mutation_count = 0;
-                                self.try_wal_checkpoint();
-                            }
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            let _ = self.conn.execute("ROLLBACK");
-                            if attempt < MAX_RETRIES - 1 && e.is_transient() {
-                                let backoff = base_backoff_ms * 2u64.pow(attempt);
-                                std::thread::sleep(Duration::from_millis(backoff));
-                            }
-                            return Err(e.into());
-                        }
-                    }
-                }
-                Err(e) if attempt < MAX_RETRIES - 1 && e.is_transient() => {
-                    let _ = self.conn.execute("ROLLBACK");
-                    let backoff = base_backoff_ms * 2u64.pow(attempt);
-                    std::thread::sleep(Duration::from_millis(backoff));
-                }
-                Err(e) => {
-                    let _ = self.conn.execute("ROLLBACK");
-                    return Err(e);
+                    storage.conn.execute_with_params(&sql, &params)?;
                 }
             }
-        }
-        unreachable!("retry loop always returns")
+
+            // Mark dirty
+            if !ctx.dirty_ids.is_empty() {
+                let now_str = Utc::now().to_rfc3339();
+                let dirty_vec: Vec<String> = ctx.dirty_ids.drain().collect();
+
+                for chunk in dirty_vec.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
+                    // Bulk delete existing dirty flags for this chunk
+                    let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                    let sql = format!(
+                        "DELETE FROM dirty_issues WHERE issue_id IN ({})",
+                        placeholders.join(",")
+                    );
+                    let params: Vec<SqliteValue> =
+                        chunk.iter().map(|id| SqliteValue::from(id.as_str())).collect();
+                    storage.conn.execute_with_params(&sql, &params)?;
+
+                    // Insert new dirty flags
+                    for insert_chunk in chunk.chunks(400) {
+                        let placeholders: Vec<&str> =
+                            insert_chunk.iter().map(|_| "(?, ?)").collect();
+                        let insert_sql = format!(
+                            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES {}",
+                            placeholders.join(", ")
+                        );
+                        let mut insert_params = Vec::with_capacity(insert_chunk.len() * 2);
+                        for id in insert_chunk {
+                            insert_params.push(SqliteValue::from(id.as_str()));
+                            insert_params.push(SqliteValue::from(now_str.as_str()));
+                        }
+                        storage.conn.execute_with_params(&insert_sql, &insert_params)?;
+                    }
+                }
+            }
+
+            // Rebuild blocked cache inside the transaction if needed
+            if ctx.invalidate_blocked_cache {
+                Self::rebuild_blocked_cache_impl(&storage.conn)?;
+            }
+
+            if ctx.force_flush {
+                storage.conn.execute_with_params(
+                    "DELETE FROM metadata WHERE key = 'needs_flush'",
+                    &[],
+                )?;
+                storage.conn.execute_with_params(
+                    "INSERT INTO metadata (key, value) VALUES ('needs_flush', 'true')",
+                    &[],
+                )?;
+            }
+
+            Ok(result)
+        })
     }
 
     /// Create a new issue.
@@ -7863,7 +7794,10 @@ mod tests {
             ])
             .unwrap();
 
-        assert_eq!(inserted, 1, "duplicate issue IDs should collapse to one row");
+        assert_eq!(
+            inserted, 1,
+            "duplicate issue IDs should collapse to one row"
+        );
 
         let (content_hash, _) = storage.get_export_hash("bd-hash-1").unwrap().unwrap();
         assert_eq!(content_hash, "hash-new");
