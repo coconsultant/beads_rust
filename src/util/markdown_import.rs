@@ -265,16 +265,15 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
 fn split_list_content(content: &str) -> Vec<String> {
     let mut result = Vec::new();
     for raw_line in content.lines() {
-        let is_list_item = raw_line.trim_start().starts_with('-')
-            || raw_line.trim_start().starts_with('*')
-            || raw_line.trim_start().starts_with('+');
+        let is_list_item = raw_line.trim_start().starts_with("- ")
+            || raw_line.trim_start().starts_with("* ")
+            || raw_line.trim_start().starts_with("+ ");
 
         let line = strip_markdown_list_prefix(raw_line).trim();
-        if line.is_empty() {
+        if line.is_empty() || is_marker_only_token(line) {
             continue;
         }
-        if line.contains(',') {
-            result.extend(
+        if line.contains(',') {            result.extend(
                 line.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty() && !is_marker_only_token(s)),
