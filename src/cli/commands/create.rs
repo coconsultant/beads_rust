@@ -63,7 +63,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     // We open storage even for dry-run to check ID collisions.
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let layer = storage_ctx.load_config(cli)?;
 
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
@@ -520,7 +520,7 @@ fn execute_import(
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let layer = storage_ctx.load_config(cli)?;
 
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;
@@ -766,16 +766,28 @@ fn execute_import(
 
         // Increment count for next ID generation in the loop
         count += 1;
+        created_ids.push((id, title));
+    }
 
-        if ctx.is_json() || ctx.is_toon() {
-            if let Some(full_issue) = storage.get_issue_for_export(&id)? {
-                created_issues.push(full_issue);
-            } else {
-                eprintln!("warning: could not load created issue {id} for JSON output");
+    if ctx.is_json() || ctx.is_toon() {
+        let ids: Vec<String> = created_ids.iter().map(|(id, _)| id.clone()).collect();
+        match storage.get_issues_for_export(&ids) {
+            Ok(issues) => {
+                // Ensure output order matches creation order
+                let mut issues_by_id: std::collections::HashMap<String, crate::model::Issue> =
+                    issues.into_iter().map(|i| (i.id.clone(), i)).collect();
+                for (id, _) in &created_ids {
+                    if let Some(issue) = issues_by_id.remove(id) {
+                        created_issues.push(issue);
+                    } else {
+                        eprintln!("warning: could not load created issue {id} for JSON output");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: could not load created issues for JSON output: {e}");
             }
         }
-
-        created_ids.push((id, title));
     }
 
     if args.silent {

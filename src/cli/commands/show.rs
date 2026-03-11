@@ -28,7 +28,82 @@ pub fn execute(
     outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    execute_inner(args, cli, outer_ctx, &beads_dir, None)
+    let mut target_ids = args.ids.clone();
+    if target_ids.is_empty() {
+        let last_touched = crate::util::get_last_touched_id(&beads_dir);
+        if last_touched.is_empty() {
+            return Err(BeadsError::validation(
+                "ids",
+                "no issue IDs provided and no last-touched issue",
+            ));
+        }
+        target_ids.push(last_touched);
+    }
+
+    let routed_batches = config::routing::group_issue_inputs_by_route(&target_ids, &beads_dir)?;
+    if routed_batches.iter().any(|batch| batch.is_external) {
+        let output_format = resolve_output_format_basic_with_outer_mode(
+            args.format,
+            outer_ctx.inherited_output_mode(),
+            false,
+        );
+
+        if matches!(
+            output_format,
+            crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Toon
+        ) {
+            let mut details_list = Vec::new();
+            for batch in routed_batches {
+                let mut batch_args = args.clone();
+                batch_args.ids = batch.issue_inputs;
+
+                let mut batch_cli = cli.clone();
+                batch_cli.db = Some(batch.beads_dir.join("beads.db"));
+
+                let (batch_details, _) = load_issue_details_for_route(
+                    &batch_args,
+                    &batch_cli,
+                    &batch.beads_dir,
+                    None,
+                    None,
+                )?;
+                details_list.extend(batch_details);
+            }
+
+            match output_format {
+                crate::cli::OutputFormat::Json => outer_ctx.json_pretty(&details_list),
+                crate::cli::OutputFormat::Toon => {
+                    outer_ctx.toon_with_stats(&details_list, args.stats);
+                }
+                crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => unreachable!(),
+            }
+            return Ok(());
+        }
+
+        for (index, batch) in routed_batches.into_iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+
+            let mut batch_args = args.clone();
+            batch_args.ids = batch.issue_inputs;
+
+            let mut batch_cli = cli.clone();
+            batch_cli.db = Some(batch.beads_dir.join("beads.db"));
+
+            execute_inner(
+                &batch_args,
+                &batch_cli,
+                outer_ctx,
+                &batch.beads_dir,
+                None,
+                None,
+            )?;
+        }
+        return Ok(());
+    }
+
+    execute_inner(args, cli, outer_ctx, &beads_dir, None, None)
 }
 
 /// Execute show using storage that was already opened by the caller.
@@ -43,7 +118,22 @@ pub fn execute_with_storage(
     beads_dir: &Path,
     storage: &SqliteStorage,
 ) -> Result<()> {
-    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage))
+    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage), None)
+}
+
+/// Execute show using the caller's preopened storage context.
+///
+/// # Errors
+///
+/// Returns an error if issue resolution or rendering fails.
+pub fn execute_with_storage_ctx(
+    args: &ShowArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    execute_inner(args, cli, outer_ctx, beads_dir, None, Some(storage_ctx))
 }
 
 fn execute_inner(
@@ -52,35 +142,15 @@ fn execute_inner(
     outer_ctx: &OutputContext,
     beads_dir: &Path,
     preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    let startup = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
-    let mut bootstrap_config = startup.merged_config.clone();
-    bootstrap_config.merge_from(&cli.as_layer());
-    let no_db = config::no_db_from_layer(&bootstrap_config).unwrap_or(false);
-
-    let mut target_ids = args.ids.clone();
-    if target_ids.is_empty() {
-        let last_touched = crate::util::get_last_touched_id(beads_dir);
-        if last_touched.is_empty() {
-            return Err(BeadsError::validation(
-                "ids",
-                "no issue IDs provided and no last-touched issue",
-            ));
-        }
-        target_ids.push(last_touched);
-    }
-
-    let owned_storage_ctx = if no_db || preloaded_storage.is_some() {
-        None
-    } else {
-        Some(config::open_storage_with_cli(beads_dir, cli)?)
-    };
-    let storage = preloaded_storage.or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage));
-
-    let config_layer = config::load_config(beads_dir, storage, cli)?;
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let use_color = config::should_use_color(&config_layer);
+    let (details_list, use_color) = load_issue_details_for_route(
+        args,
+        cli,
+        beads_dir,
+        preloaded_storage,
+        preloaded_storage_ctx,
+    )?;
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
@@ -88,23 +158,6 @@ fn execute_inner(
     );
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
-    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
-
-    let details_list = if no_db {
-        load_issue_details_from_jsonl(
-            &target_ids,
-            &resolver,
-            &startup.paths.jsonl_path,
-            &external_db_paths,
-        )?
-    } else {
-        load_issue_details_from_storage(
-            &target_ids,
-            &resolver,
-            storage.ok_or(BeadsError::NotInitialized)?,
-            &external_db_paths,
-        )?
-    };
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
@@ -132,6 +185,78 @@ fn execute_inner(
     }
 
     Ok(())
+}
+
+fn load_issue_details_for_route(
+    args: &ShowArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
+) -> Result<(Vec<IssueDetails>, bool)> {
+    let mut target_ids = args.ids.clone();
+    if target_ids.is_empty() {
+        let last_touched = crate::util::get_last_touched_id(beads_dir);
+        if last_touched.is_empty() {
+            return Err(BeadsError::validation(
+                "ids",
+                "no issue IDs provided and no last-touched issue",
+            ));
+        }
+        target_ids.push(last_touched);
+    }
+
+    if let Some(storage_ctx) = preloaded_storage_ctx {
+        let config_layer = storage_ctx.load_config(cli)?;
+        let use_color = config::should_use_color(&config_layer);
+        let id_config = config::id_config_from_layer(&config_layer);
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
+        let details_list = load_issue_details_from_storage(
+            &target_ids,
+            &resolver,
+            &storage_ctx.storage,
+            &external_db_paths,
+        )?;
+        return Ok((details_list, use_color));
+    }
+
+    let startup = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())?;
+    let mut bootstrap_config = startup.merged_config.clone();
+    bootstrap_config.merge_from(&cli.as_layer());
+    let no_db = config::no_db_from_layer(&bootstrap_config).unwrap_or(false);
+    let owned_storage_ctx = if no_db || preloaded_storage.is_some() {
+        None
+    } else {
+        Some(config::open_storage_with_cli(beads_dir, cli)?)
+    };
+    let storage = preloaded_storage.unwrap_or_else(|| {
+        &owned_storage_ctx
+            .as_ref()
+            .expect("show should have an open storage handle")
+            .storage
+    });
+    let config_layer = if let Some(storage_ctx) = owned_storage_ctx.as_ref() {
+        storage_ctx.load_config(cli)?
+    } else {
+        config::load_config(beads_dir, Some(storage), cli)?
+    };
+    let use_color = config::should_use_color(&config_layer);
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
+    let details_list = if no_db {
+        load_issue_details_from_jsonl(
+            &target_ids,
+            &resolver,
+            &startup.paths.jsonl_path,
+            &external_db_paths,
+        )?
+    } else {
+        load_issue_details_from_storage(&target_ids, &resolver, storage, &external_db_paths)?
+    };
+
+    Ok((details_list, use_color))
 }
 
 fn load_issue_details_from_storage(

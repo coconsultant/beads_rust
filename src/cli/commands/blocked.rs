@@ -11,6 +11,8 @@ use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput};
 use crate::model::{IssueType, Priority};
 use crate::output::{OutputContext, OutputMode};
+use crate::storage::SqliteStorage;
+use std::path::Path;
 use std::str::FromStr;
 
 /// Execute the blocked command.
@@ -31,11 +33,72 @@ pub fn execute(
     tracing::info!("Fetching blocked issues from cache");
 
     let beads_dir = discover_beads_dir_with_cli(overrides)?;
-    let storage_ctx = open_storage_with_cli(&beads_dir, overrides)?;
-    let config_layer = storage_ctx.load_config(overrides)?;
-    let storage = &storage_ctx.storage;
+    execute_inner(args, overrides, outer_ctx, &beads_dir, None, None)
+}
 
-    let external_db_paths = external_project_db_paths(&config_layer, &beads_dir);
+/// Execute blocked using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if querying blocked issues fails.
+pub fn execute_with_storage(
+    args: &BlockedArgs,
+    overrides: &CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+) -> Result<()> {
+    execute_inner(args, overrides, outer_ctx, beads_dir, Some(storage), None)
+}
+
+/// Execute blocked using the caller's preopened storage context.
+///
+/// # Errors
+///
+/// Returns an error if querying blocked issues fails.
+pub fn execute_with_storage_ctx(
+    args: &BlockedArgs,
+    overrides: &CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage_ctx: &crate::config::OpenStorageResult,
+) -> Result<()> {
+    execute_inner(
+        args,
+        overrides,
+        outer_ctx,
+        beads_dir,
+        None,
+        Some(storage_ctx),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_inner(
+    args: &BlockedArgs,
+    overrides: &CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&crate::config::OpenStorageResult>,
+) -> Result<()> {
+    let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
+        None
+    } else {
+        Some(open_storage_with_cli(beads_dir, overrides)?)
+    };
+    let storage = preloaded_storage
+        .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
+        .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
+        .expect("blocked should have an open storage handle");
+    let config_layer =
+        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
+            storage_ctx.load_config(overrides)?
+        } else {
+            crate::config::load_config(beads_dir, Some(storage), overrides)?
+        };
+
+    let external_db_paths = external_project_db_paths(&config_layer, beads_dir);
     let use_color = should_use_color(&config_layer);
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
@@ -66,7 +129,7 @@ pub fn execute(
 
     let external_statuses =
         storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
-    let external_blockers = storage.external_blockers(&external_statuses)?;
+    let mut external_blockers = storage.external_blockers(&external_statuses)?;
 
     if !external_blockers.is_empty() {
         let mut by_id: std::collections::HashMap<String, usize> = blocked_issues
@@ -75,27 +138,36 @@ pub fn execute(
             .map(|(idx, bi)| (bi.issue.id.clone(), idx))
             .collect();
 
-        for (issue_id, blockers) in external_blockers {
-            if let Some(idx) = by_id.get(&issue_id).copied() {
+        let mut external_ids_to_fetch = Vec::new();
+        for (issue_id, blockers) in &external_blockers {
+            if let Some(idx) = by_id.get(issue_id).copied() {
                 let entry = &mut blocked_issues[idx];
-                entry.blocked_by.extend(blockers);
+                entry.blocked_by.extend(blockers.clone());
                 entry.blocked_by.sort();
                 entry.blocked_by.dedup();
                 entry.blocked_by_count = entry.blocked_by.len();
-                continue;
+            } else {
+                external_ids_to_fetch.push(issue_id.clone());
             }
+        }
 
-            if let Ok(Some(issue)) = storage.get_issue(&issue_id) {
+        if !external_ids_to_fetch.is_empty()
+            && let Ok(fetched_issues) = storage.get_issues_by_ids(&external_ids_to_fetch)
+        {
+            for issue in fetched_issues {
                 if issue.status.is_terminal() {
                     continue;
                 }
-                let blocked_by_count = blockers.len();
-                blocked_issues.push(BlockedIssue {
-                    blocked_by_count,
-                    blocked_by: blockers,
-                    issue,
-                });
-                by_id.insert(issue_id, blocked_issues.len() - 1);
+                if let Some(blockers) = external_blockers.remove(&issue.id) {
+                    let blocked_by_count = blockers.len();
+                    let issue_id = issue.id.clone();
+                    blocked_issues.push(BlockedIssue {
+                        blocked_by_count,
+                        blocked_by: blockers,
+                        issue,
+                    });
+                    by_id.insert(issue_id, blocked_issues.len() - 1);
+                }
             }
         }
     }

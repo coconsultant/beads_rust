@@ -1057,7 +1057,7 @@ pub struct QuickArgs {
     pub estimate: Option<i32>,
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct UpdateArgs {
     /// Issue IDs to update

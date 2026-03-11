@@ -38,8 +38,23 @@ pub fn execute(
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
+    execute_inner(args, ctx, &storage_ctx.storage)
+}
 
+/// Execute the count command using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if filters are invalid or the database query fails.
+pub fn execute_with_storage(
+    args: &CountArgs,
+    ctx: &OutputContext,
+    storage: &SqliteStorage,
+) -> Result<()> {
+    execute_inner(args, ctx, storage)
+}
+
+fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage) -> Result<()> {
     let mut filters = ListFilters::default();
     let statuses = parse_statuses(&args.status)?;
     let types = parse_types(&args.types)?;

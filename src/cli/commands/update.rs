@@ -40,11 +40,52 @@ impl From<&Issue> for UpdatedIssueOutput {
 ///
 /// Returns an error if database operations fail or validation errors occur.
 pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
-    let _json = cli.json.unwrap_or(false);
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut target_inputs = args.ids.clone();
+    if target_inputs.is_empty() {
+        let last_touched = crate::util::get_last_touched_id(&beads_dir);
+        if last_touched.is_empty() {
+            return Err(BeadsError::validation(
+                "ids",
+                "no issue IDs provided and no last-touched issue",
+            ));
+        }
+        target_inputs.push(last_touched);
+    }
+
+    let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
+    let mut updated_issues = Vec::new();
+
+    if routed_batches.iter().any(|batch| batch.is_external) {
+        for batch in routed_batches {
+            let mut batch_args = args.clone();
+            batch_args.ids = batch.issue_inputs;
+
+            let mut batch_cli = cli.clone();
+            batch_cli.db = Some(batch.beads_dir.join("beads.db"));
+
+            updated_issues.extend(execute_single_route(&batch_args, &batch_cli, ctx)?);
+        }
+    } else {
+        updated_issues.extend(execute_single_route(args, cli, ctx)?);
+    }
+
+    if ctx.is_json() {
+        ctx.json_pretty(&updated_issues);
+    }
+
+    Ok(())
+}
+
+fn execute_single_route(
+    args: &UpdateArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<Vec<UpdatedIssueOutput>> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
-    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage_ctx.storage)?;
@@ -146,12 +187,8 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
-    if ctx.is_json() {
-        ctx.json_pretty(&updated_issues);
-    }
-
     storage_ctx.flush_no_db_if_dirty()?;
-    Ok(())
+    Ok(updated_issues)
 }
 
 /// Print a summary of what changed for the issue.

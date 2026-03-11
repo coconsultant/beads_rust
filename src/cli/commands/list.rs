@@ -33,6 +33,30 @@ pub fn execute(
     // Open storage (--db flag allows working from any directory)
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    execute_inner(args, cli, outer_ctx, &storage_ctx)
+}
+
+/// Execute list using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if the list query or rendering fails.
+pub fn execute_with_storage(
+    args: &ListArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    execute_inner(args, cli, outer_ctx, storage_ctx)
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_inner(
+    args: &ListArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
     let storage = &storage_ctx.storage;
 
     // Build filter from args

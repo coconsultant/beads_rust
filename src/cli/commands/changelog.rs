@@ -174,10 +174,13 @@ pub fn execute(
 }
 
 const fn resolve_render_mode(json: bool, output_mode: OutputMode) -> ChangelogRenderMode {
+    if json || matches!(output_mode, OutputMode::Json) {
+        return ChangelogRenderMode::Json;
+    }
+
     match output_mode {
-        OutputMode::Quiet => ChangelogRenderMode::Quiet,
-        _ if json => ChangelogRenderMode::Json,
         OutputMode::Json => ChangelogRenderMode::Json,
+        OutputMode::Quiet => ChangelogRenderMode::Quiet,
         OutputMode::Toon => ChangelogRenderMode::Toon,
         OutputMode::Rich => ChangelogRenderMode::Rich,
         OutputMode::Plain => ChangelogRenderMode::Plain,
@@ -369,6 +372,19 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
             "Cannot resolve git tag '{reference}' without a git repository for the targeted project"
         ))
     })?;
+    let tag_ref = format!("refs/tags/{reference}");
+
+    let verify = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &tag_ref])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| BeadsError::Config(format!("Failed to run git: {e}")))?;
+
+    if !verify.status.success() {
+        return Err(BeadsError::Config(format!(
+            "Failed to resolve git tag: {reference}"
+        )));
+    }
 
     // Annotated tags carry their own timestamp, which is what --since-tag promises.
     // Lightweight tags have no tagger date, so we fall back to the referenced commit.
@@ -376,7 +392,7 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
         .args([
             "for-each-ref",
             "--format=%(taggerdate:iso-strict)",
-            &format!("refs/tags/{reference}"),
+            &tag_ref,
         ])
         .current_dir(repo_root)
         .output()
@@ -391,7 +407,7 @@ fn git_tag_date(reference: &str, repo_root: Option<&Path>) -> Result<DateTime<Ut
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stamp = stdout.trim();
     if stamp.is_empty() {
-        return git_commit_date(reference, Some(repo_root));
+        return git_commit_date(&format!("{tag_ref}^{{commit}}"), Some(repo_root));
     }
 
     DateTime::parse_from_rfc3339(stamp)
@@ -611,6 +627,40 @@ mod tests {
 
         let dt = git_tag_date("v1", Some(&repo_root)).unwrap();
         assert_eq!(dt, Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_git_tag_date_errors_for_missing_tag_even_if_branch_exists() {
+        use std::fs;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_root = temp.path().join("missing-tag-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        init_git_repo(&repo_root);
+        commit_file(&repo_root, "initial", "2024-04-01T00:00:00Z");
+
+        let branch = Command::new("git")
+            .args(["checkout", "-b", "release"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(branch.status.success(), "git branch create failed");
+
+        let err = git_tag_date("release", Some(&repo_root)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to resolve git tag: release"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_render_mode_prefers_robot_json_over_quiet() {
+        assert_eq!(
+            resolve_render_mode(true, OutputMode::Quiet),
+            ChangelogRenderMode::Json
+        );
     }
 
     #[test]

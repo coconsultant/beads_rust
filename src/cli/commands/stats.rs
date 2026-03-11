@@ -32,10 +32,68 @@ pub fn execute(
     outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let jsonl_path = storage_ctx.paths.jsonl_path.clone();
-    let storage = &storage_ctx.storage;
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    execute_inner(args, cli, outer_ctx, &beads_dir, None, None)
+}
+
+/// Execute stats using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if queries fail.
+pub fn execute_with_storage(
+    args: &StatsArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+) -> Result<()> {
+    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage), None)
+}
+
+/// Execute stats using the caller's preopened storage context.
+///
+/// # Errors
+///
+/// Returns an error if queries fail.
+pub fn execute_with_storage_ctx(
+    args: &StatsArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    execute_inner(args, cli, outer_ctx, beads_dir, None, Some(storage_ctx))
+}
+
+fn execute_inner(
+    args: &StatsArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
+) -> Result<()> {
+    let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
+        None
+    } else {
+        Some(config::open_storage_with_cli(beads_dir, cli)?)
+    };
+    let storage = preloaded_storage
+        .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
+        .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
+        .expect("stats should have an open storage handle");
+    let jsonl_path = preloaded_storage_ctx
+        .or(owned_storage_ctx.as_ref())
+        .map_or_else(
+            || beads_dir.join("issues.jsonl"),
+            |ctx| ctx.paths.jsonl_path.clone(),
+        );
+    let config_layer =
+        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
+            storage_ctx.load_config(cli)?
+        } else {
+            config::load_config(beads_dir, Some(storage), cli)?
+        };
     let use_color = config::should_use_color(&config_layer);
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
@@ -59,7 +117,7 @@ pub fn execute(
     debug!(total = all_issues.len(), "Loaded all issues for stats");
 
     // Compute summary counts
-    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
     let external_blockers = if storage.has_external_dependencies(true)? {
         let external_statuses =
             storage.resolve_external_dependency_statuses(&external_db_paths, true)?;

@@ -118,10 +118,16 @@ impl AgentFileDetection {
         self.file_path.is_some()
     }
 
+    /// Returns true if the file exists but could not be read.
+    #[must_use]
+    pub const fn unreadable(&self) -> bool {
+        self.read_error.is_some()
+    }
+
     /// Returns true if the file exists but doesn't have our blurb.
     #[must_use]
     pub const fn needs_blurb(&self) -> bool {
-        self.found() && !self.has_blurb
+        self.found() && !self.unreadable() && !self.has_blurb
     }
 
     /// Returns true if the file has an older version that needs upgrade.
@@ -131,6 +137,19 @@ impl AgentFileDetection {
             return true;
         }
         self.has_blurb && self.blurb_version < BLURB_VERSION
+    }
+}
+
+#[must_use]
+const fn inferred_dry_run_action(detection: &AgentFileDetection) -> &'static str {
+    if !detection.found() {
+        "create"
+    } else if detection.needs_upgrade() {
+        "update"
+    } else if detection.needs_blurb() {
+        "add"
+    } else {
+        "none"
     }
 }
 
@@ -465,6 +484,22 @@ fn execute_dry_run_inferred(
         return Ok(());
     }
 
+    if let Some(err) = detection.read_error.as_deref() {
+        let file_path = detection.file_path.as_ref().unwrap();
+        let file_type = detection.file_type.as_deref().unwrap_or("agent file");
+        if is_rich {
+            render_unreadable_rich(file_path, file_type, err, "Dry Run", ctx);
+        } else {
+            println!(
+                "Dry-run: cannot determine action because {} at {} is unreadable: {}",
+                file_type,
+                file_path.display(),
+                err
+            );
+        }
+        return Ok(());
+    }
+
     if detection.needs_upgrade() {
         // Would update existing blurb
         let file_path = detection.file_path.as_ref().unwrap();
@@ -519,15 +554,7 @@ fn execute_json(
     ctx: &OutputContext,
 ) -> Result<()> {
     if args.dry_run {
-        let would_action = if !detection.found() {
-            "create"
-        } else if detection.needs_upgrade() {
-            "update"
-        } else if detection.needs_blurb() {
-            "add"
-        } else {
-            "none"
-        };
+        let would_action = inferred_dry_run_action(detection);
 
         let work_dir = std::env::current_dir().unwrap_or_default();
         let target_path = if detection.found() {
@@ -545,6 +572,7 @@ fn execute_json(
             "has_legacy_blurb": detection.has_legacy_blurb,
             "blurb_version": detection.blurb_version,
             "current_version": BLURB_VERSION,
+            "read_error": detection.read_error,
             "needs_blurb": detection.needs_blurb(),
             "needs_upgrade": detection.needs_upgrade(),
             "would_action": would_action,
@@ -561,6 +589,7 @@ fn execute_json(
         "has_legacy_blurb": detection.has_legacy_blurb,
         "blurb_version": detection.blurb_version,
         "current_version": BLURB_VERSION,
+        "read_error": detection.read_error,
         "needs_blurb": detection.needs_blurb(),
         "needs_upgrade": detection.needs_upgrade(),
     });
@@ -594,7 +623,10 @@ fn execute_check(
 
     println!("Found: {} at {}", file_type, file_path.display());
 
-    if detection.has_legacy_blurb {
+    if let Some(err) = detection.read_error.as_deref() {
+        println!("\nStatus: File is unreadable");
+        println!("Error: {err}");
+    } else if detection.has_legacy_blurb {
         println!("\nStatus: Contains legacy bv blurb (needs upgrade to br format)");
         println!("\nTo upgrade:");
         println!("  br agents --update");
@@ -929,7 +961,12 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
         content.append_styled(&file_path.display().to_string(), theme.accent.clone());
         content.append("\n\n");
 
-        if detection.has_legacy_blurb {
+        if let Some(err) = detection.read_error.as_deref() {
+            content.append_styled("\u{26A0} ", theme.warning.clone());
+            content.append("Agent instructions file is unreadable\n\n");
+            content.append_styled("Error:\n", theme.dimmed.clone());
+            content.append_styled(err, theme.warning.clone());
+        } else if detection.has_legacy_blurb {
             content.append_styled("\u{26A0} ", theme.warning.clone());
             content.append("Contains legacy bv blurb (needs upgrade to br format)\n\n");
             content.append_styled("To upgrade:\n", theme.dimmed.clone());
@@ -970,6 +1007,38 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
             "Agent Instructions",
             theme.panel_title.clone(),
         ))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+fn render_unreadable_rich(
+    file_path: &Path,
+    file_type: &str,
+    err: &str,
+    title: &str,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled(
+        "Cannot determine what would happen because the agent file is unreadable.\n\n",
+        theme.warning.clone(),
+    );
+    content.append_styled("File        ", theme.dimmed.clone());
+    content.append_styled(file_type, theme.emphasis.clone());
+    content.append("\n");
+    content.append_styled("Path        ", theme.dimmed.clone());
+    content.append_styled(&file_path.display().to_string(), theme.accent.clone());
+    content.append("\n");
+    content.append_styled("Error       ", theme.dimmed.clone());
+    content.append_styled(err, theme.warning.clone());
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
@@ -1209,6 +1278,32 @@ mod tests {
         assert_eq!(detection.file_type.as_deref(), Some("AGENTS.md"));
         assert_eq!(detection.read_error.as_deref(), Some("permission denied"));
         assert!(detection.content.is_none());
+    }
+
+    #[test]
+    fn test_unreadable_agent_file_does_not_need_blurb() {
+        let detection = AgentFileDetection {
+            file_path: Some(PathBuf::from("AGENTS.md")),
+            file_type: Some("AGENTS.md".to_string()),
+            read_error: Some("permission denied".to_string()),
+            ..Default::default()
+        };
+
+        assert!(detection.found());
+        assert!(detection.unreadable());
+        assert!(!detection.needs_blurb());
+    }
+
+    #[test]
+    fn test_inferred_dry_run_action_for_unreadable_agent_file_is_none() {
+        let detection = AgentFileDetection {
+            file_path: Some(PathBuf::from("AGENTS.md")),
+            file_type: Some("AGENTS.md".to_string()),
+            read_error: Some("permission denied".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(inferred_dry_run_action(&detection), "none");
     }
 
     #[test]

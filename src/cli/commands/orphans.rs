@@ -52,14 +52,48 @@ pub fn execute(
         return Ok(());
     };
 
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    execute_inner(args, cli, ctx, &beads_dir, None)
+}
+
+/// Execute orphans using the caller's preopened storage context.
+///
+/// # Errors
+///
+/// Returns an error for invalid explicit targets or storage failures.
+/// Returns an empty list when git metadata is unavailable in the current repository.
+pub fn execute_with_storage_ctx(
+    args: &OrphansArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    execute_inner(args, cli, ctx, beads_dir, Some(storage_ctx))
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_inner(
+    args: &OrphansArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
+) -> Result<()> {
+    let owned_storage_ctx = if preloaded_storage_ctx.is_some() {
+        None
+    } else {
+        Some(config::open_storage_with_cli(beads_dir, cli)?)
+    };
+    let storage_ctx = preloaded_storage_ctx
+        .or(owned_storage_ctx.as_ref())
+        .expect("orphans should have an open storage context");
     let storage = &storage_ctx.storage;
 
     // Get issue prefix from config
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
     let prefix = config::id_config_from_layer(&config_layer).prefix;
     let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
-        .or_else(|| git_repo_root_for_path(&beads_dir))
+        .or_else(|| git_repo_root_for_path(beads_dir))
     else {
         output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());

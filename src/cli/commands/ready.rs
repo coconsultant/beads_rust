@@ -31,7 +31,7 @@ pub fn execute(
     outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    execute_inner(args, cli, outer_ctx, &beads_dir, None)
+    execute_inner(args, cli, outer_ctx, &beads_dir, None, None)
 }
 
 /// Execute ready using storage that was already opened by the caller.
@@ -46,7 +46,22 @@ pub fn execute_with_storage(
     beads_dir: &Path,
     storage: &SqliteStorage,
 ) -> Result<()> {
-    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage))
+    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage), None)
+}
+
+/// Execute ready using the caller's preopened storage context.
+///
+/// # Errors
+///
+/// Returns an error if configuration loading or the ready query fails.
+pub fn execute_with_storage_ctx(
+    args: &ReadyArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage_ctx: &config::OpenStorageResult,
+) -> Result<()> {
+    execute_inner(args, cli, outer_ctx, beads_dir, None, Some(storage_ctx))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -56,20 +71,23 @@ fn execute_inner(
     outer_ctx: &OutputContext,
     beads_dir: &Path,
     preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    let owned_storage_ctx = if preloaded_storage.is_some() {
+    let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
         None
     } else {
         Some(config::open_storage_with_cli(beads_dir, cli)?)
     };
     let storage = preloaded_storage
+        .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
         .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
         .expect("ready should have an open storage handle");
-    let config_layer = if let Some(storage_ctx) = owned_storage_ctx.as_ref() {
-        storage_ctx.load_config(cli)?
-    } else {
-        config::load_config(beads_dir, Some(storage), cli)?
-    };
+    let config_layer =
+        if let Some(storage_ctx) = preloaded_storage_ctx.or(owned_storage_ctx.as_ref()) {
+            storage_ctx.load_config(cli)?
+        } else {
+            config::load_config(beads_dir, Some(storage), cli)?
+        };
 
     let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
     let use_color = config::should_use_color(&config_layer);
