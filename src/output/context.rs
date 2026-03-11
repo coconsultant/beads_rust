@@ -221,6 +221,16 @@ impl OutputContext {
         }
     }
 
+    pub fn print_line(&self, content: &str) {
+        match self.mode {
+            OutputMode::Rich => {
+                self.console().print(&format!("{content}\n"));
+            }
+            OutputMode::Plain => println!("{content}"),
+            OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {}
+        }
+    }
+
     pub fn render<R: Renderable>(&self, renderable: &R) {
         if self.is_rich() {
             self.console().print_renderable(renderable);
@@ -358,7 +368,7 @@ impl OutputContext {
         match self.mode {
             OutputMode::Rich => {
                 self.console()
-                    .print(&format!("[bold green]✓[/] {}", message));
+                    .print(&format!("[bold green]✓[/] {}\n", message));
             }
             OutputMode::Plain => println!("✓ {}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -381,7 +391,7 @@ impl OutputContext {
         match self.mode {
             OutputMode::Rich => {
                 self.console()
-                    .print(&format!("[bold yellow]⚠[/] [yellow]{}[/]", message));
+                    .print(&format!("[bold yellow]⚠[/] [yellow]{}[/]\n", message));
             }
             OutputMode::Plain => eprintln!("Warning: {}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -391,7 +401,7 @@ impl OutputContext {
     pub fn info(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console().print(&format!("[blue]ℹ[/] {}", message));
+                self.console().print(&format!("[blue]ℹ[/] {}\n", message));
             }
             OutputMode::Plain => println!("{}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -532,5 +542,35 @@ mod tests {
     fn json_value_returns_none_on_serialize_error() {
         let ctx = OutputContext::from_output_format(OutputFormat::Json, false, true);
         assert!(ctx.json_value(&FailingSerialize, "JSON").is_none());
+    }
+
+    fn rich_test_context() -> OutputContext {
+        OutputContext {
+            mode: OutputMode::Rich,
+            width: std::sync::OnceLock::new(),
+            console: std::sync::OnceLock::new(),
+            theme: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn rich_status_helpers_emit_trailing_newlines() {
+        let ctx = rich_test_context();
+        ctx.console().begin_capture();
+
+        ctx.success("created");
+        ctx.info("details");
+        ctx.warning("careful");
+
+        let rendered: String = ctx
+            .console()
+            .end_capture()
+            .into_iter()
+            .map(|segment| segment.text.into_owned())
+            .collect();
+
+        assert!(rendered.contains("created\n"));
+        assert!(rendered.contains("details\n"));
+        assert!(rendered.contains("careful\n"));
     }
 }
