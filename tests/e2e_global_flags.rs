@@ -571,7 +571,12 @@ fn e2e_no_auto_import_flag() {
     let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
     assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
 
-    // With --no-auto-import, should skip auto import check
+    // Modify JSONL directly to make it newer than the DB
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    fs::write(&jsonl_path, format!("{}\n", contents.trim())).expect("write jsonl");
+
+    // With --no-auto-import, should skip the startup import probe entirely
     let list = run_br(
         &workspace,
         ["--no-auto-import", "list"],

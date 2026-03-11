@@ -97,6 +97,40 @@ bug
 }
 
 #[test]
+fn test_markdown_import_implicit_description_keeps_first_non_empty_line_only() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_implicit_description");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Implicit Description Issue
+First line becomes description
+This line should be ignored
+
+### Type
+task
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_implicit_description_json",
+    );
+    assert!(output.status.success(), "create --file --json failed");
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0]["description"].as_str(),
+        Some("First line becomes description")
+    );
+}
+
+#[test]
 fn test_markdown_import_rejects_dry_run() {
     let workspace = BrWorkspace::new();
 
@@ -320,5 +354,64 @@ invalid-type:bd-123
             .stderr
             .contains("warning: skipping invalid dependency type"),
         "expected warning for invalid dependency type"
+    );
+}
+
+#[test]
+fn test_markdown_import_whitespace_separated_typed_dependencies() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_whitespace_typed_deps");
+    assert!(output.status.success(), "init failed");
+
+    let blocker = run_br(
+        &workspace,
+        ["create", "Whitespace dependency blocker", "--json"],
+        "create_whitespace_dep_blocker_json",
+    );
+    assert!(
+        blocker.status.success(),
+        "create blocker failed: {}",
+        blocker.stderr
+    );
+    let blocker_payload = extract_json_payload(&blocker.stdout);
+    let blocker_json: serde_json::Value =
+        serde_json::from_str(&blocker_payload).expect("blocker json");
+    let blocker_id = blocker_json["id"].as_str().expect("blocker id").to_string();
+
+    let md_path = workspace.root.join("issues.md");
+    let content =
+        format!("## Imported issue\n### Dependencies\nblocks: {blocker_id} external:github#123\n");
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_whitespace_typed_deps_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 1);
+
+    let dependencies = issues[0]["dependencies"]
+        .as_array()
+        .expect("dependencies array");
+    assert_eq!(dependencies.len(), 2);
+    assert!(
+        dependencies
+            .iter()
+            .any(|dep| dep["depends_on_id"].as_str() == Some(blocker_id.as_str()))
+    );
+    assert!(
+        dependencies
+            .iter()
+            .any(|dep| dep["depends_on_id"].as_str() == Some("external:github#123"))
     );
 }

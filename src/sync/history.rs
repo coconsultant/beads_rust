@@ -8,6 +8,7 @@
 use crate::error::{BeadsError, Result};
 use crate::sync::path::validate_sync_path_with_external;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -137,21 +138,17 @@ fn parse_backup_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
 
 pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<Utc>)> {
     let without_ext = filename.strip_suffix(".jsonl")?;
-    let (prefix, last_component) = without_ext.rsplit_once('.')?;
 
-    let (stem, timestamp_str) = if last_component.chars().all(|ch| ch.is_ascii_digit()) {
-        let (stem, timestamp_str) = prefix.rsplit_once('.')?;
-        (stem, timestamp_str)
-    } else {
-        (prefix, last_component)
-    };
+    // Pattern: <stem>.<timestamp>[.<collision_index>]
+    // Timestamp formats: YYYYMMDD_HHMMSS or YYYYMMDD_HHMMSS_ffffff
+    let re = Regex::new(r"^(?P<stem>.+?)\.(?P<ts>\d{8}_\d{6}(?:_\d{6})?)(\.\d+)?$").ok()?;
+    let caps = re.captures(without_ext)?;
 
-    if stem.is_empty() {
-        return None;
-    }
+    let stem = caps.name("stem")?.as_str().to_string();
+    let timestamp_str = caps.name("ts")?.as_str();
 
     let timestamp = parse_backup_timestamp(timestamp_str)?;
-    Some((stem.to_string(), timestamp))
+    Some((stem, timestamp))
 }
 
 fn create_backup_file(history_dir: &Path, file_stem: &str) -> Result<(PathBuf, File)> {
@@ -479,7 +476,7 @@ pub fn backup_before_export(
 ///
 /// Returns an error if listing or deleting backups fails.
 fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) -> Result<()> {
-    let backups: Vec<_> = list_backups(history_dir, None)?
+    let mut backups: Vec<_> = list_backups(history_dir, None)?
         .into_iter()
         .filter(|entry| entry.target_key == target_key)
         .collect();
@@ -487,6 +484,9 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) 
     if backups.is_empty() {
         return Ok(());
     }
+
+    // Sort newest first to ensure limit-based pruning targets the oldest entries
+    backups.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
 
     // Determine cutoff time
     let now = Utc::now();

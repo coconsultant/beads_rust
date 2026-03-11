@@ -1005,7 +1005,11 @@ fn execute_import(
     } else if ctx.is_rich() {
         render_import_result_rich(&result, ctx);
     } else {
+        let processed = import_result.imported_count
+            + import_result.skipped_count
+            + import_result.tombstone_skipped;
         println!("Imported from JSONL:");
+        println!("  Processed: {processed} issues");
         println!("  Created: {} issues", result.created);
         println!("  Updated: {} issues", result.updated);
         if result.skipped > 0 {
@@ -1222,9 +1226,18 @@ fn execute_merge(
 
     let _actor = cli.actor.as_deref().unwrap_or("br");
 
-    // Apply deletions
+    // Apply deletions. Base snapshots can lag behind historical ID migrations, so a
+    // merge may legitimately request deletion of an issue that is already absent from
+    // the live database. Treat that as a no-op instead of aborting the whole merge.
     for id in &report.deleted {
-        storage.delete_issue(id, "system", "merge deletion", Some(chrono::Utc::now()))?;
+        if storage.get_issue(id)?.is_some() {
+            storage.delete_issue(id, "system", "merge deletion", Some(chrono::Utc::now()))?;
+        } else {
+            tracing::debug!(
+                issue_id = %id,
+                "Skipping merge deletion for issue already absent from local database"
+            );
+        }
     }
 
     // Apply updates/creates (upsert)

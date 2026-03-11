@@ -35,7 +35,6 @@ impl ContentHashable for Issue {
 /// - tombstone fields (`deleted_at`, `deleted_by`, `delete_reason`)
 /// - `estimated_minutes`, `due_at`, `defer_until`
 /// - `close_reason`, `closed_by_session`
-/// - `deleted_at`, `deleted_by`, `delete_reason`
 #[must_use]
 pub fn content_hash(issue: &Issue) -> String {
     content_hash_from_parts(
@@ -110,6 +109,12 @@ impl HashFieldWriter {
     }
 
     fn field(&mut self, value: &str) {
+        if !value.contains('\0') {
+            self.hasher.update(value.as_bytes());
+            self.hasher.update(b"\x00");
+            return;
+        }
+
         let mut last_idx = 0;
         for (i, b) in value.bytes().enumerate() {
             if b == b'\0' {

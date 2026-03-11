@@ -184,7 +184,7 @@ pub fn parse_markdown_content(content: &str) -> Result<Vec<ParsedIssue>> {
         // Collect content for current section
         if current_issue.is_some() {
             if current_section == Section::BeforeH3 {
-                if !line.trim().is_empty() || captured_implicit_desc {
+                if !captured_implicit_desc && !line.trim().is_empty() {
                     section_lines.push(line.to_string());
                     captured_implicit_desc = true;
                 }
@@ -265,30 +265,50 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
 fn split_list_content(content: &str) -> Vec<String> {
     let mut result = Vec::new();
     for raw_line in content.lines() {
-        let is_list_item = raw_line.trim_start().starts_with("- ")
-            || raw_line.trim_start().starts_with("* ")
-            || raw_line.trim_start().starts_with("+ ");
-
         let line = strip_markdown_list_prefix(raw_line).trim();
         if line.is_empty() || is_marker_only_token(line) {
             continue;
         }
-        if line.contains(',') {            result.extend(
+        if line.contains(',') {
+            result.extend(
                 line.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty() && !is_marker_only_token(s)),
             );
-        } else if is_list_item || line.contains(':') {
-            result.push(line.to_string());
         } else {
-            result.extend(
-                line.split_whitespace()
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty() && !is_marker_only_token(s)),
-            );
+            result.extend(split_whitespace_items_preserving_colon_pairs(line));
         }
     }
     result
+}
+
+fn split_whitespace_items_preserving_colon_pairs(line: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut pending_colon_prefix: Option<String> = None;
+
+    for token in line
+        .split_whitespace()
+        .filter(|token| !token.is_empty() && !is_marker_only_token(token))
+    {
+        if let Some(mut prefix) = pending_colon_prefix.take() {
+            prefix.push(' ');
+            prefix.push_str(token);
+            items.push(prefix);
+            continue;
+        }
+
+        if token.ends_with(':') && token != ":" {
+            pending_colon_prefix = Some(token.to_string());
+        } else {
+            items.push(token.to_string());
+        }
+    }
+
+    if let Some(prefix) = pending_colon_prefix {
+        items.push(prefix);
+    }
+
+    items
 }
 
 fn strip_markdown_list_prefix(line: &str) -> &str {
@@ -472,6 +492,19 @@ blocks:bd-123, bd-456, related:bd-789
         assert_eq!(
             issues[0].dependencies,
             vec!["bd-123", "related:bd-456", "external:github#123"]
+        );
+    }
+
+    #[test]
+    fn test_dependencies_whitespace_separated_typed_tokens() {
+        let content = r"## Test Issue
+### Dependencies
+blocks: bd-123 related:bd-456 external:github#123
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(
+            issues[0].dependencies,
+            vec!["blocks: bd-123", "related:bd-456", "external:github#123"]
         );
     }
 

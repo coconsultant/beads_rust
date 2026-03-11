@@ -9,6 +9,18 @@ mod common;
 use common::cli::{BrWorkspace, run_br};
 use std::fs;
 
+fn create_issue_id(workspace: &BrWorkspace, title: &str, label: &str) -> String {
+    let create = run_br(workspace, ["--json", "create", title, "-t", "task"], label);
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let created_issue: serde_json::Value =
+        serde_json::from_str(&create.stdout).expect("parse create json");
+    created_issue["id"]
+        .as_str()
+        .expect("create json should include issue id")
+        .to_string()
+}
+
 #[test]
 fn repro_3way_merge_data_loss() {
     let workspace = BrWorkspace::new();
@@ -18,9 +30,7 @@ fn repro_3way_merge_data_loss() {
     assert!(init.status.success(), "init failed");
 
     // 2. Create an issue
-    let create = run_br(&workspace, ["create", "Test issue", "-t", "task"], "create");
-    assert!(create.status.success(), "create failed");
-    let issue_id = create.stdout.trim().to_string(); // Assuming output is just the ID or contains it
+    let issue_id = create_issue_id(&workspace, "Test issue", "create");
 
     // 3. Sync to JSONL (creates base snapshot)
     let sync1 = run_br(&workspace, ["sync", "--flush-only"], "sync1");
@@ -61,8 +71,9 @@ fn repro_3way_merge_data_loss() {
     // 7. Verify result
     let show = run_br(&workspace, ["show", &issue_id, "--json"], "show");
     assert!(show.status.success(), "show failed");
-    let final_issue: serde_json::Value =
-        serde_json::from_str(&show.stdout).expect("parse final issue");
+    let final_issue_list: serde_json::Value =
+        serde_json::from_str(&show.stdout).expect("parse final issue list");
+    let final_issue = &final_issue_list[0];
 
     let labels = final_issue["labels"]
         .as_array()
@@ -75,5 +86,52 @@ fn repro_3way_merge_data_loss() {
          Final labels: {:?}\n\
          Final description: {}",
         labels, final_issue["description"]
+    );
+}
+
+#[test]
+fn repro_merge_tolerates_base_only_deleted_issue_absent_from_db() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_id = create_issue_id(&workspace, "Current issue", "create");
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let issue_json = fs::read_to_string(&jsonl_path).expect("read issues jsonl");
+    let mut phantom_issue: serde_json::Value =
+        serde_json::from_str(issue_json.trim()).expect("parse current issue json");
+    phantom_issue["id"] = serde_json::Value::String("second-9u2".to_string());
+    phantom_issue["external_ref"] = serde_json::Value::Null;
+
+    let base_snapshot_path = workspace.root.join(".beads").join("beads.base.jsonl");
+    fs::write(
+        &base_snapshot_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&phantom_issue).expect("serialize phantom issue")
+        ),
+    )
+    .expect("write base snapshot");
+
+    let merge = run_br(&workspace, ["sync", "--merge"], "merge");
+    assert!(merge.status.success(), "merge failed: {}", merge.stderr);
+
+    let show = run_br(&workspace, ["show", &issue_id, "--json"], "show");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+
+    let final_issue_list: serde_json::Value =
+        serde_json::from_str(&show.stdout).expect("parse final issue list");
+    let final_issue = &final_issue_list[0];
+    assert_eq!(final_issue["id"].as_str(), Some(issue_id.as_str()));
+
+    let merged_jsonl = fs::read_to_string(&jsonl_path).expect("read merged jsonl");
+    assert!(
+        !merged_jsonl.contains("second-9u2"),
+        "phantom base-only issue should not survive merge"
     );
 }

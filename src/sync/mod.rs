@@ -256,7 +256,7 @@ impl ExportContext {
 }
 
 /// Result of a JSONL export operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExportResult {
     /// Number of issues exported.
     pub exported_count: usize,
@@ -272,20 +272,6 @@ pub struct ExportResult {
     pub output_path: Option<String>,
     /// Per-issue content hashes (`issue_id`, `content_hash`) for incremental export tracking.
     pub issue_hashes: Vec<(String, String)>,
-}
-
-impl Default for ExportResult {
-    fn default() -> Self {
-        Self {
-            exported_count: 0,
-            exported_ids: Vec::new(),
-            exported_marked_at: Vec::new(),
-            skipped_tombstone_ids: Vec::new(),
-            content_hash: String::new(),
-            output_path: None,
-            issue_hashes: Vec::new(),
-        }
-    }
 }
 
 /// Configuration for JSONL import.
@@ -1436,36 +1422,44 @@ pub fn export_to_jsonl_with_policy(
     };
 
     for issue in &mut issues {
-        if let Some(deps) = all_deps.as_ref().and_then(|map| map.get(&issue.id)) {
-            issue.dependencies = deps.clone();
-        } else if all_deps.is_some() && !issue.dependencies.is_empty() {
-            // Bulk query succeeded but had no entry for this issue — possible
-            // partial read failure. Preserve existing deps to avoid silent data loss.
-            tracing::warn!(
-                issue_id = %issue.id,
-                "issue missing from bulk dependency query; preserving existing dependencies"
-            );
+        // Dependencies
+        if let Some(ref map) = all_deps {
+            if let Some(deps) = map.get(&issue.id) {
+                issue.dependencies = deps.clone();
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore {
+            // Bulk failed, but we are in best-effort/partial mode — try individual query
+            if let Ok(deps) = storage.get_dependencies_full(&issue.id) {
+                issue.dependencies = deps;
+            }
         }
-        if let Some(labels) = all_labels.as_ref().and_then(|map| map.get(&issue.id)) {
-            issue.labels = labels.clone();
-        } else if all_labels.is_some() && !issue.labels.is_empty() {
-            tracing::warn!(
-                issue_id = %issue.id,
-                "issue missing from bulk label query; preserving existing labels"
-            );
+
+        // Labels
+        if let Some(ref map) = all_labels {
+            if let Some(labels) = map.get(&issue.id) {
+                issue.labels = labels.clone();
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore
+            && let Ok(labels) = storage.get_labels(&issue.id)
+        {
+            issue.labels = labels;
         }
+
         // Normalize labels for consistent round-trip hashing (matches import behavior)
         if !issue.labels.is_empty() {
             issue.labels.sort();
             issue.labels.dedup();
         }
-        if let Some(comments) = all_comments.as_ref().and_then(|map| map.get(&issue.id)) {
-            issue.comments = comments.clone();
-        } else if all_comments.is_some() && !issue.comments.is_empty() {
-            tracing::warn!(
-                issue_id = %issue.id,
-                "issue missing from bulk comment query; preserving existing comments"
-            );
+
+        // Comments
+        if let Some(ref map) = all_comments {
+            if let Some(comments) = map.get(&issue.id) {
+                issue.comments = comments.clone();
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore
+            && let Ok(comments) = storage.get_comments(&issue.id)
+        {
+            issue.comments = comments;
         }
     }
 
@@ -1513,10 +1507,11 @@ pub fn export_to_jsonl_with_policy(
 
     // Write JSONL and compute hash
     let mut hasher = Sha256::new();
-    let mut exported_ids = Vec::new();
-    let mut skipped_tombstone_ids = Vec::new();
-    let mut issue_hashes = Vec::new();
-    let mut buffer = Vec::new();
+    let issues_len = issues.len();
+    let mut exported_ids = Vec::with_capacity(issues_len);
+    let mut skipped_tombstone_ids = Vec::new(); // Usually small
+    let mut issue_hashes = Vec::with_capacity(issues_len);
+    let mut buffer = Vec::with_capacity(1024);
 
     for issue in &issues {
         // Skip expired tombstones
@@ -1537,7 +1532,10 @@ pub fn export_to_jsonl_with_policy(
             continue;
         }
 
-        if let Err(err) = writer.write_all(&buffer).and_then(|_| writer.write_all(b"\n")) {
+        if let Err(err) = writer
+            .write_all(&buffer)
+            .and_then(|()| writer.write_all(b"\n"))
+        {
             ctx.handle_error(ExportError::new(
                 ExportEntityType::Issue,
                 issue.id.clone(),
@@ -1691,43 +1689,52 @@ pub fn export_to_writer_with_policy<W: Write>(
     };
 
     for issue in &mut issues {
-        if let Some(deps) = all_deps.as_ref().and_then(|map| map.get(&issue.id)) {
-            issue.dependencies = deps.clone();
-        } else if all_deps.is_some() && !issue.dependencies.is_empty() {
-            // Bulk query succeeded but had no entry for this issue — possible
-            // partial read failure. Preserve existing deps to avoid silent data loss.
-            tracing::warn!(
-                issue_id = %issue.id,
-                "issue missing from bulk dependency query; preserving existing dependencies"
-            );
+        // Dependencies
+        if let Some(ref map) = all_deps {
+            if let Some(deps) = map.get(&issue.id) {
+                issue.dependencies = deps.clone();
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore {
+            // Bulk failed, but we are in best-effort/partial mode — try individual query
+            if let Ok(deps) = storage.get_dependencies_full(&issue.id) {
+                issue.dependencies = deps;
+            }
         }
-        if let Some(labels) = all_labels.as_ref().and_then(|map| map.get(&issue.id)) {
-            issue.labels = labels.clone();
-        } else if all_labels.is_some() && !issue.labels.is_empty() {
-            tracing::warn!(
-                issue_id = %issue.id,
-                "issue missing from bulk label query; preserving existing labels"
-            );
+
+        // Labels
+        if let Some(ref map) = all_labels {
+            if let Some(labels) = map.get(&issue.id) {
+                issue.labels = labels.clone();
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore
+            && let Ok(labels) = storage.get_labels(&issue.id)
+        {
+            issue.labels = labels;
         }
+
         // Normalize labels for consistent round-trip hashing (matches import behavior)
         if !issue.labels.is_empty() {
             issue.labels.sort();
             issue.labels.dedup();
         }
-        if let Some(comments) = all_comments.as_ref().and_then(|map| map.get(&issue.id)) {
-            issue.comments = comments.clone();
-        } else if all_comments.is_some() && !issue.comments.is_empty() {
-            tracing::warn!(
-                issue_id = %issue.id,
-                "issue missing from bulk comment query; preserving existing comments"
-            );
+
+        // Comments
+        if let Some(ref map) = all_comments {
+            if let Some(comments) = map.get(&issue.id) {
+                issue.comments = comments.clone();
+            }
+        } else if ctx.policy != ExportErrorPolicy::RequiredCore
+            && let Ok(comments) = storage.get_comments(&issue.id)
+        {
+            issue.comments = comments;
         }
     }
 
     let mut hasher = Sha256::new();
-    let mut exported_ids = Vec::new();
+    let issues_len = issues.len();
+    let mut exported_ids = Vec::with_capacity(issues_len);
     let skipped_tombstone_ids = Vec::new();
-    let mut issue_hashes = Vec::new();
+    let mut issue_hashes = Vec::with_capacity(issues_len);
 
     for issue in &issues {
         let json = match serde_json::to_string(issue) {
@@ -1877,6 +1884,8 @@ pub struct AutoImportResult {
 /// Auto-import JSONL if it is newer than the DB.
 ///
 /// Honors `--no-auto-import` and `--allow-stale` behavior.
+/// Both flags short-circuit before any staleness probe so startup can skip the
+/// JSONL stat/hash path entirely when the caller explicitly opted out.
 ///
 /// # Errors
 ///
@@ -1889,6 +1898,15 @@ pub fn auto_import_if_stale(
     allow_stale: bool,
     no_auto_import: bool,
 ) -> Result<AutoImportResult> {
+    if allow_stale || no_auto_import {
+        tracing::debug!(
+            allow_stale,
+            no_auto_import,
+            "Skipping auto-import staleness probe due to startup override"
+        );
+        return Ok(AutoImportResult::default());
+    }
+
     let staleness = compute_staleness(storage, jsonl_path)?;
     if !staleness.jsonl_newer {
         return Ok(AutoImportResult::default());
@@ -1909,23 +1927,6 @@ pub fn auto_import_if_stale(
                 staleness.dirty_count
             ),
         });
-    }
-
-    if allow_stale {
-        tracing::warn!(
-            jsonl_path = %jsonl_path.display(),
-            "JSONL is newer than DB; skipping auto-import due to --allow-stale"
-        );
-        return Ok(AutoImportResult::default());
-    }
-
-    if no_auto_import {
-        return Err(BeadsError::Config(
-            "JSONL is newer than the database (auto-import disabled).\n\
-             Hint: run `br sync --import-only` or rerun without --no-auto-import.\n\
-             To proceed without importing, use --allow-stale."
-                .to_string(),
-        ));
     }
 
     let allow_external_jsonl =
@@ -2170,8 +2171,9 @@ fn try_incremental_auto_flush(
         return Ok(Some(AutoFlushResult::default()));
     }
 
-    let mut removed_hash_ids = Vec::new();
-    let mut issue_hashes = Vec::new();
+    let dirty_len = dirty_metadata.len();
+    let mut removed_hash_ids = Vec::with_capacity(dirty_len);
+    let mut issue_hashes = Vec::with_capacity(dirty_len);
     let mut changed = false;
 
     for (issue_id, _) in &dirty_metadata {
@@ -2346,8 +2348,10 @@ pub fn auto_flush(
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let file = File::open(path)?;
+    let file_size = file.metadata().map_or(0, |m| m.len());
+    let estimated_count = (file_size / 500) as usize;
     let mut reader = BufReader::new(file);
-    let mut issues = Vec::new();
+    let mut issues = Vec::with_capacity(estimated_count);
     let mut line = String::new();
     let mut line_num = 0;
 
@@ -2642,9 +2646,12 @@ pub fn import_from_jsonl(
     // Step 2: Parse, Normalize, and Validate JSONL
     let spinner = create_spinner("Parsing and validating issues", config.show_progress);
     let file = File::open(input_path)?;
+    let file_size = file.metadata().map_or(0, |m| m.len());
+    // Estimate ~500 bytes per issue to pre-allocate vector capacity
+    let estimated_count = (file_size / 500) as usize;
     let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-    let mut issues = Vec::new();
-    let mut id_to_index = std::collections::HashMap::new();
+    let mut issues = Vec::with_capacity(estimated_count);
+    let mut id_to_index = std::collections::HashMap::with_capacity(estimated_count);
     let mut mismatches = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
@@ -2793,9 +2800,10 @@ pub fn import_from_jsonl(
 
     // Preload all metadata for O(1) collision detection (avoiding N+1 queries)
     let all_meta = storage.get_all_issues_metadata()?;
-    let mut meta_by_id = std::collections::HashMap::new();
-    let mut id_by_ext_ref = std::collections::HashMap::new();
-    let mut id_by_hash = std::collections::HashMap::new();
+    let meta_len = all_meta.len();
+    let mut meta_by_id = std::collections::HashMap::with_capacity(meta_len);
+    let mut id_by_ext_ref = std::collections::HashMap::with_capacity(meta_len);
+    let mut id_by_hash = std::collections::HashMap::with_capacity(meta_len);
 
     for m in all_meta {
         let issue_id = m.id.clone();
@@ -2817,13 +2825,14 @@ pub fn import_from_jsonl(
     // Phase 1: Scan and Resolve IDs
     let mut seen_external_refs: HashSet<String> = HashSet::new();
     let mut renames: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut import_ops = Vec::new();
-    let mut new_export_hashes = Vec::new();
+    let issues_len = issues.len();
+    let mut import_ops = Vec::with_capacity(issues_len);
+    let mut new_export_hashes = Vec::with_capacity(issues_len);
 
     let progress =
         create_progress_bar(issues.len() as u64, "Scanning issues", config.show_progress);
 
-    for issue in &issues {
+    for mut issue in issues {
         // Skip ephemerals during import (they shouldn't be in JSONL anyway)
         if issue.ephemeral {
             result.skipped_count += 1;
@@ -2831,14 +2840,12 @@ pub fn import_from_jsonl(
             continue;
         }
 
-        let mut effective_issue = issue.clone();
-
         // Handle external ref duplicates before collision detection
         if let Some(ref ext_ref) = issue.external_ref {
             if seen_external_refs.contains(ext_ref) {
                 if config.clear_duplicate_external_refs {
-                    effective_issue.external_ref = None;
-                    effective_issue.content_hash = Some(content_hash(&effective_issue));
+                    issue.external_ref = None;
+                    issue.content_hash = Some(content_hash(&issue));
                 } else {
                     progress.inc(1);
                     return Err(BeadsError::Config(format!(
@@ -2851,11 +2858,11 @@ pub fn import_from_jsonl(
         }
 
         // Compute content hash for collision detection
-        let computed_hash = content_hash(&effective_issue);
+        let computed_hash = content_hash(&issue);
 
         // Detect collision
         let collision = detect_collision(
-            &effective_issue,
+            &issue,
             &id_by_ext_ref,
             &id_by_hash,
             &meta_by_id,
@@ -2863,27 +2870,22 @@ pub fn import_from_jsonl(
         );
 
         // Determine action
-        let action = determine_action(
-            &collision,
-            &effective_issue,
-            &meta_by_id,
-            config.force_upsert,
-        )?;
+        let action = determine_action(&collision, &issue, &meta_by_id, config.force_upsert)?;
 
         // Determine target ID and record mapping
         let target_id = match &collision {
             CollisionResult::Match { existing_id, .. } => existing_id.clone(),
-            CollisionResult::NewIssue => effective_issue.id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
         };
 
-        if target_id != effective_issue.id {
-            renames.insert(effective_issue.id.clone(), target_id.clone());
+        if target_id != issue.id {
+            renames.insert(issue.id.clone(), target_id.clone());
         }
 
         // Collect hash for export_hashes table
         new_export_hashes.push((target_id, computed_hash));
 
-        import_ops.push((effective_issue, action));
+        import_ops.push((issue, action));
         progress.inc(1);
     }
     progress.finish_with_message("Scan complete");
@@ -3529,8 +3531,8 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
         serde_json::to_writer(&mut buffer, issue).map_err(|e| {
             BeadsError::Config(format!("Failed to serialize issue {}: {}", issue.id, e))
         })?;
-        writer.write_all(&buffer).map_err(|e| BeadsError::Io(e))?;
-        writer.write_all(b"\n").map_err(|e| BeadsError::Io(e))?;
+        writer.write_all(&buffer).map_err(BeadsError::Io)?;
+        writer.write_all(b"\n").map_err(BeadsError::Io)?;
     }
     writer.flush()?;
     writer
@@ -4121,6 +4123,44 @@ mod tests {
         };
         let result = export_to_jsonl(&storage, &output_path, &config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auto_import_if_stale_skips_probe_for_allow_stale() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(&jsonl_path, [0xFF_u8, b'\n']).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+
+        let result =
+            auto_import_if_stale(&mut storage, &beads_dir, &jsonl_path, None, true, false).unwrap();
+        assert!(!result.attempted);
+        assert_eq!(result.imported_count, 0);
+    }
+
+    #[test]
+    fn test_auto_import_if_stale_skips_probe_for_no_auto_import() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(&jsonl_path, [0xFF_u8, b'\n']).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+
+        let result =
+            auto_import_if_stale(&mut storage, &beads_dir, &jsonl_path, None, false, true).unwrap();
+        assert!(!result.attempted);
+        assert_eq!(result.imported_count, 0);
     }
 
     #[test]
