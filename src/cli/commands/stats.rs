@@ -511,7 +511,7 @@ fn print_text_output(output: &Statistics) {
     }
 
     // Match bd footer
-    println!("\nFor more details, use 'bd list' to see individual issues.");
+    println!("\nFor more details, use 'br list' to see individual issues.");
 }
 
 /// Render stats with rich formatting.

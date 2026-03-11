@@ -201,24 +201,28 @@ pub fn read_redirect(beads_dir: &Path) -> Result<Option<PathBuf>> {
 pub fn follow_redirects(start: &Path, max_depth: usize) -> Result<PathBuf> {
     let mut current = start.to_path_buf();
     let mut visited = vec![start.to_path_buf()];
+    let mut depth = 0usize;
 
-    for _ in 0..max_depth {
-        match read_redirect(&current)? {
-            Some(next) => {
-                // Check for loops
-                if visited.iter().any(|p| p == &next) {
-                    return Err(BeadsError::Config(format!(
-                        "Redirect loop detected: {} -> {}",
-                        current.display(),
-                        next.display()
-                    )));
-                }
-
-                visited.push(next.clone());
-                current = next;
-            }
-            None => break,
+    while let Some(next) = read_redirect(&current)? {
+        if depth >= max_depth {
+            return Err(BeadsError::Config(format!(
+                "Redirect chain exceeds max depth ({max_depth}): {}",
+                start.display()
+            )));
         }
+
+        // Check for loops
+        if visited.iter().any(|p| p == &next) {
+            return Err(BeadsError::Config(format!(
+                "Redirect loop detected: {} -> {}",
+                current.display(),
+                next.display()
+            )));
+        }
+
+        visited.push(next.clone());
+        current = next;
+        depth += 1;
     }
 
     // Verify the final directory exists and still points to a real .beads dir.
@@ -459,6 +463,27 @@ mod tests {
         let err = follow_redirects(&beads_dir, 10).unwrap_err();
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("must be a .beads directory")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_redirects_rejects_redirect_chains_beyond_max_depth() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("first").join(".beads");
+        let second = dir.path().join("second").join(".beads");
+        let third = dir.path().join("third").join(".beads");
+
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::create_dir_all(&third).unwrap();
+
+        fs::write(first.join("redirect"), "../../second/.beads").unwrap();
+        fs::write(second.join("redirect"), "../../third/.beads").unwrap();
+
+        let err = follow_redirects(&first, 1).unwrap_err();
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("max depth")),
             other => panic!("unexpected error: {other:?}"),
         }
     }

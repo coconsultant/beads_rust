@@ -472,7 +472,7 @@ br config edit
 
 | Variable | Description |
 |----------|-------------|
-| `BEADS_DB` | Override database path |
+| `BD_DB` / `BD_DATABASE` | Override database path |
 | `BEADS_JSONL` | Override JSONL path (requires `--allow-external-jsonl`) |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 
