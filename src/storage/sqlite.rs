@@ -1324,9 +1324,6 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
-        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
-        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
-        let apply_label_filters_in_rust = !labels_and.is_empty() || !labels_or.is_empty();
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -1339,6 +1336,27 @@ impl SqliteStorage {
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
+
+        if let Some(ref labels) = filters.labels {
+            for label in labels {
+                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
+
+        if let Some(ref labels_or) = filters.labels_or
+            && !labels_or.is_empty()
+        {
+            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(
+                sql,
+                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
+                placeholders.join(",")
+            );
+            for label in labels_or {
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -1443,8 +1461,7 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
-        if !apply_label_filters_in_rust
-            && let Some(limit) = filters.limit
+        if let Some(limit) = filters.limit
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
@@ -1454,10 +1471,6 @@ impl SqliteStorage {
         let mut issues = Vec::new();
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
-        }
-
-        if apply_label_filters_in_rust {
-            return self.filter_issues_by_labels(issues, labels_and, labels_or, filters.limit);
         }
 
         Ok(issues)
@@ -1511,10 +1524,6 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
-        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
-        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
-        let apply_label_filters_in_rust = !labels_and.is_empty() || !labels_or.is_empty();
-
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -1537,6 +1546,27 @@ impl SqliteStorage {
         params.push(SqliteValue::from(pattern.as_str()));
         params.push(SqliteValue::from(pattern.as_str()));
         params.push(SqliteValue::from(pattern));
+
+        if let Some(ref labels) = filters.labels {
+            for label in labels {
+                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
+
+        if let Some(ref labels_or) = filters.labels_or
+            && !labels_or.is_empty()
+        {
+            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(
+                sql,
+                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
+                placeholders.join(",")
+            );
+            for label in labels_or {
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
 
         if let Some(ref statuses) = filters.statuses
             && !statuses.is_empty()
@@ -1626,8 +1656,7 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
-        if !apply_label_filters_in_rust
-            && let Some(limit) = filters.limit
+        if let Some(limit) = filters.limit
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
@@ -1637,10 +1666,6 @@ impl SqliteStorage {
         let mut issues = Vec::new();
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
-        }
-
-        if apply_label_filters_in_rust {
-            return self.filter_issues_by_labels(issues, labels_and, labels_or, filters.limit);
         }
 
         Ok(issues)
@@ -1664,8 +1689,6 @@ impl SqliteStorage {
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
-        let apply_label_filters_in_rust =
-            !filters.labels_and.is_empty() || !filters.labels_or.is_empty();
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -1678,6 +1701,25 @@ impl SqliteStorage {
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
+
+        if !filters.labels_and.is_empty() {
+            for label in &filters.labels_and {
+                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
+
+        if !filters.labels_or.is_empty() {
+            let placeholders: Vec<String> = filters.labels_or.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(
+                sql,
+                " AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label IN ({}))",
+                placeholders.join(",")
+            );
+            for label in &filters.labels_or {
+                params.push(SqliteValue::from(label.as_str()));
+            }
+        }
 
         // Ready condition 1: status is `open` by default; optionally include
         // explicitly deferred issues when requested.
@@ -3846,6 +3888,23 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// Get the IDs and timestamps of dirty issues.
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_dirty_issue_metadata(&self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .conn
+            .query("SELECT issue_id, marked_at FROM dirty_issues ORDER BY marked_at")?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let id = r.get(0).and_then(SqliteValue::as_text).map(String::from)?;
+                let marked_at = r.get(1).and_then(SqliteValue::as_text).map(String::from)?;
+                Some((id, marked_at))
+            })
+            .collect())
+    }
+
     /// Get IDs of all dirty issues (issues modified since last export).
     ///
     /// # Errors
@@ -3861,14 +3920,41 @@ impl SqliteStorage {
             .collect())
     }
 
-    /// Clear dirty flags for the given issue IDs.
+    /// Clear dirty flags for the given issue IDs and timestamps.
     ///
-    /// Call this after successful export to the default JSONL path.
+    /// This is a safe version that only deletes if the timestamp matches,
+    /// preventing a race condition where a concurrent update during export
+    /// would otherwise have its dirty flag cleared incorrectly.
     ///
     /// # Errors
     ///
     /// Returns an error if the database update fails.
-    pub fn clear_dirty_issues(&mut self, issue_ids: &[String]) -> Result<usize> {
+    pub fn clear_dirty_issues(&mut self, metadata: &[(String, String)]) -> Result<usize> {
+        if metadata.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total_deleted = 0;
+        for (id, marked_at) in metadata {
+            let count = self.conn.execute_with_params(
+                "DELETE FROM dirty_issues WHERE issue_id = ? AND marked_at = ?",
+                &[
+                    SqliteValue::from(id.as_str()),
+                    SqliteValue::from(marked_at.as_str()),
+                ],
+            )?;
+            total_deleted += count;
+        }
+
+        Ok(total_deleted)
+    }
+
+    /// Clear dirty flags for the given issue IDs WITHOUT timestamp validation (Legacy).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database update fails.
+    pub fn clear_dirty_issues_legacy(&mut self, issue_ids: &[String]) -> Result<usize> {
         const SQLITE_VAR_LIMIT: usize = 900;
         if issue_ids.is_empty() {
             return Ok(0);

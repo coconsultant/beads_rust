@@ -262,6 +262,8 @@ pub struct ExportResult {
     pub exported_count: usize,
     /// IDs of exported issues.
     pub exported_ids: Vec<String>,
+    /// IDs and timestamps of dirty issues that were cleared.
+    pub exported_marked_at: Vec<(String, String)>,
     /// IDs skipped due to expired tombstone retention (still clear dirty flags).
     pub skipped_tombstone_ids: Vec<String>,
     /// SHA256 hash of the exported JSONL content.
@@ -270,6 +272,20 @@ pub struct ExportResult {
     pub output_path: Option<String>,
     /// Per-issue content hashes (`issue_id`, `content_hash`) for incremental export tracking.
     pub issue_hashes: Vec<(String, String)>,
+}
+
+impl Default for ExportResult {
+    fn default() -> Self {
+        Self {
+            exported_count: 0,
+            exported_ids: Vec::new(),
+            exported_marked_at: Vec::new(),
+            skipped_tombstone_ids: Vec::new(),
+            content_hash: String::new(),
+            output_path: None,
+            issue_hashes: Vec::new(),
+        }
+    }
 }
 
 /// Configuration for JSONL import.
@@ -1323,6 +1339,9 @@ pub fn export_to_jsonl_with_policy(
     // Get all issues for export (sorted by ID, excludes ephemerals/wisps)
     let mut issues = storage.get_all_issues_for_export()?;
 
+    // Fetch dirty metadata for safe clearing later
+    let exported_marked_at = storage.get_dirty_issue_metadata()?;
+
     // Safety checks
     if !config.force && output_path.exists() {
         let (jsonl_count, jsonl_ids) = analyze_jsonl(output_path)?;
@@ -1599,6 +1618,7 @@ pub fn export_to_jsonl_with_policy(
     let result = ExportResult {
         exported_count: exported_ids.len(),
         exported_ids,
+        exported_marked_at,
         skipped_tombstone_ids,
         content_hash,
         output_path: Some(output_path.to_string_lossy().to_string()),
@@ -1752,6 +1772,7 @@ pub fn export_to_writer_with_policy<W: Write>(
     let result = ExportResult {
         exported_count: exported_ids.len(),
         exported_ids,
+        exported_marked_at: Vec::new(),
         skipped_tombstone_ids,
         content_hash,
         output_path: None,
@@ -1955,13 +1976,9 @@ pub fn finalize_export(
 
     storage.execute_raw("BEGIN IMMEDIATE")?;
     match (|| -> Result<()> {
-        // Clear dirty flags for exported issues
-        let mut clear_ids = result.exported_ids.clone();
-        if !result.skipped_tombstone_ids.is_empty() {
-            clear_ids.extend(result.skipped_tombstone_ids.iter().cloned());
-        }
-        if !clear_ids.is_empty() {
-            storage.clear_dirty_issues(&clear_ids)?;
+        // Clear dirty flags for exported issues (safe version with timestamp validation)
+        if !result.exported_marked_at.is_empty() {
+            storage.clear_dirty_issues(&result.exported_marked_at)?;
         }
 
         // Record export hashes for each exported issue (for incremental export detection)
@@ -2002,7 +2019,7 @@ fn is_issue_exportable(issue: &Issue, retention_days: Option<u64>) -> bool {
 
 fn finalize_incremental_auto_flush(
     storage: &mut SqliteStorage,
-    clear_dirty_ids: &[String],
+    clear_dirty_metadata: &[(String, String)],
     removed_hash_ids: &[String],
     issue_hashes: &[(String, String)],
     content_hash: Option<&str>,
@@ -2011,8 +2028,8 @@ fn finalize_incremental_auto_flush(
 
     storage.execute_raw("BEGIN IMMEDIATE")?;
     match (|| -> Result<()> {
-        if !clear_dirty_ids.is_empty() {
-            storage.clear_dirty_issues(clear_dirty_ids)?;
+        if !clear_dirty_metadata.is_empty() {
+            storage.clear_dirty_issues(clear_dirty_metadata)?;
         }
         if !removed_hash_ids.is_empty() {
             storage.clear_export_hashes_in_tx(removed_hash_ids)?;
@@ -2149,8 +2166,8 @@ fn try_incremental_auto_flush(
     }
 
     let mut lines_by_id = read_jsonl_lines_by_id(jsonl_path)?;
-    let dirty_ids = storage.get_dirty_issue_ids()?;
-    if dirty_ids.is_empty() {
+    let dirty_metadata = storage.get_dirty_issue_metadata()?;
+    if dirty_metadata.is_empty() {
         return Ok(Some(AutoFlushResult::default()));
     }
 
@@ -2158,7 +2175,7 @@ fn try_incremental_auto_flush(
     let mut issue_hashes = Vec::new();
     let mut changed = false;
 
-    for issue_id in &dirty_ids {
+    for (issue_id, _) in &dirty_metadata {
         let maybe_issue = storage.get_issue_for_export(issue_id)?;
         match maybe_issue {
             Some(mut issue) if is_issue_exportable(&issue, None) => {
@@ -2193,7 +2210,7 @@ fn try_incremental_auto_flush(
     if !changed {
         finalize_incremental_auto_flush(
             storage,
-            &dirty_ids,
+            &dirty_metadata,
             &removed_hash_ids,
             &issue_hashes,
             None,
@@ -2210,7 +2227,7 @@ fn try_incremental_auto_flush(
     let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
     finalize_incremental_auto_flush(
         storage,
-        &dirty_ids,
+        &dirty_metadata,
         &removed_hash_ids,
         &issue_hashes,
         Some(&content_hash),
@@ -2330,18 +2347,29 @@ pub fn auto_flush(
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut issues = Vec::new();
+    let mut line = String::new();
+    let mut line_num = 0;
 
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line_num += 1;
             continue;
         }
-        let issue: Issue = serde_json::from_str(&line).map_err(|e| {
+
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|e| {
             BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
         })?;
         issues.push(issue);
+        line_num += 1;
     }
 
     Ok(issues)
