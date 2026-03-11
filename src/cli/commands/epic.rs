@@ -428,6 +428,7 @@ fn render_close_result_rich(closed_ids: &[String], ctx: &OutputContext) {
 mod tests {
     use super::*;
     use crate::model::{Issue, Priority};
+    use crate::storage::IssueUpdate;
     use chrono::TimeZone;
 
     fn base_issue(id: &str, title: &str, issue_type: IssueType, status: Status) -> Issue {
