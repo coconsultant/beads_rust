@@ -2176,8 +2176,15 @@ fn try_incremental_auto_flush(
     let mut issue_hashes = Vec::with_capacity(dirty_len);
     let mut changed = false;
 
+    let dirty_ids: Vec<String> = dirty_metadata.iter().map(|(id, _)| id.clone()).collect();
+    let batch_issues = storage.get_issues_for_export(&dirty_ids)?;
+    let mut issues_by_id: std::collections::HashMap<String, crate::model::Issue> = batch_issues
+        .into_iter()
+        .map(|i| (i.id.clone(), i))
+        .collect();
+
     for (issue_id, _) in &dirty_metadata {
-        let maybe_issue = storage.get_issue_for_export(issue_id)?;
+        let maybe_issue = issues_by_id.remove(issue_id);
         match maybe_issue {
             Some(mut issue) if is_issue_exportable(&issue, None) => {
                 normalize_issue_for_export(&mut issue);
