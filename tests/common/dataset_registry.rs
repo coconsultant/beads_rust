@@ -1222,10 +1222,11 @@ mod tests {
         let isolated =
             IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("should copy beads_rust");
 
-        // beads_rust should have a git repo, so source_commit should be set
-        assert!(
-            isolated.metadata.source_commit.is_some(),
-            "source_commit should be captured for git repos"
+        let expected_commit = get_git_commit(&KnownDataset::BeadsRust.source_path());
+
+        assert_eq!(
+            isolated.metadata.source_commit, expected_commit,
+            "source_commit should match git availability for the source dataset"
         );
     }
 
