@@ -271,21 +271,22 @@ pub fn is_valid_id_format(id: &str) -> bool {
         return false;
     }
 
-    // Allow longer hashes for hierarchical IDs (e.g., "0v1.1.1.1")
-    if hash.is_empty() || hash.len() > MAX_ID_HASH_LEN {
-        return false;
-    }
-
     // Allow dots for hierarchical/child IDs (e.g., "bd-abc.1", "bd-abc.1.2")
     // Format: base_hash[.child_num]* where child_num is numeric
     let mut segments = hash.split('.');
     let Some(base_hash) = segments.next() else {
         return false;
     };
-    if base_hash.is_empty()
-        || !base_hash
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+
+    // Allow longer total hashes for hierarchical IDs (e.g., "0v1.1.1.1")
+    // but enforce the length limit on the base hash.
+    if base_hash.is_empty() || base_hash.len() > MAX_ID_HASH_LEN {
+        return false;
+    }
+
+    if !base_hash
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
         return false;
     }
