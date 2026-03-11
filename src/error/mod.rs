@@ -167,6 +167,25 @@ pub enum BeadsError {
     Other(#[from] anyhow::Error),
 }
 
+impl BeadsError {
+    /// Returns true if the error is transient and can be retried.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Database(e) => e.is_transient(),
+            Self::Io(e) => {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                )
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A single field validation error.
 #[derive(Debug, Clone)]
 pub struct ValidationError {

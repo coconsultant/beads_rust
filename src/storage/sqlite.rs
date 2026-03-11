@@ -467,6 +467,11 @@ impl SqliteStorage {
 
                     if let Err(err) = side_effects {
                         let _ = self.conn.execute("ROLLBACK");
+                        if attempt < MAX_RETRIES - 1 && err.is_transient() {
+                            let backoff = base_backoff_ms * 2u64.pow(attempt);
+                            std::thread::sleep(Duration::from_millis(backoff));
+                            continue;
+                        }
                         return Err(err);
                     }
 
@@ -486,11 +491,16 @@ impl SqliteStorage {
                             if attempt < MAX_RETRIES - 1 && e.is_transient() {
                                 let backoff = base_backoff_ms * 2u64.pow(attempt);
                                 std::thread::sleep(Duration::from_millis(backoff));
-                                continue;
                             }
                             return Err(e.into());
                         }
                     }
+                }
+                Err(e) if attempt < MAX_RETRIES - 1 && e.is_transient() => {
+                    let _ = self.conn.execute("ROLLBACK");
+                    let backoff = base_backoff_ms * 2u64.pow(attempt);
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    continue;
                 }
                 Err(e) => {
                     let _ = self.conn.execute("ROLLBACK");
@@ -628,6 +638,12 @@ impl SqliteStorage {
             // Insert Dependencies
             let mut seen_deps = HashSet::new();
             for dep in &issue.dependencies {
+                if dep.depends_on_id == issue.id {
+                    return Err(BeadsError::SelfDependency {
+                        id: issue.id.clone(),
+                    });
+                }
+
                 if !seen_deps.insert(dep.depends_on_id.as_str()) {
                     continue;
                 }
@@ -1310,6 +1326,9 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
+        let apply_label_filters_in_rust = !labels_and.is_empty() || !labels_or.is_empty();
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -1359,7 +1378,7 @@ impl SqliteStorage {
         }
 
         if filters.unassigned {
-            sql.push_str(" AND assignee IS NULL");
+            sql.push_str(" AND (assignee IS NULL OR assignee = '')");
         }
 
         if !filters.include_closed {
@@ -1372,27 +1391,6 @@ impl SqliteStorage {
 
         if !filters.include_templates {
             sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
-        }
-
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND id IN (SELECT issue_id FROM labels WHERE label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
-
-        if let Some(ref labels_or) = filters.labels_or
-            && !labels_or.is_empty()
-        {
-            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
-                placeholders.join(",")
-            );
-            for l in labels_or {
-                params.push(SqliteValue::from(l.as_str()));
-            }
         }
 
         if let Some(ref title_contains) = filters.title_contains {
@@ -1447,7 +1445,8 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
-        if let Some(limit) = filters.limit
+        if !apply_label_filters_in_rust
+            && let Some(limit) = filters.limit
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
@@ -1457,6 +1456,46 @@ impl SqliteStorage {
         let mut issues = Vec::new();
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
+        }
+
+        if apply_label_filters_in_rust {
+            return self.filter_issues_by_labels(issues, labels_and, labels_or, filters.limit);
+        }
+
+        Ok(issues)
+    }
+
+    fn filter_issues_by_labels(
+        &self,
+        mut issues: Vec<Issue>,
+        labels_and: &[String],
+        labels_or: &[String],
+        limit: Option<usize>,
+    ) -> Result<Vec<Issue>> {
+        if issues.is_empty() {
+            return Ok(issues);
+        }
+
+        let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+        let labels_map = self.get_labels_for_issues(&issue_ids)?;
+
+        issues.retain(|issue| {
+            let issue_labels = labels_map
+                .get(&issue.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+
+            let matches_and = labels_and.iter().all(|label| issue_labels.contains(label));
+            let matches_or =
+                labels_or.is_empty() || labels_or.iter().any(|label| issue_labels.contains(label));
+
+            matches_and && matches_or
+        });
+
+        if let Some(limit) = limit
+            && limit > 0
+        {
+            issues.truncate(limit);
         }
 
         Ok(issues)
@@ -1473,6 +1512,10 @@ impl SqliteStorage {
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
+
+        let labels_and = filters.labels.as_deref().unwrap_or(&[]);
+        let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
+        let apply_label_filters_in_rust = !labels_and.is_empty() || !labels_or.is_empty();
 
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
@@ -1533,7 +1576,7 @@ impl SqliteStorage {
         }
 
         if filters.unassigned {
-            sql.push_str(" AND assignee IS NULL");
+            sql.push_str(" AND (assignee IS NULL OR assignee = '')");
         }
 
         if !filters.include_closed {
@@ -1546,27 +1589,6 @@ impl SqliteStorage {
 
         if !filters.include_templates {
             sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
-        }
-
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND id IN (SELECT issue_id FROM labels WHERE label = ?)");
-                params.push(SqliteValue::from(label.as_str()));
-            }
-        }
-
-        if let Some(ref labels_or) = filters.labels_or
-            && !labels_or.is_empty()
-        {
-            let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
-                placeholders.join(",")
-            );
-            for l in labels_or {
-                params.push(SqliteValue::from(l.as_str()));
-            }
         }
 
         if let Some(ref title_contains) = filters.title_contains {
@@ -1606,7 +1628,8 @@ impl SqliteStorage {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
 
-        if let Some(limit) = filters.limit
+        if !apply_label_filters_in_rust
+            && let Some(limit) = filters.limit
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
@@ -1616,6 +1639,10 @@ impl SqliteStorage {
         let mut issues = Vec::new();
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
+        }
+
+        if apply_label_filters_in_rust {
+            return self.filter_issues_by_labels(issues, labels_and, labels_or, filters.limit);
         }
 
         Ok(issues)
@@ -1639,6 +1666,8 @@ impl SqliteStorage {
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
+        let apply_label_filters_in_rust =
+            !filters.labels_and.is_empty() || !filters.labels_or.is_empty();
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -1708,29 +1737,7 @@ impl SqliteStorage {
 
         // Filter for unassigned
         if filters.unassigned {
-            sql.push_str(" AND assignee IS NULL");
-        }
-
-        // Filter by labels (AND logic) — use IN subquery instead of
-        // correlated EXISTS so fsqlite's eager EXISTS rewriter doesn't
-        // strip the bind parameters.
-        for label in &filters.labels_and {
-            sql.push_str(" AND id IN (SELECT issue_id FROM labels WHERE label = ?)");
-            params.push(SqliteValue::from(label.as_str()));
-        }
-
-        // Filter by labels (OR logic)
-        if !filters.labels_or.is_empty() {
-            let placeholders: Vec<String> =
-                filters.labels_or.iter().map(|_| "?".to_string()).collect();
-            let _ = write!(
-                sql,
-                " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
-                placeholders.join(",")
-            );
-            for l in &filters.labels_or {
-                params.push(SqliteValue::from(l.as_str()));
-            }
+            sql.push_str(" AND (assignee IS NULL OR assignee = '')");
         }
 
         // Filter by parent (--parent flag)
@@ -1779,7 +1786,8 @@ impl SqliteStorage {
         }
 
         // Apply limit in SQL to avoid fetching extra rows.
-        if let Some(limit) = filters.limit
+        if !apply_label_filters_in_rust
+            && let Some(limit) = filters.limit
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
@@ -1789,6 +1797,15 @@ impl SqliteStorage {
         let mut issues = Vec::new();
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
+        }
+
+        if apply_label_filters_in_rust {
+            return self.filter_issues_by_labels(
+                issues,
+                &filters.labels_and,
+                &filters.labels_or,
+                filters.limit,
+            );
         }
 
         Ok(issues)
@@ -2005,14 +2022,29 @@ impl SqliteStorage {
             std::collections::HashMap::new();
         {
             let rows = conn.query(
-                r"SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
-                  FROM dependencies d
-                  LEFT JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')
-                    AND (
-                      i.status NOT IN ('closed', 'tombstone')
-                      OR (i.id IS NULL AND d.depends_on_id NOT LIKE 'external:%')
-                    )",
+                r"
+                -- Case 1: Standard dependencies (blocks, waits-for, etc.)
+                -- Where d.issue_id is the blocked issue and d.depends_on_id is the blocker.
+                SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
+                FROM dependencies d
+                LEFT JOIN issues i ON d.depends_on_id = i.id
+                WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                  AND (
+                    i.status NOT IN ('closed', 'tombstone')
+                    OR (i.id IS NULL AND d.depends_on_id NOT LIKE 'external:%')
+                  )
+                UNION
+                -- Case 2: Parent-Child dependencies (Epics are blocked by their children)
+                -- Where d.depends_on_id is the parent (Epic) and d.issue_id is the child.
+                SELECT DISTINCT d.depends_on_id, d.issue_id || ':' || COALESCE(i.status, 'unknown')
+                FROM dependencies d
+                LEFT JOIN issues i ON d.issue_id = i.id
+                WHERE d.type = 'parent-child'
+                  AND (
+                    i.status NOT IN ('closed', 'tombstone')
+                    OR (i.id IS NULL AND d.issue_id NOT LIKE 'external:%')
+                  )
+                ",
             )?;
 
             for row in &rows {
@@ -2321,18 +2353,34 @@ impl SqliteStorage {
         Ok(!rows.is_empty())
     }
 
+    fn issue_status_in_tx(conn: &Connection, id: &str) -> Result<Option<Status>> {
+        let rows = conn.query_with_params(
+            "SELECT status FROM issues WHERE id = ?",
+            &[SqliteValue::from(id)],
+        )?;
+        if let Some(row) = rows.first() {
+            let status_str = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
+            Ok(Some(status_str.parse()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn ensure_dependency_target_exists_in_tx(conn: &Connection, depends_on_id: &str) -> Result<()> {
         if depends_on_id.starts_with("external:") {
             return Ok(());
         }
 
-        if Self::issue_exists_in_tx(conn, depends_on_id)? {
-            return Ok(());
+        match Self::issue_status_in_tx(conn, depends_on_id)? {
+            Some(Status::Tombstone) => Err(BeadsError::Validation {
+                field: "depends_on_id".to_string(),
+                reason: format!("cannot depend on tombstone issue: {depends_on_id}"),
+            }),
+            Some(_) => Ok(()),
+            None => Err(BeadsError::IssueNotFound {
+                id: depends_on_id.to_string(),
+            }),
         }
-
-        Err(BeadsError::IssueNotFound {
-            id: depends_on_id.to_string(),
-        })
     }
 
     /// Find issue IDs that end with the given hash substring.
@@ -2418,6 +2466,12 @@ impl SqliteStorage {
         dep_type: &str,
         actor: &str,
     ) -> Result<bool> {
+        if issue_id == depends_on_id {
+            return Err(BeadsError::SelfDependency {
+                id: issue_id.to_string(),
+            });
+        }
+
         self.mutate("add_dependency", actor, |conn, ctx| {
             if !Self::issue_exists_in_tx(conn, issue_id)? {
                 return Err(BeadsError::IssueNotFound {
@@ -2618,6 +2672,72 @@ impl SqliteStorage {
             }
 
             Ok(rows > 0)
+        })
+    }
+
+    /// Set parent for an issue (replace existing).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database update fails or cycle detected.
+    pub fn set_parent(&mut self, issue_id: &str, parent_id: Option<&str>, actor: &str) -> Result<()> {
+        self.mutate("set_parent", actor, |conn, ctx| {
+            // Remove existing parent
+            conn.execute_with_params(
+                "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
+                &[SqliteValue::from(issue_id)],
+            )?;
+
+            if let Some(pid) = parent_id {
+                if pid == issue_id {
+                    return Err(BeadsError::SelfDependency {
+                        id: issue_id.to_string(),
+                    });
+                }
+
+                Self::ensure_dependency_target_exists_in_tx(conn, pid)?;
+
+                if Self::check_cycle(conn, issue_id, pid, true)? {
+                    return Err(BeadsError::DependencyCycle {
+                        path: format!("Setting parent of {issue_id} to {pid} would create a cycle"),
+                    });
+                }
+
+                conn.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                     VALUES (?, ?, 'parent-child', ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id),
+                        SqliteValue::from(pid),
+                        SqliteValue::from(Utc::now().to_rfc3339()),
+                        SqliteValue::from(actor),
+                    ],
+                )?;
+
+                ctx.record_event(
+                    EventType::DependencyAdded,
+                    issue_id,
+                    Some(format!("Set parent to {pid}")),
+                );
+            } else {
+                ctx.record_event(
+                    EventType::DependencyRemoved,
+                    issue_id,
+                    Some("Removed parent".to_string()),
+                );
+            }
+
+            conn.execute_with_params(
+                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(Utc::now().to_rfc3339()),
+                    SqliteValue::from(issue_id),
+                ],
+            )?;
+
+            ctx.mark_dirty(issue_id);
+            ctx.invalidate_cache();
+            Ok(())
         })
     }
 
@@ -7647,6 +7767,65 @@ mod tests {
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "bd-l1");
+    }
+
+    #[test]
+    fn test_list_issues_filter_by_multiple_labels_uses_and_logic() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        let issue1 = make_issue("bd-l3", "Core only", Status::Open, 2, None, t1, None);
+        let issue2 = make_issue(
+            "bd-l4",
+            "Core and frontend",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue1, "tester").unwrap();
+        storage.create_issue(&issue2, "tester").unwrap();
+
+        storage.add_label("bd-l3", "core", "tester").unwrap();
+        storage.add_label("bd-l4", "core", "tester").unwrap();
+        storage.add_label("bd-l4", "frontend", "tester").unwrap();
+
+        let filters = ListFilters {
+            labels: Some(vec!["core".to_string(), "frontend".to_string()]),
+            ..Default::default()
+        };
+
+        let issues = storage.list_issues(&filters).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "bd-l4");
+    }
+
+    #[test]
+    fn test_list_issues_combined_type_and_label_filters() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        let task_issue = make_issue("bd-l5", "Core task", Status::Open, 1, None, t1, None);
+        let mut feature_issue =
+            make_issue("bd-l6", "Core feature", Status::Open, 1, None, t1, None);
+        feature_issue.issue_type = IssueType::Feature;
+
+        storage.create_issue(&task_issue, "tester").unwrap();
+        storage.create_issue(&feature_issue, "tester").unwrap();
+
+        storage.add_label("bd-l5", "core", "tester").unwrap();
+        storage.add_label("bd-l6", "core", "tester").unwrap();
+
+        let filters = ListFilters {
+            types: Some(vec![IssueType::Task]),
+            labels: Some(vec!["core".to_string()]),
+            ..Default::default()
+        };
+
+        let issues = storage.list_issues(&filters).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "bd-l5");
     }
 
     #[test]
