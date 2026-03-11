@@ -1476,42 +1476,6 @@ impl SqliteStorage {
         Ok(issues)
     }
 
-    fn filter_issues_by_labels(
-        &self,
-        mut issues: Vec<Issue>,
-        labels_and: &[String],
-        labels_or: &[String],
-        limit: Option<usize>,
-    ) -> Result<Vec<Issue>> {
-        if issues.is_empty() {
-            return Ok(issues);
-        }
-
-        let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
-        let labels_map = self.get_labels_for_issues(&issue_ids)?;
-
-        issues.retain(|issue| {
-            let issue_labels = labels_map
-                .get(&issue.id)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-
-            let matches_and = labels_and.iter().all(|label| issue_labels.contains(label));
-            let matches_or =
-                labels_or.is_empty() || labels_or.iter().any(|label| issue_labels.contains(label));
-
-            matches_and && matches_or
-        });
-
-        if let Some(limit) = limit
-            && limit > 0
-        {
-            issues.truncate(limit);
-        }
-
-        Ok(issues)
-    }
-
     /// Search issues by query with optional filters.
     ///
     /// # Errors
@@ -1827,8 +1791,7 @@ impl SqliteStorage {
         }
 
         // Apply limit in SQL to avoid fetching extra rows.
-        if !apply_label_filters_in_rust
-            && let Some(limit) = filters.limit
+        if let Some(limit) = filters.limit
             && limit > 0
         {
             let _ = write!(sql, " LIMIT {limit}");
@@ -1838,15 +1801,6 @@ impl SqliteStorage {
         let mut issues = Vec::new();
         for row in &rows {
             issues.push(Self::issue_from_row(row)?);
-        }
-
-        if apply_label_filters_in_rust {
-            return self.filter_issues_by_labels(
-                issues,
-                &filters.labels_and,
-                &filters.labels_or,
-                filters.limit,
-            );
         }
 
         Ok(issues)
