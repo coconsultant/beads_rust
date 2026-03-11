@@ -11,6 +11,8 @@ use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use crate::util::time::parse_flexible_timestamp;
 use rich_rust::prelude::*;
 use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 
 /// Result of deferring a single issue (for text output).
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +37,8 @@ struct DeferResult {
     pub deferred: Vec<DeferredIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedIssue>,
+    #[serde(skip)]
+    ordered_outcomes: Vec<DeferredOutcome>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +46,14 @@ struct UndeferResult {
     pub undeferred: Vec<DeferredIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedIssue>,
+    #[serde(skip)]
+    ordered_outcomes: Vec<DeferredOutcome>,
+}
+
+#[derive(Debug, Clone)]
+enum DeferredOutcome {
+    Changed(DeferredIssue),
+    Skipped(SkippedIssue),
 }
 
 fn restored_status_after_undefer(issue: &Issue) -> Status {
@@ -73,106 +85,47 @@ pub fn execute_defer(
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, &beads_dir)?;
+    let mut deferred_issues = Vec::new();
+    let mut skipped_issues = Vec::new();
 
-    let config_layer = storage_ctx.load_config(cli)?;
-    let actor = config::resolve_actor(&config_layer);
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
+    if routed_batches.iter().any(|batch| batch.is_external) {
+        let normalized_local_beads_dir =
+            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let mut routed_outcomes = Vec::new();
 
-    // Parse defer_until if provided
-    let defer_until = args
-        .until
-        .as_ref()
-        .map(|s| parse_flexible_timestamp(s, "defer_until"))
-        .transpose()?;
+        for batch in routed_batches {
+            let mut batch_args = args.clone();
+            batch_args.ids.clone_from(&batch.issue_inputs);
 
-    // Resolve all IDs
-    let resolved_ids = resolver.resolve_all(
-        &args.ids,
-        |id| all_ids.iter().any(|existing| existing == id),
-        |hash| find_matching_ids(&all_ids, hash),
-    )?;
+            let normalized_batch_beads_dir =
+                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
+            let mut batch_cli = cli.clone();
+            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                cli.db.clone()
+            } else {
+                None
+            };
 
-    let mut deferred_issues: Vec<DeferredIssue> = Vec::new();
-    let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
-    let mut cache_dirty = false;
-
-    for resolved in &resolved_ids {
-        let id = &resolved.id;
-        tracing::info!(id = %id, until = ?defer_until, "Deferring issue");
-
-        // Get current issue
-        let Some(issue) =
-            preserve_blocked_cache_on_error(storage, cache_dirty, "defer", storage.get_issue(id))?
-        else {
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason: "issue not found".to_string(),
-            });
-            continue;
-        };
-
-        // Check if already closed/tombstone
-        if issue.status.is_terminal() {
-            tracing::debug!(id = %id, status = ?issue.status, "Issue is terminal");
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason: format!("cannot defer {} issue", issue.status.as_str()),
-            });
-            continue;
+            let result = execute_defer_route(&batch_args, &batch_cli, &batch.beads_dir)?;
+            routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
         }
 
-        // Check if already deferred (with same time)
-        if issue.status == Status::Deferred && issue.defer_until == defer_until {
-            tracing::debug!(id = %id, "Issue already deferred with same time");
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason: "already deferred".to_string(),
-            });
-            continue;
+        let ordered_outcomes =
+            reorder_routed_items_by_requested_inputs(&args.ids, routed_outcomes, "defer routing")?;
+        for outcome in ordered_outcomes {
+            match outcome {
+                DeferredOutcome::Changed(issue) => deferred_issues.push(issue),
+                DeferredOutcome::Skipped(issue) => skipped_issues.push(issue),
+            }
         }
-
-        // Build update: set status=deferred, set defer_until
-        let update = IssueUpdate {
-            status: Some(Status::Deferred),
-            defer_until: Some(defer_until),
-            skip_cache_rebuild: true,
-            ..Default::default()
-        };
-
-        // Apply update
-        let update_result = storage.update_issue(id, &update, &actor);
-        preserve_blocked_cache_on_error(storage, cache_dirty, "defer", update_result)?;
-        cache_dirty = true;
-        tracing::info!(id = %id, defer_until = ?defer_until, "Issue deferred");
-
-        // Update last touched
-        crate::util::set_last_touched_id(&beads_dir, id);
-
-        deferred_issues.push(DeferredIssue {
-            id: id.clone(),
-            title: issue.title.clone(),
-            previous_status: issue.status.as_str().to_string(),
-            status: "deferred".to_string(),
-            defer_until: defer_until.map(|dt| dt.to_rfc3339()),
-        });
-    }
-
-    // Rebuild blocked cache since deferred issues may unblock dependents (or change their blocked reason)
-    if cache_dirty {
-        tracing::info!(
-            "Rebuilding blocked cache after deferring {} issues",
-            deferred_issues.len()
-        );
-        storage.rebuild_blocked_cache(true)?;
+    } else {
+        let result = execute_defer_route(args, cli, &beads_dir)?;
+        deferred_issues = result.deferred;
+        skipped_issues = result.skipped;
     }
 
     render_defer_output(&deferred_issues, &skipped_issues, args, json, ctx)?;
-
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 
@@ -183,18 +136,18 @@ fn render_defer_output(
     json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let use_json = json || ctx.is_json() || args.robot;
-    if use_json {
-        let json = if skipped_issues.is_empty() {
-            serde_json::to_string_pretty(deferred_issues)?
+    let use_structured_output = json || ctx.is_json() || ctx.is_toon() || args.robot;
+    if use_structured_output {
+        if skipped_issues.is_empty() {
+            emit_structured_output(&deferred_issues.to_vec(), ctx)?;
         } else {
             let result = DeferResult {
                 deferred: deferred_issues.to_vec(),
                 skipped: skipped_issues.to_vec(),
+                ordered_outcomes: Vec::new(),
             };
-            serde_json::to_string_pretty(&result)?
-        };
-        println!("{json}");
+            emit_structured_output(&result, ctx)?;
+        }
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
@@ -219,6 +172,127 @@ fn render_defer_output(
     Ok(())
 }
 
+fn execute_defer_route(
+    args: &DeferArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+) -> Result<DeferResult> {
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let all_ids = storage_ctx.storage.get_all_ids()?;
+    let update_last_touched_inline = !storage_ctx.no_db;
+    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
+    let storage = &mut storage_ctx.storage;
+
+    let defer_until = args
+        .until
+        .as_ref()
+        .map(|s| parse_flexible_timestamp(s, "defer_until"))
+        .transpose()?;
+
+    let resolved_ids = resolver.resolve_all(
+        &args.ids,
+        |id| all_ids.iter().any(|existing| existing == id),
+        |hash| find_matching_ids(&all_ids, hash),
+    )?;
+
+    let mut deferred_issues: Vec<DeferredIssue> = Vec::new();
+    let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
+    let mut cache_dirty = false;
+
+    for resolved in &resolved_ids {
+        let id = &resolved.id;
+        tracing::info!(id = %id, until = ?defer_until, "Deferring issue");
+
+        let Some(issue) =
+            preserve_blocked_cache_on_error(storage, cache_dirty, "defer", storage.get_issue(id))?
+        else {
+            let skipped = SkippedIssue {
+                id: id.clone(),
+                reason: "issue not found".to_string(),
+            };
+            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
+            continue;
+        };
+
+        if issue.status.is_terminal() {
+            tracing::debug!(id = %id, status = ?issue.status, "Issue is terminal");
+            let skipped = SkippedIssue {
+                id: id.clone(),
+                reason: format!("cannot defer {} issue", issue.status.as_str()),
+            };
+            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
+            continue;
+        }
+
+        if issue.status == Status::Deferred && issue.defer_until == defer_until {
+            tracing::debug!(id = %id, "Issue already deferred with same time");
+            let skipped = SkippedIssue {
+                id: id.clone(),
+                reason: "already deferred".to_string(),
+            };
+            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
+            continue;
+        }
+
+        let update = IssueUpdate {
+            status: Some(Status::Deferred),
+            defer_until: Some(defer_until),
+            skip_cache_rebuild: true,
+            ..Default::default()
+        };
+
+        let update_result = storage.update_issue(id, &update, &actor);
+        preserve_blocked_cache_on_error(storage, cache_dirty, "defer", update_result)?;
+        cache_dirty = true;
+        if update_last_touched_inline {
+            crate::util::set_last_touched_id(&last_touched_dir, id);
+        }
+        tracing::info!(id = %id, defer_until = ?defer_until, "Issue deferred");
+
+        let deferred = DeferredIssue {
+            id: id.clone(),
+            title: issue.title.clone(),
+            previous_status: issue.status.as_str().to_string(),
+            status: "deferred".to_string(),
+            defer_until: defer_until.map(|dt| dt.to_rfc3339()),
+        };
+        ordered_outcomes.push(DeferredOutcome::Changed(deferred.clone()));
+        deferred_issues.push(deferred);
+    }
+
+    if cache_dirty {
+        tracing::info!(
+            "Rebuilding blocked cache after deferring {} issues",
+            deferred_issues.len()
+        );
+        storage.rebuild_blocked_cache(true)?;
+    }
+
+    storage_ctx.flush_no_db_then(|ctx| {
+        if ctx.no_db
+            && let Some(deferred) = deferred_issues.last()
+        {
+            crate::util::set_last_touched_id(&ctx.paths.beads_dir, &deferred.id);
+        }
+        Ok(())
+    })?;
+
+    Ok(DeferResult {
+        deferred: deferred_issues,
+        skipped: skipped_issues,
+        ordered_outcomes,
+    })
+}
+
 /// Execute the undefer command.
 ///
 /// # Errors
@@ -240,100 +314,50 @@ pub fn execute_undefer(
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, &beads_dir)?;
+    let mut undeferred_issues = Vec::new();
+    let mut skipped_issues = Vec::new();
 
-    let config_layer = storage_ctx.load_config(cli)?;
-    let actor = config::resolve_actor(&config_layer);
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
+    if routed_batches.iter().any(|batch| batch.is_external) {
+        let normalized_local_beads_dir =
+            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let mut routed_outcomes = Vec::new();
 
-    // Resolve all IDs
-    let resolved_ids = resolver.resolve_all(
-        &args.ids,
-        |id| all_ids.iter().any(|existing| existing == id),
-        |hash| find_matching_ids(&all_ids, hash),
-    )?;
+        for batch in routed_batches {
+            let mut batch_args = args.clone();
+            batch_args.ids.clone_from(&batch.issue_inputs);
 
-    let mut undeferred_issues: Vec<DeferredIssue> = Vec::new();
-    let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
-    let mut cache_dirty = false;
+            let normalized_batch_beads_dir =
+                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
+            let mut batch_cli = cli.clone();
+            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                cli.db.clone()
+            } else {
+                None
+            };
 
-    for resolved in &resolved_ids {
-        let id = &resolved.id;
-        tracing::info!(id = %id, "Undeferring issue");
-
-        // Get current issue
-        let Some(issue) = preserve_blocked_cache_on_error(
-            storage,
-            cache_dirty,
-            "undefer",
-            storage.get_issue(id),
-        )?
-        else {
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason: "issue not found".to_string(),
-            });
-            continue;
-        };
-
-        // Check if actually deferred (status or date)
-        if issue.status != Status::Deferred && issue.defer_until.is_none() {
-            tracing::debug!(id = %id, status = ?issue.status, "Issue is not deferred");
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason: format!("not deferred (status: {})", issue.status.as_str()),
-            });
-            continue;
+            let result = execute_undefer_route(&batch_args, &batch_cli, &batch.beads_dir)?;
+            routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
         }
 
-        let restored_status = restored_status_after_undefer(&issue);
-        let status_update = if issue.status == Status::Deferred {
-            Some(Status::Open)
-        } else {
-            None
-        };
-
-        // Build update: clear defer_until and only reopen explicitly deferred issues.
-        let update = IssueUpdate {
-            status: status_update,
-            defer_until: Some(None), // Clear defer_until
-            skip_cache_rebuild: true,
-            ..Default::default()
-        };
-
-        // Apply update
-        let update_result = storage.update_issue(id, &update, &actor);
-        preserve_blocked_cache_on_error(storage, cache_dirty, "undefer", update_result)?;
-        cache_dirty = true;
-        tracing::info!(id = %id, "Issue undeferred");
-
-        // Update last touched
-        crate::util::set_last_touched_id(&beads_dir, id);
-
-        undeferred_issues.push(DeferredIssue {
-            id: id.clone(),
-            title: issue.title.clone(),
-            previous_status: issue.status.as_str().to_string(),
-            status: restored_status.as_str().to_string(),
-            defer_until: None,
-        });
-    }
-
-    // Rebuild blocked cache since undeferred issues may become blockers
-    if cache_dirty {
-        tracing::info!(
-            "Rebuilding blocked cache after undeferring {} issues",
-            undeferred_issues.len()
-        );
-        storage.rebuild_blocked_cache(true)?;
+        let ordered_outcomes = reorder_routed_items_by_requested_inputs(
+            &args.ids,
+            routed_outcomes,
+            "undefer routing",
+        )?;
+        for outcome in ordered_outcomes {
+            match outcome {
+                DeferredOutcome::Changed(issue) => undeferred_issues.push(issue),
+                DeferredOutcome::Skipped(issue) => skipped_issues.push(issue),
+            }
+        }
+    } else {
+        let result = execute_undefer_route(args, cli, &beads_dir)?;
+        undeferred_issues = result.undeferred;
+        skipped_issues = result.skipped;
     }
 
     render_undefer_output(&undeferred_issues, &skipped_issues, json, args, ctx)?;
-
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 
@@ -344,18 +368,18 @@ fn render_undefer_output(
     args: &UndeferArgs,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let use_json = json || ctx.is_json() || args.robot;
-    if use_json {
-        let json = if skipped_issues.is_empty() {
-            serde_json::to_string_pretty(undeferred_issues)?
+    let use_structured_output = json || ctx.is_json() || ctx.is_toon() || args.robot;
+    if use_structured_output {
+        if skipped_issues.is_empty() {
+            emit_structured_output(&undeferred_issues.to_vec(), ctx)?;
         } else {
             let result = UndeferResult {
                 undeferred: undeferred_issues.to_vec(),
                 skipped: skipped_issues.to_vec(),
+                ordered_outcomes: Vec::new(),
             };
-            serde_json::to_string_pretty(&result)?
-        };
-        println!("{json}");
+            emit_structured_output(&result, ctx)?;
+        }
     } else if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
@@ -376,6 +400,181 @@ fn render_undefer_output(
     }
 
     Ok(())
+}
+
+fn execute_undefer_route(
+    args: &UndeferArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+) -> Result<UndeferResult> {
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let all_ids = storage_ctx.storage.get_all_ids()?;
+    let update_last_touched_inline = !storage_ctx.no_db;
+    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
+    let storage = &mut storage_ctx.storage;
+
+    let resolved_ids = resolver.resolve_all(
+        &args.ids,
+        |id| all_ids.iter().any(|existing| existing == id),
+        |hash| find_matching_ids(&all_ids, hash),
+    )?;
+
+    let mut undeferred_issues: Vec<DeferredIssue> = Vec::new();
+    let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
+    let mut cache_dirty = false;
+
+    for resolved in &resolved_ids {
+        let id = &resolved.id;
+        tracing::info!(id = %id, "Undeferring issue");
+
+        let Some(issue) = preserve_blocked_cache_on_error(
+            storage,
+            cache_dirty,
+            "undefer",
+            storage.get_issue(id),
+        )?
+        else {
+            let skipped = SkippedIssue {
+                id: id.clone(),
+                reason: "issue not found".to_string(),
+            };
+            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
+            continue;
+        };
+
+        if issue.status != Status::Deferred && issue.defer_until.is_none() {
+            tracing::debug!(id = %id, status = ?issue.status, "Issue is not deferred");
+            let skipped = SkippedIssue {
+                id: id.clone(),
+                reason: format!("not deferred (status: {})", issue.status.as_str()),
+            };
+            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
+            continue;
+        }
+
+        let restored_status = restored_status_after_undefer(&issue);
+        let status_update = if issue.status == Status::Deferred {
+            Some(Status::Open)
+        } else {
+            None
+        };
+
+        let update = IssueUpdate {
+            status: status_update,
+            defer_until: Some(None),
+            skip_cache_rebuild: true,
+            ..Default::default()
+        };
+
+        let update_result = storage.update_issue(id, &update, &actor);
+        preserve_blocked_cache_on_error(storage, cache_dirty, "undefer", update_result)?;
+        cache_dirty = true;
+        if update_last_touched_inline {
+            crate::util::set_last_touched_id(&last_touched_dir, id);
+        }
+        tracing::info!(id = %id, "Issue undeferred");
+
+        let undeferred = DeferredIssue {
+            id: id.clone(),
+            title: issue.title.clone(),
+            previous_status: issue.status.as_str().to_string(),
+            status: restored_status.as_str().to_string(),
+            defer_until: None,
+        };
+        ordered_outcomes.push(DeferredOutcome::Changed(undeferred.clone()));
+        undeferred_issues.push(undeferred);
+    }
+
+    if cache_dirty {
+        tracing::info!(
+            "Rebuilding blocked cache after undeferring {} issues",
+            undeferred_issues.len()
+        );
+        storage.rebuild_blocked_cache(true)?;
+    }
+
+    storage_ctx.flush_no_db_then(|ctx| {
+        if ctx.no_db
+            && let Some(undeferred) = undeferred_issues.last()
+        {
+            crate::util::set_last_touched_id(&ctx.paths.beads_dir, &undeferred.id);
+        }
+        Ok(())
+    })?;
+
+    Ok(UndeferResult {
+        undeferred: undeferred_issues,
+        skipped: skipped_issues,
+        ordered_outcomes,
+    })
+}
+
+fn emit_structured_output<T: Serialize>(payload: &T, ctx: &OutputContext) -> Result<()> {
+    if ctx.is_toon() {
+        ctx.toon(payload);
+    } else if ctx.is_json() {
+        ctx.json_pretty(payload);
+    } else {
+        let json = serde_json::to_string_pretty(payload)?;
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn reorder_routed_items_by_requested_inputs<T>(
+    requested_inputs: &[String],
+    routed_items: Vec<(Vec<String>, Vec<T>)>,
+    context: &str,
+) -> Result<Vec<T>> {
+    let mut positions_by_input: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, input) in requested_inputs.iter().enumerate() {
+        positions_by_input
+            .entry(input.as_str())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
+    for (batch_inputs, batch_items) in routed_items {
+        if batch_inputs.len() != batch_items.len() {
+            return Err(BeadsError::Config(format!(
+                "{context} produced mismatched issue/result counts"
+            )));
+        }
+
+        for (input, item) in batch_inputs.into_iter().zip(batch_items) {
+            let Some(index) = positions_by_input
+                .get_mut(input.as_str())
+                .and_then(VecDeque::pop_front)
+            else {
+                return Err(BeadsError::Config(format!(
+                    "{context} returned unexpected issue input {input}"
+                )));
+            };
+            ordered_items[index] = Some(item);
+        }
+    }
+
+    ordered_items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "{context} did not produce a result for {}",
+                    requested_inputs[index]
+                ))
+            })
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────

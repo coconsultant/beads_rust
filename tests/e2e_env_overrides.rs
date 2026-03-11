@@ -8,6 +8,7 @@ mod common;
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
 use std::fs;
+use toon_rust::try_decode;
 
 // ============================================================================
 // BEADS_DIR tests
@@ -667,6 +668,437 @@ fn e2e_info_shows_resolved_paths() {
     assert!(
         info_json.get("database_path").is_some(),
         "info should include database_path: {info_json}"
+    );
+}
+
+#[test]
+fn e2e_info_plain_output_shows_storage_paths() {
+    let _log = common::test_log("e2e_info_plain_output_shows_storage_paths");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let info = run_br(&workspace, ["info"], "info_plain");
+    assert!(info.status.success(), "info failed: {}", info.stderr);
+
+    assert!(
+        info.stdout.contains("Beads dir:"),
+        "plain info should include beads dir: {}",
+        info.stdout
+    );
+    assert!(
+        info.stdout.contains("JSONL:"),
+        "plain info should include jsonl path: {}",
+        info.stdout
+    );
+}
+
+#[test]
+fn e2e_info_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_info_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let info = run_br_with_env(
+        &workspace,
+        ["info"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "info_toon_env",
+    );
+    assert!(info.status.success(), "info toon failed: {}", info.stderr);
+
+    let decoded = try_decode(info.stdout.trim(), None).expect("valid info TOON");
+    let json = Value::from(decoded);
+    assert!(
+        json.get("database_path").is_some(),
+        "TOON info should include database_path: {json}"
+    );
+}
+
+#[test]
+fn e2e_info_message_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_info_message_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let info = run_br_with_env(
+        &workspace,
+        ["info", "--thanks"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "info_thanks_toon_env",
+    );
+    assert!(
+        info.status.success(),
+        "info --thanks toon failed: {}",
+        info.stderr
+    );
+
+    let decoded = try_decode(info.stdout.trim(), None).expect("valid info message TOON");
+    let json = Value::from(decoded);
+    assert!(
+        json["thanks"]
+            .as_str()
+            .is_some_and(|message| message.contains("Thanks for using br")),
+        "TOON info message should preserve the thanks text: {json}"
+    );
+}
+
+#[test]
+fn e2e_delete_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_delete_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON delete target", "--json"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = created["id"].as_str().expect("issue id");
+
+    let delete = run_br_with_env(
+        &workspace,
+        ["delete", issue_id],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "delete_toon_env",
+    );
+    assert!(
+        delete.status.success(),
+        "delete toon failed: {}",
+        delete.stderr
+    );
+
+    let decoded = try_decode(delete.stdout.trim(), None).expect("valid delete TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json["deleted_count"].as_f64(), Some(1.0));
+    assert_eq!(json["deleted"][0], issue_id);
+}
+
+#[test]
+fn e2e_delete_preview_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_delete_preview_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create_blocker = run_br(&workspace, ["create", "TOON blocker", "--json"], "create_a");
+    assert!(
+        create_blocker.status.success(),
+        "create blocker failed: {}",
+        create_blocker.stderr
+    );
+    let blocker_issue: Value =
+        serde_json::from_str(&extract_json_payload(&create_blocker.stdout)).expect("blocker json");
+    let blocker_id = blocker_issue["id"]
+        .as_str()
+        .expect("blocker id")
+        .to_string();
+
+    let create_dependent = run_br(&workspace, ["create", "TOON blocked", "--json"], "create_b");
+    assert!(
+        create_dependent.status.success(),
+        "create blocked failed: {}",
+        create_dependent.stderr
+    );
+    let dependent_issue: Value =
+        serde_json::from_str(&extract_json_payload(&create_dependent.stdout))
+            .expect("blocked json");
+    let dependent_id = dependent_issue["id"]
+        .as_str()
+        .expect("blocked id")
+        .to_string();
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &dependent_id, &blocker_id],
+        "dep_add_preview_toon",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let delete = run_br_with_env(
+        &workspace,
+        ["delete", &blocker_id],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "delete_preview_toon_env",
+    );
+    assert!(
+        delete.status.success(),
+        "delete preview toon failed: {}",
+        delete.stderr
+    );
+
+    let decoded = try_decode(delete.stdout.trim(), None).expect("valid delete preview TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json["preview"], true);
+    assert_eq!(json["would_delete"][0], blocker_id);
+    assert_eq!(json["blocked_dependents"][0], dependent_id);
+}
+
+#[test]
+fn e2e_close_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_close_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON close target", "--json"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = created["id"].as_str().expect("issue id").to_string();
+
+    let close = run_br_with_env(
+        &workspace,
+        ["close", &issue_id],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "close_toon_env",
+    );
+    assert!(
+        close.status.success(),
+        "close toon failed: {}",
+        close.stderr
+    );
+
+    let decoded = try_decode(close.stdout.trim(), None).expect("valid close TOON");
+    let json = Value::from(decoded);
+    let closed = json.as_array().expect("closed array");
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["id"], issue_id);
+    assert_eq!(closed[0]["status"], "closed");
+}
+
+#[test]
+fn e2e_reopen_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_reopen_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON reopen target", "--json"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = created["id"].as_str().expect("issue id").to_string();
+
+    let close = run_br(&workspace, ["close", &issue_id], "close_before_reopen");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let reopen = run_br_with_env(
+        &workspace,
+        ["reopen", &issue_id],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "reopen_toon_env",
+    );
+    assert!(
+        reopen.status.success(),
+        "reopen toon failed: {}",
+        reopen.stderr
+    );
+
+    let decoded = try_decode(reopen.stdout.trim(), None).expect("valid reopen TOON");
+    let json = Value::from(decoded);
+    let reopened = json["reopened"].as_array().expect("reopened array");
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(reopened[0]["id"], issue_id);
+    assert_eq!(reopened[0]["status"], "open");
+}
+
+#[test]
+fn e2e_defer_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_defer_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON defer target", "--json"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = created["id"].as_str().expect("issue id").to_string();
+
+    let defer = run_br_with_env(
+        &workspace,
+        ["defer", &issue_id],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "defer_toon_env",
+    );
+    assert!(
+        defer.status.success(),
+        "defer toon failed: {}",
+        defer.stderr
+    );
+
+    let decoded = try_decode(defer.stdout.trim(), None).expect("valid defer TOON");
+    let json = Value::from(decoded);
+    let deferred = json.as_array().expect("deferred array");
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0]["id"], issue_id);
+    assert_eq!(deferred[0]["status"], "deferred");
+}
+
+#[test]
+fn e2e_q_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_q_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let quick_capture = run_br_with_env(
+        &workspace,
+        ["q", "TOON quick capture"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "q_toon_env",
+    );
+    assert!(
+        quick_capture.status.success(),
+        "q toon failed: {}",
+        quick_capture.stderr
+    );
+
+    let decoded = try_decode(quick_capture.stdout.trim(), None).expect("valid q TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json["title"].as_str(), Some("TOON quick capture"));
+    assert!(
+        json["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "TOON q output should include a created id: {json}"
+    );
+}
+
+#[test]
+fn e2e_label_add_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_label_add_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_label_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON label target", "--json"],
+        "create_label",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = issue["id"].as_str().expect("issue id").to_string();
+
+    let label_add = run_br_with_env(
+        &workspace,
+        ["label", "add", &issue_id, "triage"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "label_add_toon_env",
+    );
+    assert!(
+        label_add.status.success(),
+        "label add toon failed: {}",
+        label_add.stderr
+    );
+
+    let decoded = try_decode(label_add.stdout.trim(), None).expect("valid label add TOON");
+    let json = Value::from(decoded);
+    let results = json.as_array().expect("label add array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["issue_id"].as_str(), Some(issue_id.as_str()));
+    assert_eq!(results[0]["label"].as_str(), Some("triage"));
+}
+
+#[test]
+fn e2e_comments_add_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_comments_add_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_comments_toon");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "TOON comments target", "--json"],
+        "create_comments",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let issue_id = issue["id"].as_str().expect("issue id").to_string();
+
+    let comments_add = run_br_with_env(
+        &workspace,
+        ["comments", "add", &issue_id, "TOON comment"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "comments_add_toon_env",
+    );
+    assert!(
+        comments_add.status.success(),
+        "comments add toon failed: {}",
+        comments_add.stderr
+    );
+
+    let decoded = try_decode(comments_add.stdout.trim(), None).expect("valid comments add TOON");
+    let json = Value::from(decoded);
+    assert_eq!(json["issue_id"].as_str(), Some(issue_id.as_str()));
+    assert_eq!(json["text"].as_str(), Some("TOON comment"));
+}
+
+#[test]
+fn e2e_where_honors_toon_env_mode() {
+    let _log = common::test_log("e2e_where_honors_toon_env_mode");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let where_result = run_br_with_env(
+        &workspace,
+        ["where"],
+        [("BR_OUTPUT_FORMAT", "toon")],
+        "where_toon_env",
+    );
+    assert!(
+        where_result.status.success(),
+        "where toon failed: {}",
+        where_result.stderr
+    );
+
+    let decoded = try_decode(where_result.stdout.trim(), None).expect("valid where TOON");
+    let json = Value::from(decoded);
+    assert!(
+        json["path"]
+            .as_str()
+            .is_some_and(|path| path.contains(".beads")),
+        "TOON where output should include the beads path: {json}"
+    );
+    assert!(
+        json["database_path"]
+            .as_str()
+            .is_some_and(|path| path.contains("beads.db")),
+        "TOON where output should include the database path: {json}"
     );
 }
 

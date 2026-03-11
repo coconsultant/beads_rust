@@ -113,6 +113,156 @@ fn e2e_relations_labels_comments() {
 }
 
 #[test]
+fn e2e_label_add_updates_last_touched_context() {
+    common::init_test_logging();
+    info!("e2e_label_add_updates_last_touched_context: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_label_last_touched");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let target = run_br(
+        &workspace,
+        ["create", "Label target"],
+        "create_label_target",
+    );
+    assert!(target.status.success(), "create failed: {}", target.stderr);
+    let target_id = parse_created_id(&target.stdout);
+
+    let other = run_br(&workspace, ["create", "Other issue"], "create_label_other");
+    assert!(other.status.success(), "create failed: {}", other.stderr);
+    let other_id = parse_created_id(&other.stdout);
+
+    let label_add = run_br(
+        &workspace,
+        ["label", "add", &target_id, "triage", "--json"],
+        "label_add_last_touched",
+    );
+    assert!(
+        label_add.status.success(),
+        "label add failed: {}",
+        label_add.stderr
+    );
+
+    let update = run_br(
+        &workspace,
+        ["update", "--title", "Label-touched target", "--json"],
+        "update_after_label_add_last_touched",
+    );
+    assert!(
+        update.status.success(),
+        "update without explicit id failed after label add: {}",
+        update.stderr
+    );
+
+    let show_target = run_br(
+        &workspace,
+        ["show", &target_id, "--json"],
+        "show_label_target",
+    );
+    assert!(
+        show_target.status.success(),
+        "show target failed: {}",
+        show_target.stderr
+    );
+    let shown_target: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show_target.stdout)).expect("target json");
+    assert_eq!(shown_target[0]["title"], "Label-touched target");
+
+    let show_other = run_br(
+        &workspace,
+        ["show", &other_id, "--json"],
+        "show_label_other",
+    );
+    assert!(
+        show_other.status.success(),
+        "show other failed: {}",
+        show_other.stderr
+    );
+    let shown_other: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show_other.stdout)).expect("other json");
+    assert_eq!(shown_other[0]["title"], "Other issue");
+    info!("e2e_label_add_updates_last_touched_context: assertions passed");
+}
+
+#[test]
+fn e2e_comments_add_updates_last_touched_context() {
+    common::init_test_logging();
+    info!("e2e_comments_add_updates_last_touched_context: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_comments_last_touched");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let target = run_br(
+        &workspace,
+        ["create", "Comment target"],
+        "create_comments_target",
+    );
+    assert!(target.status.success(), "create failed: {}", target.stderr);
+    let target_id = parse_created_id(&target.stdout);
+
+    let other = run_br(
+        &workspace,
+        ["create", "Other comments issue"],
+        "create_comments_other",
+    );
+    assert!(other.status.success(), "create failed: {}", other.stderr);
+    let other_id = parse_created_id(&other.stdout);
+
+    let comment_add = run_br(
+        &workspace,
+        ["comments", "add", &target_id, "Context anchor", "--json"],
+        "comments_add_last_touched",
+    );
+    assert!(
+        comment_add.status.success(),
+        "comments add failed: {}",
+        comment_add.stderr
+    );
+
+    let update = run_br(
+        &workspace,
+        ["update", "--title", "Comment-touched target", "--json"],
+        "update_after_comments_add_last_touched",
+    );
+    assert!(
+        update.status.success(),
+        "update without explicit id failed after comments add: {}",
+        update.stderr
+    );
+
+    let show_target = run_br(
+        &workspace,
+        ["show", &target_id, "--json"],
+        "show_comments_target",
+    );
+    assert!(
+        show_target.status.success(),
+        "show target failed: {}",
+        show_target.stderr
+    );
+    let shown_target: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show_target.stdout)).expect("target json");
+    assert_eq!(shown_target[0]["title"], "Comment-touched target");
+
+    let show_other = run_br(
+        &workspace,
+        ["show", &other_id, "--json"],
+        "show_comments_other",
+    );
+    assert!(
+        show_other.status.success(),
+        "show other failed: {}",
+        show_other.stderr
+    );
+    let shown_other: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show_other.stdout)).expect("other json");
+    assert_eq!(shown_other[0]["title"], "Other comments issue");
+    info!("e2e_comments_add_updates_last_touched_context: assertions passed");
+}
+
+#[test]
 fn e2e_dep_add_list_blocked_remove() {
     common::init_test_logging();
     info!("e2e_dep_add_list_blocked_remove: starting");
@@ -200,6 +350,180 @@ fn e2e_dep_add_list_blocked_remove() {
         "blocked issue still present after dep remove"
     );
     info!("e2e_dep_add_list_blocked_remove: assertions passed");
+}
+
+#[test]
+fn e2e_dep_add_updates_last_touched_context() {
+    common::init_test_logging();
+    info!("e2e_dep_add_updates_last_touched_context: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(&workspace, ["create", "Blocker"], "create_blocker");
+    assert!(
+        blocker.status.success(),
+        "create blocker failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let blocked = run_br(&workspace, ["create", "Blocked"], "create_blocked");
+    assert!(
+        blocked.status.success(),
+        "create blocked failed: {}",
+        blocked.stderr
+    );
+    let blocked_id = parse_created_id(&blocked.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &blocked_id, &blocker_id, "--json"],
+        "dep_add_last_touched",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            "--title",
+            "Blocked renamed via last touched",
+            "--json",
+        ],
+        "update_last_touched_after_dep_add",
+    );
+    assert!(
+        update.status.success(),
+        "update without explicit id failed after dep add: {}",
+        update.stderr
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", &blocked_id, "--json"],
+        "show_blocked_after_update",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("show json");
+    assert_eq!(json[0]["title"], "Blocked renamed via last touched");
+    info!("e2e_dep_add_updates_last_touched_context: assertions passed");
+}
+
+#[test]
+fn e2e_dep_remove_updates_last_touched_context() {
+    common::init_test_logging();
+    info!("e2e_dep_remove_updates_last_touched_context: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(&workspace, ["create", "Blocker"], "create_blocker");
+    assert!(
+        blocker.status.success(),
+        "create blocker failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let blocked = run_br(&workspace, ["create", "Blocked"], "create_blocked");
+    assert!(
+        blocked.status.success(),
+        "create blocked failed: {}",
+        blocked.stderr
+    );
+    let blocked_id = parse_created_id(&blocked.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &blocked_id, &blocker_id, "--json"],
+        "dep_add_before_remove",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let update_blocker = run_br(
+        &workspace,
+        [
+            "update",
+            &blocker_id,
+            "--title",
+            "Blocker renamed first",
+            "--json",
+        ],
+        "update_blocker_first",
+    );
+    assert!(
+        update_blocker.status.success(),
+        "update blocker failed: {}",
+        update_blocker.stderr
+    );
+
+    let dep_remove = run_br(
+        &workspace,
+        ["dep", "remove", &blocked_id, &blocker_id, "--json"],
+        "dep_remove_last_touched",
+    );
+    assert!(
+        dep_remove.status.success(),
+        "dep remove failed: {}",
+        dep_remove.stderr
+    );
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            "--title",
+            "Blocked renamed after dep remove",
+            "--json",
+        ],
+        "update_last_touched_after_dep_remove",
+    );
+    assert!(
+        update.status.success(),
+        "update without explicit id failed after dep remove: {}",
+        update.stderr
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", &blocked_id, "--json"],
+        "show_blocked_after_remove",
+    );
+    assert!(
+        show.status.success(),
+        "show blocked failed: {}",
+        show.stderr
+    );
+    let blocked_payload = extract_json_payload(&show.stdout);
+    let blocked_json: Value = serde_json::from_str(&blocked_payload).expect("show blocked json");
+    assert_eq!(blocked_json[0]["title"], "Blocked renamed after dep remove");
+
+    let show_blocker = run_br(
+        &workspace,
+        ["show", &blocker_id, "--json"],
+        "show_blocker_final",
+    );
+    assert!(
+        show_blocker.status.success(),
+        "show blocker failed: {}",
+        show_blocker.stderr
+    );
+    let blocker_payload = extract_json_payload(&show_blocker.stdout);
+    let blocker_json: Value = serde_json::from_str(&blocker_payload).expect("show blocker json");
+    assert_eq!(blocker_json[0]["title"], "Blocker renamed first");
+    info!("e2e_dep_remove_updates_last_touched_context: assertions passed");
 }
 
 #[test]

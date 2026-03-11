@@ -142,6 +142,144 @@ fn e2e_basic_lifecycle() {
 }
 
 #[test]
+fn e2e_create_updates_last_touched_context() {
+    let _log = common::test_log("e2e_create_updates_last_touched_context");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_create_last_touched");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Create updates last touched"],
+        "create_last_touched",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created_id = parse_created_id(&create.stdout);
+    assert!(!created_id.is_empty(), "missing created id");
+
+    let update = run_br(
+        &workspace,
+        ["update", "--status", "in_progress"],
+        "update_last_touched_after_create",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let show = run_br(
+        &workspace,
+        ["show", &created_id, "--json"],
+        "show_last_touched_after_create",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("show json");
+    assert_eq!(json[0]["status"], "in_progress");
+}
+
+#[test]
+fn e2e_create_dry_run_does_not_update_last_touched_context() {
+    let _log = common::test_log("e2e_create_dry_run_does_not_update_last_touched_context");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_create_dry_run_last_touched");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let seed = run_br(
+        &workspace,
+        ["create", "Seed for dry-run last touched"],
+        "seed_create_dry_run_last_touched",
+    );
+    assert!(seed.status.success(), "seed create failed: {}", seed.stderr);
+    let seed_id = parse_created_id(&seed.stdout);
+    assert!(!seed_id.is_empty(), "missing seed id");
+
+    let dry_run = run_br(
+        &workspace,
+        [
+            "create",
+            "Dry-run should not move last touched",
+            "--dry-run",
+        ],
+        "create_dry_run_last_touched",
+    );
+    assert!(
+        dry_run.status.success(),
+        "dry-run create failed: {}",
+        dry_run.stderr
+    );
+
+    let update = run_br(
+        &workspace,
+        ["update", "--status", "in_progress"],
+        "update_after_create_dry_run",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let show = run_br(
+        &workspace,
+        ["show", &seed_id, "--json"],
+        "show_after_create_dry_run",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("show json");
+    assert_eq!(json[0]["status"], "in_progress");
+}
+
+#[test]
+fn e2e_no_db_create_updates_last_touched_after_flush() {
+    let _log = common::test_log("e2e_no_db_create_updates_last_touched_after_flush");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_no_db_create_last_touched");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let seed = run_br(
+        &workspace,
+        ["create", "Seed issue"],
+        "seed_no_db_create_last_touched",
+    );
+    assert!(seed.status.success(), "seed create failed: {}", seed.stderr);
+
+    let sync = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "sync_no_db_create_last_touched",
+    );
+    assert!(sync.status.success(), "sync failed: {}", sync.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["--no-db", "create", "No DB create updates last touched"],
+        "create_no_db_last_touched",
+    );
+    assert!(
+        create.status.success(),
+        "no-db create failed: {}",
+        create.stderr
+    );
+    let created_id = parse_created_id(&create.stdout);
+    assert!(!created_id.is_empty(), "missing created id");
+
+    let update = run_br(
+        &workspace,
+        ["update", "--status", "in_progress"],
+        "update_last_touched_after_no_db_create",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let show = run_br(
+        &workspace,
+        ["show", &created_id, "--json"],
+        "show_last_touched_after_no_db_create",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("show json");
+    assert_eq!(json[0]["status"], "in_progress");
+}
+
+#[test]
 fn e2e_quick_capture() {
     let _log = common::test_log("e2e_quick_capture");
     let workspace = BrWorkspace::new();

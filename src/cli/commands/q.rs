@@ -3,7 +3,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::util::id::{IdGenerator, child_id};
+use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::validation::LabelValidator;
 use chrono::Utc;
 use rich_rust::prelude::*;
@@ -47,6 +47,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
     let storage = &mut storage_ctx.storage;
 
     let priority = if let Some(p) = args.priority {
@@ -62,12 +63,25 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     };
 
     let now = Utc::now();
+    let resolved_parent_id = args
+        .parent
+        .as_deref()
+        .map(|parent_input| {
+            resolver
+                .resolve_fallible(
+                    parent_input,
+                    |id| storage.id_exists(id),
+                    |hash| storage.find_ids_by_hash(hash),
+                )
+                .map(|resolved| resolved.id)
+        })
+        .transpose()?;
 
     // When a parent is specified, generate a child ID (parent.1, parent.2, etc.)
-    let id = if let Some(ref parent_id) = args.parent {
+    let id = if let Some(parent_id) = resolved_parent_id.as_deref() {
         if !storage.id_exists(parent_id)? {
             return Err(BeadsError::IssueNotFound {
-                id: parent_id.clone(),
+                id: parent_id.to_string(),
             });
         }
         let next_num = storage.next_child_number(parent_id)?;
@@ -156,7 +170,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     issue.created_by = Some(actor.clone());
 
     // Parent dependency
-    if let Some(ref parent_id) = args.parent {
+    if let Some(parent_id) = resolved_parent_id.as_ref() {
         // Double-check cycle even though we are a new issue, to catch logic errors
         // and ensure the storage would_create_cycle works correctly for prospective links
         if storage.would_create_cycle(&issue.id, parent_id, true)? {
@@ -180,21 +194,35 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     issue.content_hash = Some(issue.compute_content_hash());
 
     storage.create_issue(&issue, &actor)?;
+    let created_id = issue.id.clone();
+    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
+    let update_last_touched_after_flush = storage_ctx.no_db;
+    if !update_last_touched_after_flush {
+        crate::util::set_last_touched_id(&last_touched_dir, &created_id);
+    }
+    storage_ctx.flush_no_db_if_dirty()?;
+    if update_last_touched_after_flush {
+        crate::util::set_last_touched_id(&last_touched_dir, &created_id);
+    }
 
     // Output
-    if ctx.is_json() {
+    if ctx.is_json() || ctx.is_toon() {
         let output = serde_json::json!({
             "id": issue.id,
             "title": issue.title,
         });
-        ctx.json(&output);
+        if ctx.is_toon() {
+            ctx.toon(&output);
+        } else {
+            ctx.json(&output);
+        }
+    } else if ctx.is_quiet() {
+        return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_quick_created_rich(&issue.id, &issue.title, ctx);
     } else {
         println!("{}", issue.id);
     }
-
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 

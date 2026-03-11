@@ -3503,6 +3503,24 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Count how many audit events belong to an issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_issue_events(&self, issue_id: &str) -> Result<usize> {
+        let count = self
+            .conn
+            .query_row_with_params(
+                "SELECT count(*) FROM events WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id)],
+            )?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Add a comment to an issue.
     ///
     /// # Errors
@@ -3643,7 +3661,10 @@ impl SqliteStorage {
     pub fn get_blocker_ids(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
             r"
-            SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type != 'parent-child'
+            SELECT depends_on_id
+            FROM dependencies
+            WHERE issue_id = ?
+              AND type IN ('blocks', 'conditional-blocks', 'waits-for')
             UNION
             SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child'
             ",
@@ -3663,7 +3684,10 @@ impl SqliteStorage {
     pub fn get_blocked_issue_ids(&self, issue_id: &str) -> Result<Vec<String>> {
         let rows = self.conn.query_with_params(
             r"
-            SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type != 'parent-child'
+            SELECT issue_id
+            FROM dependencies
+            WHERE depends_on_id = ?
+              AND type IN ('blocks', 'conditional-blocks', 'waits-for')
             UNION
             SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child'
             ",
@@ -7376,6 +7400,52 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_blocker_helpers_ignore_non_blocking_related_edges() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
+
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 2, None, t1, None);
+        let blocked = make_issue("bd-c1", "Blocked", Status::Open, 2, None, t1, None);
+        let parent = make_issue("bd-p1", "Parent", Status::Open, 2, None, t1, None);
+        let child = make_issue("bd-p1.1", "Child", Status::Open, 2, None, t1, None);
+        let related = make_issue("bd-r1", "Related", Status::Open, 2, None, t1, None);
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage.create_issue(&related, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-p1.1", "bd-p1", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-r1", "bd-b1", "related", "tester")
+            .unwrap();
+
+        let blocker_ids = storage.get_blocker_ids("bd-c1").unwrap();
+        assert_eq!(blocker_ids, vec!["bd-b1"]);
+
+        let parent_blockers = storage.get_blocker_ids("bd-p1").unwrap();
+        assert_eq!(parent_blockers, vec!["bd-p1.1"]);
+
+        let related_blockers = storage.get_blocker_ids("bd-r1").unwrap();
+        assert!(
+            related_blockers.is_empty(),
+            "non-blocking related edges should not be reported as blockers"
+        );
+
+        let blocked_issue_ids = storage.get_blocked_issue_ids("bd-b1").unwrap();
+        assert_eq!(blocked_issue_ids, vec!["bd-c1"]);
+
+        let child_blocked_issue_ids = storage.get_blocked_issue_ids("bd-p1.1").unwrap();
+        assert_eq!(child_blocked_issue_ids, vec!["bd-p1"]);
     }
 
     #[test]

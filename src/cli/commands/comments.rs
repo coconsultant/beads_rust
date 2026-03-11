@@ -1,6 +1,6 @@
 //! Comments command implementation.
 
-use crate::cli::{CommentAddArgs, CommentCommands, CommentListArgs, CommentsArgs};
+use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Comment;
@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use std::fs;
 use std::io::Read;
+use std::path::Path;
 use std::process::Command;
 
 /// Execute the comments command.
@@ -25,45 +26,101 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-
-    let config_layer = storage_ctx.load_config(cli)?;
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-    let actor = config::actor_from_layer(&config_layer);
-    let storage = &mut storage_ctx.storage;
 
     match &args.command {
-        Some(CommentCommands::Add(add_args)) => add_comment(
-            add_args,
-            storage,
-            &resolver,
-            &all_ids,
-            actor.as_deref(),
-            json,
-            ctx,
-        ),
-        Some(CommentCommands::List(list_args)) => list_comments(
-            list_args,
-            storage,
-            &resolver,
-            &all_ids,
-            json,
-            ctx,
-            list_args.wrap,
-        ),
+        Some(CommentCommands::Add(add_args)) => execute_add(add_args, cli, ctx, &beads_dir),
+        Some(CommentCommands::List(list_args)) => {
+            execute_list(&list_args.id, json, cli, ctx, &beads_dir, list_args.wrap)
+        }
         None => {
             let id = args
                 .id
                 .as_deref()
                 .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
-            list_comments_by_id(id, storage, &resolver, &all_ids, json, ctx, args.wrap)
+            execute_list(id, json, cli, ctx, &beads_dir, args.wrap)
         }
-    }?;
+    }
+}
 
-    storage_ctx.flush_no_db_if_dirty()?;
+fn execute_add(
+    args: &CommentAddArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    let (mut storage_ctx, route_cli) = open_routed_storage_for_input(beads_dir, cli, &args.id)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let all_ids = storage_ctx.storage.get_all_ids()?;
+    let actor = config::actor_from_layer(&config_layer);
+
+    let (issue_id, comment) = add_comment(
+        args,
+        &mut storage_ctx.storage,
+        &resolver,
+        &all_ids,
+        actor.as_deref(),
+    )?;
+    storage_ctx.flush_no_db_then(|ctx| {
+        crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);
+        Ok(())
+    })?;
+
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
+    if ctx.is_json() {
+        ctx.json_pretty(&comment);
+    } else if ctx.is_toon() {
+        ctx.toon(&comment);
+    } else if ctx.is_rich() {
+        render_comment_added_rich(&issue_id, &comment, ctx);
+    } else {
+        println!("Comment added to {issue_id}");
+    }
+
     Ok(())
+}
+
+fn execute_list(
+    issue_input: &str,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+    wrap: bool,
+) -> Result<()> {
+    let (storage_ctx, route_cli) = open_routed_storage_for_input(beads_dir, cli, issue_input)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let all_ids = storage_ctx.storage.get_all_ids()?;
+
+    list_comments_by_id(
+        issue_input,
+        &storage_ctx.storage,
+        &resolver,
+        &all_ids,
+        json,
+        ctx,
+        wrap,
+    )
+}
+
+fn open_routed_storage_for_input(
+    local_beads_dir: &Path,
+    cli: &config::CliOverrides,
+    issue_input: &str,
+) -> Result<(config::OpenStorageResult, config::CliOverrides)> {
+    let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    let mut route_cli = cli.clone();
+    if route.is_external {
+        route_cli.db = None;
+    }
+    let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+    Ok((storage_ctx, route_cli))
 }
 
 fn add_comment(
@@ -72,9 +129,7 @@ fn add_comment(
     resolver: &IdResolver,
     all_ids: &[String],
     actor: Option<&str>,
-    _json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
+) -> Result<(String, Comment)> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.id)?;
     let text = read_comment_text(args)?;
     if text.trim().is_empty() {
@@ -86,32 +141,7 @@ fn add_comment(
     let author = resolve_author(args.author.as_deref(), actor);
 
     let comment = storage.add_comment(&issue_id, &author, &text)?;
-
-    if matches!(ctx.mode(), OutputMode::Quiet) {
-        return Ok(());
-    }
-
-    if ctx.is_json() {
-        ctx.json_pretty(&comment);
-    } else if ctx.is_rich() {
-        render_comment_added_rich(&issue_id, &comment, ctx);
-    } else {
-        println!("Comment added to {issue_id}");
-    }
-
-    Ok(())
-}
-
-fn list_comments(
-    args: &CommentListArgs,
-    storage: &SqliteStorage,
-    resolver: &IdResolver,
-    all_ids: &[String],
-    json: bool,
-    ctx: &OutputContext,
-    wrap: bool,
-) -> Result<()> {
-    list_comments_by_id(&args.id, storage, resolver, all_ids, json, ctx, wrap)
+    Ok((issue_id, comment))
 }
 
 fn list_comments_by_id(
@@ -132,6 +162,11 @@ fn list_comments_by_id(
 
     if ctx.is_json() {
         ctx.json_pretty(&comments);
+        return Ok(());
+    }
+
+    if ctx.is_toon() {
+        ctx.toon(&comments);
         return Ok(());
     }
 
@@ -305,15 +340,29 @@ fn resolve_issue_id(
         .map(|resolved| resolved.id)
 }
 
+const MAX_STDIN_COMMENT_BYTES: usize = 10 * 1024 * 1024;
+
+fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) -> Result<String> {
+    let max_bytes = byte_limit
+        .checked_add(1)
+        .and_then(|limit| u64::try_from(limit).ok())
+        .unwrap_or(u64::MAX);
+    let mut buffer = String::new();
+    reader.take(max_bytes).read_to_string(&mut buffer)?;
+    if buffer.len() > byte_limit {
+        return Err(BeadsError::validation(
+            field,
+            format!("stdin input exceeds maximum size of {byte_limit} bytes"),
+        ));
+    }
+    Ok(buffer)
+}
+
 fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
     if let Some(path) = &args.file {
         if path.as_os_str() == "-" {
-            let mut buffer = String::new();
-            // Limit stdin to 10MB to prevent OOM
-            std::io::stdin()
-                .take(10 * 1024 * 1024)
-                .read_to_string(&mut buffer)?;
-            return Ok(buffer);
+            let mut stdin = std::io::stdin();
+            return read_limited_string(&mut stdin, MAX_STDIN_COMMENT_BYTES, "text");
         }
         return Ok(fs::read_to_string(path)?);
     }
@@ -520,5 +569,27 @@ mod tests {
         let result = read_comment_text(&args);
         assert!(result.is_err());
         info!("test_read_comment_text_no_input_fails: assertions passed");
+    }
+
+    #[test]
+    fn test_read_limited_string_accepts_content_within_limit() {
+        init_test_logging();
+        info!("test_read_limited_string_accepts_content_within_limit: starting");
+        let payload = "a".repeat(32);
+        let mut reader = payload.as_bytes();
+        let result = read_limited_string(&mut reader, 32, "text").expect("read within limit");
+        assert_eq!(result.len(), 32);
+        info!("test_read_limited_string_accepts_content_within_limit: assertions passed");
+    }
+
+    #[test]
+    fn test_read_limited_string_rejects_oversized_input() {
+        init_test_logging();
+        info!("test_read_limited_string_rejects_oversized_input: starting");
+        let payload = "a".repeat(33);
+        let mut reader = payload.as_bytes();
+        let err = read_limited_string(&mut reader, 32, "text").expect_err("oversized stdin");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+        info!("test_read_limited_string_rejects_oversized_input: assertions passed");
     }
 }

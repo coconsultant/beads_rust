@@ -11,6 +11,7 @@ use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 /// JSON output structure for updated issues.
@@ -35,6 +36,42 @@ impl From<&Issue> for UpdatedIssueOutput {
     }
 }
 
+enum UpdateRenderItem {
+    Summary {
+        id: String,
+        title: String,
+        before: Box<Option<Issue>>,
+        after: Box<Issue>,
+    },
+    NoUpdates {
+        id: String,
+    },
+}
+
+struct UpdateRouteOutput {
+    updated_issues: Vec<UpdatedIssueOutput>,
+    render_items: Vec<UpdateRenderItem>,
+}
+
+enum ParentUpdatePlan {
+    Unchanged,
+    Clear,
+    Set(String),
+}
+
+struct PreparedUpdateRoute {
+    storage_ctx: config::OpenStorageResult,
+    actor: String,
+    resolved_ids: Vec<String>,
+    update: IssueUpdate,
+    has_updates: bool,
+    add_labels: Vec<String>,
+    remove_labels: Vec<String>,
+    set_labels: bool,
+    valid_set_labels: Vec<String>,
+    resolved_parent: ParentUpdatePlan,
+}
+
 /// Execute the update command.
 ///
 /// # Errors
@@ -56,42 +93,81 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
     let mut updated_issues = Vec::new();
+    let mut render_items = Vec::new();
 
     if routed_batches.iter().any(|batch| batch.is_external) {
+        let normalized_local_beads_dir =
+            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let mut prepared_routes = Vec::new();
+        let mut routed_updated_issues = Vec::new();
+        let mut routed_render_items = Vec::new();
         for batch in routed_batches {
             let mut batch_args = args.clone();
-            batch_args.ids = batch.issue_inputs;
+            batch_args.ids.clone_from(&batch.issue_inputs);
 
+            let normalized_batch_beads_dir =
+                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
             let mut batch_cli = cli.clone();
             // Routed projects must resolve their own metadata-defined DB path
-            // instead of being forced back to the default beads.db filename.
-            batch_cli.db = None;
+            // instead of being forced back to the local override. Preserve the
+            // caller's explicit DB only for the local batch.
+            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                cli.db.clone()
+            } else {
+                None
+            };
+            prepared_routes.push((
+                batch.issue_inputs.clone(),
+                prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir)?,
+            ));
+        }
 
-            updated_issues.extend(execute_single_route(
-                &batch_args,
-                &batch_cli,
-                ctx,
-                &batch.beads_dir,
-            )?);
+        for (issue_inputs, prepared_route) in prepared_routes {
+            let route_output = execute_prepared_route(prepared_route, ctx)?;
+
+            if ctx.is_json() {
+                routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
+            } else if !ctx.is_quiet() {
+                routed_render_items.push((issue_inputs.clone(), route_output.render_items));
+            }
+        }
+
+        if ctx.is_json() {
+            updated_issues = reorder_routed_items_by_requested_inputs(
+                &target_inputs,
+                routed_updated_issues,
+                "update routing",
+            )?;
+        } else if !ctx.is_quiet() {
+            render_items = reorder_routed_items_by_requested_inputs(
+                &target_inputs,
+                routed_render_items,
+                "update routing",
+            )?;
         }
     } else {
-        updated_issues.extend(execute_single_route(args, cli, ctx, &beads_dir)?);
+        let route_output =
+            execute_prepared_route(prepare_single_route(args, cli, &beads_dir)?, ctx)?;
+        updated_issues = route_output.updated_issues;
+        render_items = route_output.render_items;
     }
 
     if ctx.is_json() {
         ctx.json_pretty(&updated_issues);
+    } else if !ctx.is_quiet() {
+        print_render_items(&render_items);
     }
 
     Ok(())
 }
 
-fn execute_single_route(
+#[allow(clippy::too_many_lines)]
+fn prepare_single_route(
     args: &UpdateArgs,
     cli: &config::CliOverrides,
-    ctx: &OutputContext,
     beads_dir: &Path,
-) -> Result<Vec<UpdatedIssueOutput>> {
-    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+) -> Result<PreparedUpdateRoute> {
+    let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
 
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
@@ -126,26 +202,109 @@ fn execute_single_route(
         }
     }
 
+    let resolved_parent =
+        resolve_parent_update(args.parent.as_deref(), &resolver, &storage_ctx.storage)?;
+    validate_parent_updates(&storage_ctx.storage, &resolved_ids, &resolved_parent)?;
+
+    validate_transition_to_in_progress(&storage_ctx.storage, &resolved_ids, args)?;
+
+    Ok(PreparedUpdateRoute {
+        storage_ctx,
+        actor,
+        resolved_ids,
+        update,
+        has_updates,
+        add_labels: args.add_label.clone(),
+        remove_labels: args.remove_label.clone(),
+        set_labels: !args.set_labels.is_empty(),
+        valid_set_labels,
+        resolved_parent,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_prepared_route(
+    mut prepared: PreparedUpdateRoute,
+    ctx: &OutputContext,
+) -> Result<UpdateRouteOutput> {
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
+    let mut render_items = Vec::new();
+    let last_updated_id = prepared.resolved_ids.last().cloned();
+    let storage = &mut prepared.storage_ctx.storage;
 
-    let storage = &mut storage_ctx.storage;
-
-    for id in &resolved_ids {
+    for id in &prepared.resolved_ids {
         // Get issue before update for change tracking
         let issue_before = storage.get_issue(id)?;
 
-        // Claim guard is now inside the IMMEDIATE transaction (see IssueUpdate.expect_unassigned)
-        // to prevent TOCTOU races between concurrent agents.
+        // Apply basic field updates
+        if !prepared.update.is_empty() {
+            storage.update_issue(id, &prepared.update, &prepared.actor)?;
+        }
 
-        // Check if transitioning to in_progress (via --claim or --status in_progress)
-        // and if so, validate that the issue is not blocked
-        let transitioning_to_in_progress = args.claim
-            || args
-                .status
-                .as_ref()
-                .is_some_and(|s| s.eq_ignore_ascii_case("in_progress"));
+        // Apply labels
+        for label in &prepared.add_labels {
+            storage.add_label(id, label, &prepared.actor)?;
+        }
+        for label in &prepared.remove_labels {
+            storage.remove_label(id, label, &prepared.actor)?;
+        }
+        if prepared.set_labels {
+            storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor)?;
+        }
 
-        if transitioning_to_in_progress && !args.force && storage.is_blocked(id)? {
+        // Apply parent
+        apply_parent_update(storage, id, &prepared.resolved_parent, &prepared.actor)?;
+
+        // Get issue after update for output
+        let issue_after = storage.get_issue(id)?;
+
+        if let Some(issue) = issue_after {
+            if ctx.is_json() {
+                updated_issues.push(UpdatedIssueOutput::from(&issue));
+            } else if ctx.is_quiet() {
+            } else if prepared.has_updates {
+                render_items.push(UpdateRenderItem::Summary {
+                    id: id.clone(),
+                    title: issue.title.clone(),
+                    before: Box::new(issue_before),
+                    after: Box::new(issue),
+                });
+            } else {
+                render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
+            }
+        }
+    }
+
+    prepared.storage_ctx.flush_no_db_then(|ctx| {
+        if let Some(id) = last_updated_id.as_deref() {
+            crate::util::set_last_touched_id(&ctx.paths.beads_dir, id);
+        }
+        Ok(())
+    })?;
+
+    Ok(UpdateRouteOutput {
+        updated_issues,
+        render_items,
+    })
+}
+
+fn validate_transition_to_in_progress(
+    storage: &SqliteStorage,
+    ids: &[String],
+    args: &UpdateArgs,
+) -> Result<()> {
+    let transitioning_to_in_progress = args.claim
+        || args
+            .status
+            .as_ref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("in_progress"));
+
+    if !transitioning_to_in_progress || args.force {
+        return Ok(());
+    }
+
+    for id in ids {
+        if storage.is_blocked(id)? {
             let blockers = storage.get_blockers(id)?;
             let blocker_list = if blockers.is_empty() {
                 "blocking dependencies".to_string()
@@ -157,46 +316,9 @@ fn execute_single_route(
                 format!("cannot claim blocked issue: {blocker_list}"),
             ));
         }
-
-        // Apply basic field updates
-        if !update.is_empty() {
-            storage.update_issue(id, &update, &actor)?;
-        }
-
-        // Apply labels
-        for label in &args.add_label {
-            storage.add_label(id, label, &actor)?;
-        }
-        for label in &args.remove_label {
-            storage.remove_label(id, label, &actor)?;
-        }
-        if !args.set_labels.is_empty() {
-            storage.set_labels(id, &valid_set_labels, &actor)?;
-        }
-
-        // Apply parent
-        apply_parent_update(storage, id, args.parent.as_deref(), &resolver, &actor)?;
-
-        // Update last touched
-        crate::util::set_last_touched_id(beads_dir, id);
-
-        // Get issue after update for output
-        let issue_after = storage.get_issue(id)?;
-
-        if let Some(issue) = issue_after {
-            if ctx.is_json() {
-                updated_issues.push(UpdatedIssueOutput::from(&issue));
-            } else if ctx.is_quiet() {
-            } else if has_updates {
-                print_update_summary(id, &issue.title, issue_before.as_ref(), &issue);
-            } else {
-                println!("No updates specified for {id}");
-            }
-        }
     }
 
-    storage_ctx.flush_no_db_if_dirty()?;
-    Ok(updated_issues)
+    Ok(())
 }
 
 /// Print a summary of what changed for the issue.
@@ -237,6 +359,68 @@ fn print_update_summary(id: &str, title: &str, before: Option<&Issue>, after: &I
             println!("  owner: {before_owner} → {after_owner}");
         }
     }
+}
+
+fn print_render_items(render_items: &[UpdateRenderItem]) {
+    for item in render_items {
+        match item {
+            UpdateRenderItem::Summary {
+                id,
+                title,
+                before,
+                after,
+            } => print_update_summary(id, title, before.as_ref().as_ref(), after.as_ref()),
+            UpdateRenderItem::NoUpdates { id } => println!("No updates specified for {id}"),
+        }
+    }
+}
+
+fn reorder_routed_items_by_requested_inputs<T>(
+    requested_inputs: &[String],
+    routed_items: Vec<(Vec<String>, Vec<T>)>,
+    context: &str,
+) -> Result<Vec<T>> {
+    let mut positions_by_input: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, input) in requested_inputs.iter().enumerate() {
+        positions_by_input
+            .entry(input.as_str())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
+    for (batch_inputs, batch_items) in routed_items {
+        if batch_inputs.len() != batch_items.len() {
+            return Err(BeadsError::Config(format!(
+                "{context} produced mismatched issue/result counts"
+            )));
+        }
+
+        for (input, item) in batch_inputs.into_iter().zip(batch_items) {
+            let Some(index) = positions_by_input
+                .get_mut(input.as_str())
+                .and_then(VecDeque::pop_front)
+            else {
+                return Err(BeadsError::Config(format!(
+                    "{context} returned unexpected issue input {input}"
+                )));
+            };
+            ordered_items[index] = Some(item);
+        }
+    }
+
+    ordered_items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "{context} did not produce a result for {}",
+                    requested_inputs[index]
+                ))
+            })
+        })
+        .collect()
 }
 
 fn build_resolver(config_layer: &config::ConfigLayer, _storage: &SqliteStorage) -> IdResolver {
@@ -390,25 +574,56 @@ fn resolve_issue_id(resolver: &IdResolver, storage: &SqliteStorage, input: &str)
         .map(|resolved| resolved.id)
 }
 
+fn resolve_parent_update(
+    parent: Option<&str>,
+    resolver: &IdResolver,
+    storage: &SqliteStorage,
+) -> Result<ParentUpdatePlan> {
+    match parent {
+        None => Ok(ParentUpdatePlan::Unchanged),
+        Some("") => Ok(ParentUpdatePlan::Clear),
+        Some(parent_value) => {
+            resolve_issue_id(resolver, storage, parent_value).map(ParentUpdatePlan::Set)
+        }
+    }
+}
+
 fn apply_parent_update(
     storage: &mut SqliteStorage,
     issue_id: &str,
-    parent: Option<&str>,
-    resolver: &IdResolver,
+    parent: &ParentUpdatePlan,
     actor: &str,
 ) -> Result<()> {
-    let Some(parent_value) = parent else {
+    match parent {
+        ParentUpdatePlan::Unchanged => Ok(()),
+        ParentUpdatePlan::Clear => storage.set_parent(issue_id, None, actor),
+        ParentUpdatePlan::Set(parent_id) => storage.set_parent(issue_id, Some(parent_id), actor),
+    }
+}
+
+fn validate_parent_updates(
+    storage: &SqliteStorage,
+    issue_ids: &[String],
+    parent: &ParentUpdatePlan,
+) -> Result<()> {
+    let ParentUpdatePlan::Set(parent_id) = parent else {
         return Ok(());
     };
 
-    if parent_value.is_empty() {
-        storage.set_parent(issue_id, None, actor)?;
-        return Ok(());
+    for issue_id in issue_ids {
+        if issue_id == parent_id {
+            return Err(BeadsError::SelfDependency {
+                id: issue_id.clone(),
+            });
+        }
+
+        if storage.would_create_cycle(issue_id, parent_id, true)? {
+            return Err(BeadsError::DependencyCycle {
+                path: format!("Setting parent of {issue_id} to {parent_id} would create a cycle"),
+            });
+        }
     }
 
-    // Use immutable reference to storage for resolution
-    let parent_id = resolve_issue_id(resolver, storage, parent_value)?;
-    storage.set_parent(issue_id, Some(&parent_id), actor)?;
     Ok(())
 }
 

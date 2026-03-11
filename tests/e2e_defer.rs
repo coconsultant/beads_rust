@@ -98,9 +98,9 @@ fn defer_indefinitely_no_until() {
     let payload = extract_json_payload(&defer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
 
-    // defer returns array of updated issues
-    assert_eq!(result.as_array().unwrap().len(), 1);
-    let deferred = &result[0];
+    let deferred = result.as_array().expect("deferred array");
+    assert_eq!(deferred.len(), 1);
+    let deferred = &deferred[0];
     assert_eq!(deferred["status"], "deferred");
 
     let show = run_br(&workspace, ["show", &id, "--json"], "show");
@@ -157,11 +157,8 @@ fn defer_multiple_issues() {
     let payload = extract_json_payload(&defer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
 
-    assert_eq!(
-        result.as_array().unwrap().len(),
-        3,
-        "all 3 issues should be deferred"
-    );
+    let deferred = result.as_array().expect("deferred array");
+    assert_eq!(deferred.len(), 3, "all 3 issues should be deferred");
 
     for id in &ids {
         let show = run_br(&workspace, ["show", id, "--json"], &format!("show_{id}"));
@@ -188,8 +185,7 @@ fn defer_json_output() {
     let payload = extract_json_payload(&defer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
 
-    // Expect array of updated issues
-    let deferred = result.as_array().unwrap();
+    let deferred = result.as_array().expect("deferred array");
     assert!(!deferred.is_empty());
 
     let first = &deferred[0];
@@ -449,11 +445,8 @@ fn undefer_multiple_issues() {
     let payload = extract_json_payload(&undefer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
 
-    assert_eq!(
-        result.as_array().unwrap().len(),
-        3,
-        "all 3 issues should be undeferred"
-    );
+    let undeferred = result.as_array().expect("undeferred array");
+    assert_eq!(undeferred.len(), 3, "all 3 issues should be undeferred");
 
     for id in &ids {
         let show = run_br(&workspace, ["show", id, "--json"], &format!("show_{id}"));
@@ -479,7 +472,7 @@ fn undefer_json_output() {
     let payload = extract_json_payload(&undefer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
 
-    let undeferred = result.as_array().unwrap();
+    let undeferred = result.as_array().expect("undeferred array");
     assert_eq!(undeferred.len(), 1);
 
     let first = &undeferred[0];
@@ -518,8 +511,8 @@ fn defer_already_deferred_updates_time() {
     let payload = extract_json_payload(&defer2.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
 
-    // Expect array with 1 updated issue
-    assert_eq!(result.as_array().unwrap().len(), 1);
+    let deferred = result.as_array().expect("deferred array");
+    assert_eq!(deferred.len(), 1);
 
     // Check time updated via show
     let show = run_br(&workspace, ["show", &id, "--json"], "show");

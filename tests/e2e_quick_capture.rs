@@ -199,6 +199,42 @@ fn q_with_labels() {
 }
 
 #[test]
+fn q_updates_last_touched_context() {
+    let _log = common::test_log("q_updates_last_touched_context");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_q_last_touched");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let quick = run_br(
+        &workspace,
+        ["q", "Quick capture updates last touched"],
+        "quick_last_touched",
+    );
+    assert!(quick.status.success(), "q failed: {}", quick.stderr);
+    let created_id = quick.stdout.trim().to_string();
+    assert!(!created_id.is_empty(), "missing quick-capture id");
+
+    let update = run_br(
+        &workspace,
+        ["update", "--status", "in_progress"],
+        "update_last_touched_after_q",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let show = run_br(
+        &workspace,
+        ["show", &created_id, "--json"],
+        "show_last_touched_after_q",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+
+    let payload = extract_json_payload(&show.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    assert_eq!(json[0]["status"], "in_progress");
+}
+
+#[test]
 fn q_multiple_words_title() {
     let _log = common::test_log("q_multiple_words_title");
     // Multiple words without quotes should be joined
@@ -282,6 +318,58 @@ fn q_issue_appears_in_list() {
 
     let found = json.iter().any(|issue| issue["id"] == id);
     assert!(found, "issue {id} should appear in list output");
+}
+
+#[test]
+fn q_parent_accepts_short_parent_id() {
+    let _log = common::test_log("q_parent_accepts_short_parent_id");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let parent_create = run_br(&workspace, ["q", "Parent issue"], "q_parent");
+    assert!(
+        parent_create.status.success(),
+        "parent q failed: {}",
+        parent_create.stderr
+    );
+    let parent_id = parent_create.stdout.trim().to_string();
+    let short_parent_id = parent_id
+        .split_once('-')
+        .map(|(_, hash)| hash)
+        .expect("parent id should contain hash segment");
+
+    let child_create = run_br(
+        &workspace,
+        ["q", "Child issue", "--parent", short_parent_id],
+        "q_child_short_parent",
+    );
+    assert!(
+        child_create.status.success(),
+        "q with short parent id failed: {}",
+        child_create.stderr
+    );
+
+    let child_id = child_create.stdout.trim();
+    assert!(
+        child_id.starts_with(&format!("{parent_id}.")),
+        "child id should be generated under the resolved parent: {child_id}"
+    );
+
+    let show = run_br(&workspace, ["show", child_id, "--json"], "show_child");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
+    let dependencies = json[0]["dependencies"]
+        .as_array()
+        .expect("dependencies should be an array");
+    assert!(
+        dependencies
+            .iter()
+            .any(|dep| { dep["id"] == parent_id && dep["dependency_type"] == "parent-child" }),
+        "child should reference the resolved parent dependency: {dependencies:?}"
+    );
 }
 
 // =============================================================================

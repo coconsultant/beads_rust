@@ -79,6 +79,16 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     let issue = create_issue_impl(&mut storage_ctx.storage, args, &config)?;
+    let created_id = issue.id.clone();
+    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
+    let update_last_touched_after_flush = storage_ctx.no_db;
+    if !args.dry_run && !update_last_touched_after_flush {
+        crate::util::set_last_touched_id(&last_touched_dir, &created_id);
+    }
+    storage_ctx.flush_no_db_if_dirty()?;
+    if !args.dry_run && update_last_touched_after_flush {
+        crate::util::set_last_touched_id(&last_touched_dir, &created_id);
+    }
 
     // Output
     if args.silent {
@@ -124,8 +134,6 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         ctx.success(&format!("Created {}: {}", issue.id, issue.title));
     }
-
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 
@@ -553,6 +561,7 @@ fn execute_import(
 
     let storage = &mut storage_ctx.storage;
     let mut count = storage.count_issues()?;
+    let mut last_created_id: Option<String> = None;
 
     // Track created IDs for output
     let mut created_ids = Vec::new();
@@ -772,6 +781,7 @@ fn execute_import(
 
         // Increment count for next ID generation in the loop
         count += 1;
+        last_created_id = Some(id.clone());
         created_ids.push((id, title));
     }
 
@@ -796,6 +806,22 @@ fn execute_import(
         }
     }
 
+    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
+    let update_last_touched_after_flush = storage_ctx.no_db;
+    if !update_last_touched_after_flush && let Some(last_created_id) = last_created_id.as_deref() {
+        crate::util::set_last_touched_id(&last_touched_dir, last_created_id);
+    }
+    storage_ctx.flush_no_db_if_dirty()?;
+    if update_last_touched_after_flush && let Some(last_created_id) = last_created_id.as_deref() {
+        crate::util::set_last_touched_id(&last_touched_dir, last_created_id);
+    }
+
+    if created_ids.is_empty() {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("failed to create any issues from {}", path.display()),
+        });
+    }
+
     if args.silent {
         for (id, _) in created_ids {
             println!("{id}");
@@ -814,8 +840,6 @@ fn execute_import(
             ctx.print_line(&format!("  {id}: {title}"));
         }
     }
-
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 

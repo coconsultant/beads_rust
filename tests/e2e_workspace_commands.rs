@@ -489,6 +489,130 @@ fn e2e_where_json_output() {
         serde_json::from_str(&payload).expect("where --json should output valid JSON");
 }
 
+#[test]
+fn e2e_where_json_reports_effective_prefix_from_project_config() {
+    let _log = common::test_log("e2e_where_json_reports_effective_prefix_from_project_config");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    fs::write(
+        workspace.root.join(".beads").join("config.yaml"),
+        "issue_prefix: proj\n",
+    )
+    .expect("write project config");
+
+    let whr = run_br(&workspace, ["where", "--json"], "where_json_config_prefix");
+    assert!(whr.status.success(), "where --json failed: {}", whr.stderr);
+
+    let payload = extract_json_payload(&whr.stdout);
+    let json: Value =
+        serde_json::from_str(&payload).expect("where --json should output valid JSON");
+    assert_eq!(json["prefix"].as_str(), Some("proj"));
+}
+
+#[test]
+fn e2e_where_json_omits_prefix_for_mixed_jsonl_fallback() {
+    let _log = common::test_log("e2e_where_json_omits_prefix_for_mixed_jsonl_fallback");
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create beads dir");
+    fs::write(
+        beads_dir.join("issues.jsonl"),
+        concat!(
+            r#"{"id":"proj-abc12","title":"Example"}"#,
+            "\n",
+            r#"{"id":"other-def34","title":"Second"}"#,
+            "\n",
+        ),
+    )
+    .expect("write mixed-prefix jsonl");
+
+    let whr = run_br(
+        &workspace,
+        ["where", "--json"],
+        "where_json_mixed_prefix_jsonl",
+    );
+    assert!(whr.status.success(), "where --json failed: {}", whr.stderr);
+
+    let payload = extract_json_payload(&whr.stdout);
+    let json: Value =
+        serde_json::from_str(&payload).expect("where --json should output valid JSON");
+    assert!(
+        json.get("prefix").is_none(),
+        "where should omit misleading prefix when JSONL prefixes conflict: {json}"
+    );
+}
+
+#[test]
+fn e2e_where_json_recovers_prefix_from_valid_lines_despite_malformed_jsonl_entries() {
+    let _log = common::test_log(
+        "e2e_where_json_recovers_prefix_from_valid_lines_despite_malformed_jsonl_entries",
+    );
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create beads dir");
+    fs::write(
+        beads_dir.join("issues.jsonl"),
+        concat!(
+            "{not valid json}\n",
+            r#"{"id":"proj-abc12","title":"Example"}"#,
+            "\n",
+        ),
+    )
+    .expect("write malformed jsonl");
+
+    let whr = run_br(
+        &workspace,
+        ["where", "--json"],
+        "where_json_malformed_prefix_jsonl",
+    );
+    assert!(whr.status.success(), "where --json failed: {}", whr.stderr);
+
+    let payload = extract_json_payload(&whr.stdout);
+    let json: Value =
+        serde_json::from_str(&payload).expect("where --json should output valid JSON");
+    assert_eq!(json["prefix"].as_str(), Some("proj"));
+}
+
+#[test]
+fn e2e_where_json_omits_prefix_for_mixed_jsonl_even_with_existing_db_prefix() {
+    let _log = common::test_log(
+        "e2e_where_json_omits_prefix_for_mixed_jsonl_even_with_existing_db_prefix",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    fs::write(
+        workspace.root.join(".beads").join("issues.jsonl"),
+        concat!(
+            r#"{"id":"proj-abc12","title":"Example"}"#,
+            "\n",
+            r#"{"id":"other-def34","title":"Second"}"#,
+            "\n",
+        ),
+    )
+    .expect("write mixed-prefix jsonl");
+
+    let whr = run_br(
+        &workspace,
+        ["where", "--json"],
+        "where_json_mixed_prefix_existing_db",
+    );
+    assert!(whr.status.success(), "where --json failed: {}", whr.stderr);
+
+    let payload = extract_json_payload(&whr.stdout);
+    let json: Value =
+        serde_json::from_str(&payload).expect("where --json should output valid JSON");
+    assert!(
+        json.get("prefix").is_none(),
+        "where should omit misleading prefix when JSONL prefixes conflict even if a DB exists: {json}"
+    );
+}
+
 // ============================================================================
 // version command tests
 // ============================================================================

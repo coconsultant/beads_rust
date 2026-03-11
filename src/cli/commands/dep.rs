@@ -36,20 +36,33 @@ pub fn execute(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
 
     let actor = config::resolve_actor(&config_layer);
 
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
 
     match command {
-        DepCommands::Add(args) => dep_add(args, storage, &resolver, &all_ids, &actor, json, ctx),
-        DepCommands::Remove(args) => {
-            dep_remove(args, storage, &resolver, &all_ids, &actor, json, ctx)
-        }
+        DepCommands::Add(args) => dep_add(
+            args,
+            &mut storage_ctx,
+            &resolver,
+            &all_ids,
+            &actor,
+            json,
+            ctx,
+        ),
+        DepCommands::Remove(args) => dep_remove(
+            args,
+            &mut storage_ctx,
+            &resolver,
+            &all_ids,
+            &actor,
+            json,
+            ctx,
+        ),
         DepCommands::List(args) => dep_list(
             args,
-            storage,
+            &storage_ctx.storage,
             &resolver,
             &all_ids,
             &external_db_paths,
@@ -59,14 +72,14 @@ pub fn execute(
         ),
         DepCommands::Tree(args) => dep_tree(
             args,
-            storage,
+            &storage_ctx.storage,
             &resolver,
             &all_ids,
             &external_db_paths,
             json,
             ctx,
         ),
-        DepCommands::Cycles(args) => dep_cycles(args, storage, json, ctx),
+        DepCommands::Cycles(args) => dep_cycles(args, &storage_ctx.storage, json, ctx),
     }?;
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -121,13 +134,14 @@ struct CyclesResult {
 
 fn dep_add(
     args: &DepAddArgs,
-    storage: &mut SqliteStorage,
+    storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
     all_ids: &[String],
     actor: &str,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let storage = &mut storage_ctx.storage;
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
 
     // External dependencies don't need resolution
@@ -188,6 +202,11 @@ fn dep_add(
         storage.rebuild_blocked_cache(true)?;
     }
 
+    storage_ctx.flush_no_db_then(|ctx| {
+        crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);
+        Ok(())
+    })?;
+
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
             status: if added { "ok" } else { "exists" }.to_string(),
@@ -240,13 +259,14 @@ fn dep_add(
 
 fn dep_remove(
     args: &DepRemoveArgs,
-    storage: &mut SqliteStorage,
+    storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
     all_ids: &[String],
     actor: &str,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let storage = &mut storage_ctx.storage;
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
 
     // External dependencies don't need resolution
@@ -264,6 +284,11 @@ fn dep_remove(
     if removed {
         storage.rebuild_blocked_cache(true)?;
     }
+
+    storage_ctx.flush_no_db_then(|ctx| {
+        crate::util::set_last_touched_id(&ctx.paths.beads_dir, &issue_id);
+        Ok(())
+    })?;
 
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {

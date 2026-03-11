@@ -3,7 +3,7 @@
 use crate::cli::InfoArgs;
 use crate::config;
 use crate::error::Result;
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::util::parse_id;
@@ -83,6 +83,10 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let db_path = canonicalize_lossy(&storage_ctx.paths.db_path);
 
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
     let issue_count = Some(storage_ctx.storage.count_issues()?);
     let config_map = Some(storage_ctx.storage.get_all_config()?).filter(|map| !map.is_empty());
     let schema = if args.schema {
@@ -126,6 +130,11 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         return Ok(());
     }
 
+    if ctx.is_toon() {
+        ctx.toon(&output);
+        return Ok(());
+    }
+
     if ctx.is_rich() {
         render_info_rich(&output, ctx);
     } else {
@@ -163,7 +172,17 @@ fn build_schema_info(
 
 fn print_human(info: &InfoOutput) {
     println!("Beads Database Information");
+    println!("Beads dir: {}", info.beads_dir);
     println!("Database: {}", info.database_path);
+    if let Some(size) = info.db_size {
+        println!("Database size: {}", format_bytes(size));
+    }
+    if let Some(jsonl_path) = &info.jsonl_path {
+        println!("JSONL: {jsonl_path}");
+        if let Some(size) = info.jsonl_size {
+            println!("JSONL size: {}", format_bytes(size));
+        }
+    }
     println!("Mode: {}", info.mode);
 
     if info.daemon_connected {
@@ -204,6 +223,11 @@ fn print_message(ctx: &OutputContext, message: &str, key: &str) -> Result<()> {
     if ctx.is_json() {
         let payload = serde_json::json!({ key: message });
         ctx.json_pretty(&payload);
+    } else if ctx.is_toon() {
+        let payload = serde_json::json!({ key: message });
+        ctx.toon(&payload);
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
     } else if ctx.is_rich() {
         let console = Console::default();
         let theme = ctx.theme();

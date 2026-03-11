@@ -362,6 +362,10 @@ fn open_sqlite_storage_with_recovery(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
 ) -> Result<SqliteStorage> {
+    if !paths.db_path.is_file() && paths.jsonl_path.is_file() {
+        return rebuild_database_from_jsonl(beads_dir, paths, lock_timeout, bootstrap_layer);
+    }
+
     match SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout) {
         Ok(storage) => match storage.detect_recoverable_open_anomaly() {
             Ok(None) => Ok(storage),
@@ -831,7 +835,7 @@ impl OpenStorageResult {
         )
     }
 
-    /// Flush JSONL if no-db mode is enabled and there are dirty issues.
+    /// Flush JSONL if no-db mode is enabled and there are pending changes.
     ///
     /// Refuses to export if the on-disk JSONL changed since this no-db session
     /// loaded its snapshot. Re-importing into the same dirty in-memory storage
@@ -845,7 +849,10 @@ impl OpenStorageResult {
             return Ok(());
         }
 
-        if self.storage.get_dirty_issue_count()? == 0 {
+        let dirty_issue_count = self.storage.get_dirty_issue_count()?;
+        let needs_flush = self.storage.get_metadata("needs_flush")?.as_deref() == Some("true");
+
+        if dirty_issue_count == 0 && !needs_flush {
             return Ok(());
         }
 
@@ -869,7 +876,10 @@ impl OpenStorageResult {
         }
 
         let export_config = ExportConfig {
-            force: false,
+            // A no-db hard delete can intentionally remove the last issue.
+            // In that case `purge_issue` leaves no dirty rows, only the force-flush
+            // marker, so allow the empty export that makes JSONL match the storage state.
+            force: needs_flush && dirty_issue_count == 0,
             is_default_path: self.paths.jsonl_path == self.paths.beads_dir.join("issues.jsonl"),
             beads_dir: Some(self.paths.beads_dir.clone()),
             allow_external_jsonl: resolved_jsonl_path_is_external(
@@ -891,6 +901,23 @@ impl OpenStorageResult {
         self.loaded_jsonl_hash = Some(export_result.content_hash);
 
         Ok(())
+    }
+
+    /// Persist no-db changes before rendering success output.
+    ///
+    /// This prevents commands from emitting success or machine-readable output
+    /// for mutations that later fail during no-db JSONL flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns any no-db flush error before invoking `on_success`, or any error
+    /// returned by `on_success` after persistence succeeds.
+    pub fn flush_no_db_then<T, F>(&mut self, on_success: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        self.flush_no_db_if_dirty()?;
+        on_success(self)
     }
 }
 
@@ -3479,6 +3506,28 @@ routing:
     }
 
     #[test]
+    fn open_storage_with_cli_rebuilds_missing_db_from_jsonl() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-recovered", "Recovered from JSONL only");
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-recovered")
+            .expect("query issue")
+            .expect("issue should exist after rebuild");
+
+        assert_eq!(issue.title, "Recovered from JSONL only");
+        assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
     fn open_storage_with_cli_no_db_supports_external_jsonl() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -3488,7 +3537,7 @@ routing:
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         fs::create_dir_all(&external_dir).expect("create external dir");
 
-        write_single_issue_jsonl(&jsonl_path, "bd-ext-import", "Imported from external JSONL");
+        write_single_issue_jsonl(&jsonl_path, "bd-extimp", "Imported from external JSONL");
 
         let cli = CliOverrides {
             db: Some(db_path),
@@ -3498,13 +3547,13 @@ routing:
         let mut storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
         let imported = storage_ctx
             .storage
-            .get_issue("bd-ext-import")
+            .get_issue("bd-extimp")
             .expect("query imported issue")
             .expect("issue should be imported");
         assert_eq!(imported.title, "Imported from external JSONL");
 
         let new_issue = Issue {
-            id: "bd-ext-flush".to_string(),
+            id: "bd-extflsh".to_string(),
             title: "Flushed to external JSONL".to_string(),
             ..Issue::default()
         };
@@ -3518,8 +3567,55 @@ routing:
 
         let exported = fs::read_to_string(&jsonl_path).expect("read external jsonl");
         assert!(
-            exported.contains("\"id\":\"bd-ext-flush\""),
+            exported.contains("\"id\":\"bd-extflsh\""),
             "flush should export to the resolved external JSONL path"
+        );
+    }
+
+    #[test]
+    fn open_storage_with_cli_no_db_flushes_force_flush_without_dirty_rows() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-purge", "Issue to purge");
+
+        let cli = CliOverrides {
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        let mut storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
+        storage_ctx
+            .storage
+            .purge_issue("bd-purge", "tester")
+            .expect("purge issue");
+
+        assert_eq!(
+            storage_ctx
+                .storage
+                .get_dirty_issue_count()
+                .expect("dirty issue count"),
+            0,
+            "hard delete removes the dirty row, so the flush gate must also honor needs_flush"
+        );
+        assert_eq!(
+            storage_ctx
+                .storage
+                .get_metadata("needs_flush")
+                .expect("needs_flush metadata")
+                .as_deref(),
+            Some("true")
+        );
+
+        storage_ctx
+            .flush_no_db_if_dirty()
+            .expect("flush no-db hard delete");
+
+        let exported = fs::read_to_string(&jsonl_path).expect("read exported jsonl");
+        assert!(
+            !exported.contains("\"id\":\"bd-purge\""),
+            "force-flush deletes must update JSONL even when no dirty rows remain"
         );
     }
 
@@ -3533,7 +3629,7 @@ routing:
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         fs::create_dir_all(&external_dir).expect("create external dir");
 
-        write_single_issue_jsonl(&jsonl_path, "bd-ext-import", "Imported from external JSONL");
+        write_single_issue_jsonl(&jsonl_path, "bd-extimp", "Imported from external JSONL");
 
         let cli = CliOverrides {
             db: Some(db_path),
@@ -3543,7 +3639,7 @@ routing:
         let mut storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
 
         let new_issue = Issue {
-            id: "bd-ext-flush".to_string(),
+            id: "bd-extflsh".to_string(),
             title: "Flushed to external JSONL".to_string(),
             ..Issue::default()
         };
@@ -3565,8 +3661,101 @@ routing:
             "concurrent JSONL content should be preserved"
         );
         assert!(
-            !exported.contains("\"id\":\"bd-ext-flush\""),
+            !exported.contains("\"id\":\"bd-extflsh\""),
             "stale in-memory edits should not overwrite concurrent JSONL changes"
+        );
+    }
+
+    #[test]
+    fn open_storage_with_cli_no_db_does_not_render_after_flush_conflict() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external-store");
+        let db_path = external_dir.join("beads.db");
+        let jsonl_path = external_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-extimp", "Imported from external JSONL");
+
+        let cli = CliOverrides {
+            db: Some(db_path),
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        let mut storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
+
+        let new_issue = Issue {
+            id: "bd-extflsh".to_string(),
+            title: "Flushed to external JSONL".to_string(),
+            ..Issue::default()
+        };
+        storage_ctx
+            .storage
+            .create_issue(&new_issue, "tester")
+            .expect("create issue");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-concurrent", "Concurrent rewrite");
+
+        let rendered = std::cell::Cell::new(false);
+        let err = storage_ctx
+            .flush_no_db_then(|_| {
+                rendered.set(true);
+                Ok(())
+            })
+            .expect_err("stale flush conflict");
+
+        assert!(matches!(err, BeadsError::SyncConflict { .. }));
+        assert!(
+            !rendered.get(),
+            "render closure must not run after a failed no-db flush"
+        );
+    }
+
+    #[test]
+    fn open_storage_with_cli_no_db_does_not_update_last_touched_after_flush_conflict() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external-store");
+        let db_path = external_dir.join("beads.db");
+        let jsonl_path = external_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::create_dir_all(&external_dir).expect("create external dir");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-extimp", "Imported from external JSONL");
+        crate::util::set_last_touched_id(&beads_dir, "bd-existing");
+
+        let cli = CliOverrides {
+            db: Some(db_path),
+            no_db: Some(true),
+            ..CliOverrides::default()
+        };
+        let mut storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
+
+        let new_issue = Issue {
+            id: "bd-extflsh".to_string(),
+            title: "Flushed to external JSONL".to_string(),
+            ..Issue::default()
+        };
+        storage_ctx
+            .storage
+            .create_issue(&new_issue, "tester")
+            .expect("create issue");
+
+        write_single_issue_jsonl(&jsonl_path, "bd-concurrent", "Concurrent rewrite");
+
+        let err = storage_ctx
+            .flush_no_db_then(|ctx| {
+                crate::util::set_last_touched_id(&ctx.paths.beads_dir, "bd-extflsh");
+                Ok(())
+            })
+            .expect_err("stale flush conflict");
+
+        assert!(matches!(err, BeadsError::SyncConflict { .. }));
+        assert_eq!(
+            crate::util::get_last_touched_id(&beads_dir),
+            "bd-existing",
+            "failed no-db flush must not leave a stale last-touched pointer behind"
         );
     }
 

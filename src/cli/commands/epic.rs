@@ -51,6 +51,10 @@ fn execute_status(
         return Ok(());
     }
 
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+
     if epics.is_empty() {
         if matches!(ctx.mode(), OutputMode::Rich) {
             render_empty_epics_rich(ctx);
@@ -92,20 +96,11 @@ fn execute_close_eligible(
     let mut epics = load_epic_statuses(storage)?;
     epics.retain(|e| e.eligible_for_close);
 
-    if epics.is_empty() {
-        if ctx.is_json() {
-            ctx.json(&Vec::<EpicStatus>::new());
-        } else if matches!(ctx.mode(), OutputMode::Rich) {
-            render_no_eligible_rich(ctx);
-        } else {
-            println!("No epics eligible for closure");
-        }
-        return Ok(());
-    }
-
     if args.dry_run {
         if ctx.is_json() {
             ctx.json_pretty(&epics);
+        } else if ctx.is_quiet() {
+            return Ok(());
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_dry_run_rich(&epics, ctx);
         } else {
@@ -113,6 +108,23 @@ fn execute_close_eligible(
             for epic_status in &epics {
                 println!("  - {}: {}", epic_status.epic.id, epic_status.epic.title);
             }
+        }
+        return Ok(());
+    }
+
+    if epics.is_empty() {
+        if ctx.is_json() {
+            let result = CloseEligibleResult {
+                closed: Vec::new(),
+                count: 0,
+            };
+            ctx.json_pretty(&result);
+        } else if ctx.is_quiet() {
+            return Ok(());
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
+            render_no_eligible_rich(ctx);
+        } else {
+            println!("No epics eligible for closure");
         }
         return Ok(());
     }
@@ -147,12 +159,16 @@ fn execute_close_eligible(
         Ok(())
     })?;
 
+    storage_ctx.flush_no_db_if_dirty()?;
+
     if ctx.is_json() {
         let result = CloseEligibleResult {
             closed: closed_ids.clone(),
             count: closed_ids.len(),
         };
         ctx.json_pretty(&result);
+    } else if ctx.is_quiet() {
+        return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_close_result_rich(&closed_ids, ctx);
     } else {
@@ -161,8 +177,6 @@ fn execute_close_eligible(
             println!("  - {id}");
         }
     }
-
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 

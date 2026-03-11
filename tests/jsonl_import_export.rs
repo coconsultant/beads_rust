@@ -162,7 +162,7 @@ fn import_sets_closed_at_when_missing() {
 #[test]
 fn export_import_roundtrip_keeps_optional_text_fields_integrity_safe() {
     let mut storage = SqliteStorage::open_memory().unwrap();
-    let issue = issue_with_id("test-optional-text", "Optional text fields");
+    let issue = issue_with_id("test-opttext", "Optional text fields");
     storage.create_issue(&issue, "tester").unwrap();
 
     let temp = TempDir::new().unwrap();

@@ -9,6 +9,52 @@ use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 use std::fs;
 
+fn parse_created_id(stdout: &str) -> String {
+    let line = stdout.lines().next().unwrap_or("");
+    let normalized = line.strip_prefix("✓ Created ").unwrap_or(line);
+    normalized
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn assert_quiet_command<const N: usize>(
+    workspace: &BrWorkspace,
+    args: [&str; N],
+    label: &str,
+    description: &str,
+) {
+    let result = run_br(workspace, args, label);
+    assert!(
+        result.status.success(),
+        "{description} failed: {}",
+        result.stderr
+    );
+    assert!(
+        result.stdout.trim().is_empty(),
+        "{description} should produce no stdout: '{}'",
+        result.stdout
+    );
+}
+
+fn run_quiet_json<const N: usize>(
+    workspace: &BrWorkspace,
+    args: [&str; N],
+    label: &str,
+    description: &str,
+) -> Value {
+    let result = run_br(workspace, args, label);
+    assert!(
+        result.status.success(),
+        "{description} failed: {}",
+        result.stderr
+    );
+    let payload = extract_json_payload(&result.stdout);
+    serde_json::from_str(&payload).expect(description)
+}
+
 // ============================================================================
 // --json flag tests
 // ============================================================================
@@ -517,6 +563,57 @@ fn e2e_no_db_flag_ready() {
     // Should output valid JSON
     let payload = extract_json_payload(&ready.stdout);
     let _json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
+}
+
+#[test]
+fn e2e_no_db_hard_delete_flushes_jsonl() {
+    let _log = common::test_log("e2e_no_db_hard_delete_flushes_jsonl");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "No-DB hard delete test"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let issue_id = create
+        .stdout
+        .lines()
+        .next()
+        .unwrap_or("")
+        .strip_prefix("✓ Created ")
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    assert!(!issue_id.is_empty(), "expected created issue id in stdout");
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let before = fs::read_to_string(&jsonl_path).expect("read jsonl before delete");
+    assert!(
+        before.contains(&format!("\"id\":\"{issue_id}\"")),
+        "issue should be present in JSONL before delete"
+    );
+
+    let delete = run_br(
+        &workspace,
+        ["--no-db", "delete", &issue_id, "--hard"],
+        "delete_no_db_hard",
+    );
+    assert!(
+        delete.status.success(),
+        "--no-db delete --hard failed: {}",
+        delete.stderr
+    );
+
+    let after = fs::read_to_string(&jsonl_path).expect("read jsonl after delete");
+    assert!(
+        !after.contains(&format!("\"id\":\"{issue_id}\"")),
+        "hard delete in --no-db mode should remove the issue from JSONL"
+    );
 }
 
 // ============================================================================
@@ -1042,28 +1139,59 @@ fn e2e_quiet_flag_count_and_where() {
     );
     assert!(create.status.success(), "create failed: {}", create.stderr);
 
-    let count = run_br(&workspace, ["--quiet", "count"], "count_quiet");
-    assert!(
-        count.status.success(),
-        "count --quiet failed: {}",
-        count.stderr
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "count"],
+        "count_quiet",
+        "count --quiet",
     );
-    assert!(
-        count.stdout.trim().is_empty(),
-        "count --quiet should produce no stdout: '{}'",
-        count.stdout
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "where"],
+        "where_quiet",
+        "where --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "info"],
+        "info_quiet",
+        "info --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "info", "--thanks"],
+        "info_thanks_quiet",
+        "info --thanks --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "info", "--whats-new"],
+        "info_whats_new_quiet",
+        "info --whats-new --quiet",
     );
 
-    let where_cmd = run_br(&workspace, ["--quiet", "where"], "where_quiet");
-    assert!(
-        where_cmd.status.success(),
-        "where --quiet failed: {}",
-        where_cmd.stderr
+    let info_json_value = run_quiet_json(
+        &workspace,
+        ["--quiet", "info", "--json"],
+        "info_json_quiet",
+        "info --json should remain json under quiet",
     );
     assert!(
-        where_cmd.stdout.trim().is_empty(),
-        "where --quiet should produce no stdout: '{}'",
-        where_cmd.stdout
+        info_json_value.get("database_path").is_some(),
+        "info --json should include database_path: {info_json_value}"
+    );
+
+    let info_thanks_value = run_quiet_json(
+        &workspace,
+        ["--quiet", "info", "--thanks", "--json"],
+        "info_thanks_json_quiet",
+        "info --thanks --json should remain json under quiet",
+    );
+    assert!(
+        info_thanks_value["thanks"]
+            .as_str()
+            .is_some_and(|message| message.contains("Thanks for using br")),
+        "info --thanks --json should preserve the thanks message: {info_thanks_value}"
     );
 }
 
@@ -1120,6 +1248,63 @@ fn e2e_quiet_flag_defer_subcommands() {
         undefer.stdout.trim().is_empty(),
         "undefer --quiet should produce no stdout: '{}'",
         undefer.stdout
+    );
+}
+
+#[test]
+fn e2e_quiet_flag_config_epic_label_and_q_subcommands() {
+    let _log = common::test_log("e2e_quiet_flag_config_epic_label_and_q_subcommands");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "config", "path"],
+        "config_path_quiet",
+        "config path --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "epic", "status"],
+        "epic_status_quiet",
+        "epic status --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "epic", "close-eligible"],
+        "epic_close_eligible_quiet",
+        "epic close-eligible --quiet",
+    );
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet label test"],
+        "create_label_quiet",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "label", "add", &issue_id, "triage"],
+        "label_add_quiet",
+        "label add --quiet",
+    );
+
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "q", "Quiet quick capture"],
+        "q_quiet",
+        "q --quiet",
+    );
+
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "delete", &issue_id],
+        "delete_quiet",
+        "delete --quiet",
     );
 }
 

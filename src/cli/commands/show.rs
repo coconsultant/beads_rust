@@ -12,7 +12,7 @@ use crate::storage::SqliteStorage;
 use crate::sync::read_issues_from_jsonl;
 use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +61,7 @@ pub fn execute_with_storage_ctx(
     execute_routed(args, cli, outer_ctx, beads_dir, None, Some(storage_ctx))
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_routed(
     args: &ShowArgs,
     cli: &config::CliOverrides,
@@ -94,18 +95,17 @@ fn execute_routed(
         output_format,
         crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Toon
     ) {
-        let mut details_list = Vec::new();
+        let mut routed_details = Vec::new();
         for batch in routed_batches {
             let mut batch_args = args.clone();
-            batch_args.ids = batch.issue_inputs;
-
-            let mut batch_cli = cli.clone();
-            batch_cli.db = None;
+            batch_args.ids.clone_from(&batch.issue_inputs);
 
             let batch_beads_dir = batch.beads_dir;
             let normalized_batch_beads_dir =
                 dunce::canonicalize(&batch_beads_dir).unwrap_or_else(|_| batch_beads_dir.clone());
             let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
+            let mut batch_cli = cli.clone();
+            batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
             let (batch_details, _) = load_issue_details_for_route(
                 &batch_args,
                 &batch_cli,
@@ -121,8 +121,10 @@ fn execute_routed(
                     None
                 },
             )?;
-            details_list.extend(batch_details);
+            routed_details.push((batch.issue_inputs, batch_details));
         }
+        let details_list =
+            reorder_routed_items_by_requested_inputs(&target_ids, routed_details, "show routing")?;
 
         match output_format {
             crate::cli::OutputFormat::Json => outer_ctx.json_pretty(&details_list),
@@ -134,24 +136,20 @@ fn execute_routed(
         return Ok(());
     }
 
-    for (index, batch) in routed_batches.into_iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
-
+    let quiet = cli.quiet.unwrap_or(false);
+    let mut routed_render_items = Vec::new();
+    for batch in routed_batches {
         let mut batch_args = args.clone();
-        batch_args.ids = batch.issue_inputs;
-
-        let mut batch_cli = cli.clone();
-        batch_cli.db = None;
+        batch_args.ids.clone_from(&batch.issue_inputs);
 
         let normalized_batch_beads_dir =
             dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
         let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-        execute_inner(
+        let mut batch_cli = cli.clone();
+        batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+        let (batch_details, use_color) = load_issue_details_for_route(
             &batch_args,
             &batch_cli,
-            outer_ctx,
             &batch.beads_dir,
             if use_preloaded {
                 preloaded_storage
@@ -164,6 +162,34 @@ fn execute_routed(
                 None
             },
         )?;
+        routed_render_items.push((
+            batch.issue_inputs,
+            batch_details
+                .into_iter()
+                .map(|details| (details, use_color))
+                .collect(),
+        ));
+    }
+
+    let ordered_details =
+        reorder_routed_items_by_requested_inputs(&target_ids, routed_render_items, "show routing")?;
+
+    if quiet {
+        return Ok(());
+    }
+
+    for (index, (details, use_color)) in ordered_details.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+
+        let ctx = OutputContext::from_output_format(output_format, quiet, !*use_color);
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            let panel = IssuePanel::from_details(details, ctx.theme());
+            panel.print(&ctx, args.wrap);
+        } else {
+            print_issue_details(details, *use_color);
+        }
     }
 
     Ok(())
@@ -235,6 +261,62 @@ fn execute_inner(
     Ok(())
 }
 
+#[cfg(test)]
+fn reorder_details_by_requested_inputs(
+    requested_inputs: &[String],
+    routed_details: Vec<(Vec<String>, Vec<IssueDetails>)>,
+) -> Result<Vec<IssueDetails>> {
+    reorder_routed_items_by_requested_inputs(requested_inputs, routed_details, "show routing")
+}
+
+fn reorder_routed_items_by_requested_inputs<T>(
+    requested_inputs: &[String],
+    routed_items: Vec<(Vec<String>, Vec<T>)>,
+    context: &str,
+) -> Result<Vec<T>> {
+    let mut positions_by_input: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, input) in requested_inputs.iter().enumerate() {
+        positions_by_input
+            .entry(input.as_str())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut ordered_details: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
+    for (batch_inputs, batch_items) in routed_items {
+        if batch_inputs.len() != batch_items.len() {
+            return Err(BeadsError::Config(format!(
+                "{context} produced mismatched issue/result counts"
+            )));
+        }
+
+        for (input, item) in batch_inputs.into_iter().zip(batch_items) {
+            let Some(index) = positions_by_input
+                .get_mut(input.as_str())
+                .and_then(VecDeque::pop_front)
+            else {
+                return Err(BeadsError::Config(format!(
+                    "{context} returned unexpected issue input {input}"
+                )));
+            };
+            ordered_details[index] = Some(item);
+        }
+    }
+
+    ordered_details
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "{context} did not produce a result for {}",
+                    requested_inputs[index]
+                ))
+            })
+        })
+        .collect()
+}
+
 fn load_issue_details_for_route(
     args: &ShowArgs,
     cli: &config::CliOverrides,
@@ -268,16 +350,10 @@ fn load_issue_details_for_route(
     } else {
         Some(config::open_storage_with_cli(beads_dir, cli)?)
     };
-    let storage = preloaded_storage.unwrap_or_else(|| {
-        &owned_storage_ctx
-            .as_ref()
-            .expect("show should have an open storage handle")
-            .storage
-    });
     let config_layer = if let Some(storage_ctx) = owned_storage_ctx.as_ref() {
         storage_ctx.load_config(cli)?
     } else {
-        config::load_config(beads_dir, Some(storage), cli)?
+        config::load_config(beads_dir, preloaded_storage, cli)?
     };
     let use_color = config::should_use_color(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
@@ -291,6 +367,12 @@ fn load_issue_details_for_route(
             &external_db_paths,
         )?
     } else {
+        let storage = preloaded_storage.unwrap_or_else(|| {
+            &owned_storage_ctx
+                .as_ref()
+                .expect("show should have an open storage handle")
+                .storage
+        });
         load_issue_details_from_storage(&target_ids, &resolver, storage, &external_db_paths)?
     };
 
@@ -716,6 +798,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
 mod tests {
     use super::{
         apply_external_dependency_metadata, build_issue_details_from_jsonl, format_issue_details,
+        reorder_details_by_requested_inputs,
     };
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
@@ -1041,6 +1124,64 @@ mod tests {
         assert_eq!(parent_details.dependents[0].dep_type, "parent-child");
         info!(
             "test_build_issue_details_from_jsonl_derives_parent_and_dependents: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_reorder_details_by_requested_inputs_restores_mixed_route_order() {
+        init_logging();
+        info!("test_reorder_details_by_requested_inputs_restores_mixed_route_order: starting");
+
+        let local_first = IssueDetails {
+            issue: make_test_issue("bd-local-1", "Local first"),
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            comments: Vec::new(),
+            events: Vec::new(),
+            parent: None,
+        };
+        let local_last = IssueDetails {
+            issue: make_test_issue("bd-local-2", "Local last"),
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            comments: Vec::new(),
+            events: Vec::new(),
+            parent: None,
+        };
+        let external_middle = IssueDetails {
+            issue: make_test_issue("ext-middle", "External middle"),
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            comments: Vec::new(),
+            events: Vec::new(),
+            parent: None,
+        };
+
+        let ordered = reorder_details_by_requested_inputs(
+            &[
+                "bd-local-1".to_string(),
+                "ext-middle".to_string(),
+                "bd-local-2".to_string(),
+            ],
+            vec![
+                (
+                    vec!["bd-local-1".to_string(), "bd-local-2".to_string()],
+                    vec![local_first, local_last],
+                ),
+                (vec!["ext-middle".to_string()], vec![external_middle]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].issue.id, "bd-local-1");
+        assert_eq!(ordered[1].issue.id, "ext-middle");
+        assert_eq!(ordered[2].issue.id, "bd-local-2");
+        info!(
+            "test_reorder_details_by_requested_inputs_restores_mixed_route_order: assertions passed"
         );
     }
 }

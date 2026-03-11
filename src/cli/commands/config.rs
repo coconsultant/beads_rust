@@ -109,14 +109,21 @@ pub fn execute(
     }
 }
 
+fn overrides_without_no_db(overrides: &CliOverrides) -> CliOverrides {
+    let mut adjusted = overrides.clone();
+    adjusted.no_db = None;
+    adjusted
+}
+
 fn build_layers(
     beads_dir: Option<&PathBuf>,
     overrides: &CliOverrides,
 ) -> Result<Vec<LayerWithSource>> {
     let defaults = default_config_layer();
+    let db_overrides = overrides_without_no_db(overrides);
 
     let db_layer = if let Some(dir) = beads_dir {
-        let storage_ctx = config::open_storage_with_cli(dir, overrides)?;
+        let storage_ctx = config::open_storage_with_cli(dir, &db_overrides)?;
         ConfigLayer::from_db(&storage_ctx.storage)?
     } else {
         ConfigLayer::default()
@@ -172,9 +179,16 @@ fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
     merged
 }
 
+fn canonical_config_key(key: &str) -> String {
+    key.trim().to_lowercase().replace('-', "_")
+}
+
 fn resolve_source(key: &str, layers: &[LayerWithSource]) -> ConfigSource {
+    let canonical = canonical_config_key(key);
     for layer in layers.iter().rev() {
-        if layer.layer.runtime.contains_key(key) || layer.layer.startup.contains_key(key) {
+        if layer.layer.runtime.contains_key(&canonical)
+            || layer.layer.startup.contains_key(&canonical)
+        {
             return layer.source;
         }
     }
@@ -270,6 +284,8 @@ fn show_paths(_json_mode: bool, overrides: &CliOverrides, ctx: &OutputContext) -
             "project_config": project_path.map(|p| p.display().to_string()),
         });
         ctx.json_pretty(&output);
+    } else if ctx.is_quiet() {
+        return Ok(());
     } else {
         if let Some(path) = user_config_path {
             let exists = path.exists();
@@ -366,12 +382,13 @@ fn get_config_value(
     debug!(key, "Reading config key");
     let layers = build_layers(beads_dir, overrides)?;
     let layer = merge_layers(&layers);
+    let canonical_key = canonical_config_key(key);
 
     // Look for the key in both runtime and startup
     let value = layer
         .runtime
-        .get(key)
-        .or_else(|| layer.startup.get(key))
+        .get(&canonical_key)
+        .or_else(|| layer.startup.get(&canonical_key))
         .cloned();
 
     if ctx.is_json() {
@@ -447,19 +464,9 @@ fn set_config_value(
         fs::create_dir_all(parent)?;
     }
 
-    // Load existing config or create new
-    // Note: Files with only YAML comments parse as Null, not as an error
-    let mut config: serde_yml::Value = if config_path.exists() {
-        let contents = fs::read_to_string(&config_path)?;
-        match serde_yml::from_str(&contents) {
-            Ok(serde_yml::Value::Null) | Err(_) => {
-                serde_yml::Value::Mapping(serde_yml::Mapping::default())
-            }
-            Ok(v) => v,
-        }
-    } else {
-        serde_yml::Value::Mapping(serde_yml::Mapping::default())
-    };
+    // Load existing config or create new.
+    // Files with only YAML comments parse as Null, which we treat as an empty mapping.
+    let mut config = load_mutable_yaml_config(&config_path)?;
 
     // Set the value
     let parts: Vec<&str> = key.split('.').collect();
@@ -603,6 +610,22 @@ fn yaml_value_to_string(value: &serde_yml::Value) -> Option<String> {
     }
 }
 
+fn load_mutable_yaml_config(config_path: &Path) -> Result<serde_yml::Value> {
+    if !config_path.exists() {
+        return Ok(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
+    }
+
+    let contents = fs::read_to_string(config_path)?;
+    match serde_yml::from_str(&contents) {
+        Ok(serde_yml::Value::Null) => Ok(serde_yml::Value::Mapping(serde_yml::Mapping::default())),
+        Ok(value) => Ok(value),
+        Err(err) => Err(BeadsError::Config(format!(
+            "Failed to parse YAML config {}: {err}",
+            config_path.display()
+        ))),
+    }
+}
+
 /// Delete a config value from the database, project config, and user config.
 fn delete_config_value(
     key: &str,
@@ -610,29 +633,40 @@ fn delete_config_value(
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    // 1. Delete from DB
+    // Pre-validate YAML targets before any mutation so malformed config files
+    // do not cause a failed command after the DB value was already deleted.
     let beads_dir = discover_optional_beads_dir_with_cli(overrides)?;
+    let prepared_project_delete = beads_dir
+        .as_ref()
+        .map(|dir| prepare_yaml_delete(&dir.join("config.yaml"), key))
+        .transpose()?
+        .flatten();
+    let prepared_user_delete = get_user_config_path()
+        .map(|path| prepare_yaml_delete(&path, key))
+        .transpose()?
+        .flatten();
+    let prepared_legacy_user_delete = get_legacy_user_config_path()
+        .map(|path| prepare_yaml_delete(&path, key))
+        .transpose()?
+        .flatten();
+
+    // 1. Delete from DB
     let mut db_deleted = false;
 
-    if let Some(dir) = &beads_dir {
+    if let Some(dir) = &beads_dir
+        && !matches!(overrides.no_db, Some(true))
+    {
         let mut storage_ctx = config::open_storage_with_cli(dir, overrides)?;
         db_deleted = storage_ctx.storage.delete_config(key)?;
         storage_ctx.flush_no_db_if_dirty()?;
     }
 
     // 2. Delete from Project YAML
-    let mut project_deleted = false;
-    if let Some(dir) = &beads_dir {
-        project_deleted = delete_config_key_from_yaml_file(&dir.join("config.yaml"), key)?;
-    }
+    let project_deleted = apply_prepared_yaml_delete(prepared_project_delete)?;
 
     // 3. Delete from User YAML
-    let user_deleted = get_user_config_path().map_or(Ok(false), |path| {
-        delete_config_key_from_yaml_file(&path, key)
-    })?;
-    let legacy_user_deleted = get_legacy_user_config_path().map_or(Ok(false), |path| {
-        delete_config_key_from_yaml_file(&path, key)
-    })?;
+    let user_deleted = apply_prepared_yaml_delete(prepared_user_delete)?;
+    let legacy_user_deleted = apply_prepared_yaml_delete(prepared_legacy_user_delete)?;
 
     if ctx.is_json() {
         let output = json!({
@@ -690,21 +724,35 @@ fn delete_config_value(
     Ok(())
 }
 
-fn delete_config_key_from_yaml_file(config_path: &Path, key: &str) -> Result<bool> {
+struct PreparedYamlDelete {
+    path: PathBuf,
+    yaml: String,
+}
+
+fn prepare_yaml_delete(config_path: &Path, key: &str) -> Result<Option<PreparedYamlDelete>> {
     if !config_path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let contents = fs::read_to_string(config_path)?;
-    let mut config: serde_yml::Value = serde_yml::from_str(&contents)
-        .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
+    let mut config = load_mutable_yaml_config(config_path)?;
 
     if !delete_from_yaml(&mut config, key) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let yaml_str = serde_yml::to_string(&config)?;
-    fs::write(config_path, yaml_str)?;
+    Ok(Some(PreparedYamlDelete {
+        path: config_path.to_path_buf(),
+        yaml: yaml_str,
+    }))
+}
+
+fn apply_prepared_yaml_delete(prepared: Option<PreparedYamlDelete>) -> Result<bool> {
+    let Some(prepared) = prepared else {
+        return Ok(false);
+    };
+
+    fs::write(prepared.path, prepared.yaml)?;
     Ok(true)
 }
 
@@ -1026,7 +1074,9 @@ mod tests {
         let config_path = dir.path().join("config.yaml");
         fs::write(&config_path, "display:\n  color: true\n").unwrap();
 
-        let deleted = delete_config_key_from_yaml_file(&config_path, "display.color").unwrap();
+        let deleted =
+            apply_prepared_yaml_delete(prepare_yaml_delete(&config_path, "display.color").unwrap())
+                .unwrap();
         assert!(deleted);
 
         let contents = fs::read_to_string(&config_path).unwrap();

@@ -41,6 +41,16 @@ impl DeleteResult {
     }
 }
 
+/// JSON output for delete preview / dry-run paths.
+#[derive(Debug, Serialize)]
+struct DeletePreviewResult {
+    preview: bool,
+    would_delete: Vec<String>,
+    cascade_delete: Vec<String>,
+    blocked_dependents: Vec<String>,
+    orphaned_issues: Vec<String>,
+}
+
 /// Execute the delete command.
 ///
 /// # Errors
@@ -70,63 +80,107 @@ pub fn execute(
     }
 
     // Deduplicate
-    let ids: Vec<String> = ids
+    let mut ids: Vec<String> = ids
         .into_iter()
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    ids.sort();
 
     // 2. Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
-    let storage = &mut storage_ctx.storage;
+    let result = {
+        let storage = &mut storage_ctx.storage;
 
-    // 3. Validate all IDs exist
-    for id in &ids {
-        if storage.get_issue(id)?.is_none() {
-            return Err(BeadsError::IssueNotFound { id: id.clone() });
-        }
-    }
-
-    // 4. Check for dependents (if not --force and not --cascade)
-    let delete_set: HashSet<String> = ids.iter().cloned().collect();
-    let all_dependents = collect_direct_dependents(storage, &ids)?;
-    let cascade_dependents = if args.cascade {
-        Some(collect_sorted_cascade_dependents(storage, &ids)?)
-    } else {
-        None
-    };
-
-    if !all_dependents.is_empty() && !args.force && !args.cascade {
-        // Preview mode: show what would happen
-        if ctx.is_rich() {
-            render_dependents_warning_rich(&all_dependents, storage, ctx);
-        } else {
-            println!("The following issues depend on issues being deleted:");
-            for dep in &all_dependents {
-                println!("  - {dep}");
+        // 3. Validate all IDs exist
+        for id in &ids {
+            if storage.get_issue(id)?.is_none() {
+                return Err(BeadsError::IssueNotFound { id: id.clone() });
             }
-            println!();
-            println!(
-                "Use --force to orphan these dependents, or --cascade to delete them recursively."
-            );
-            println!("No changes made (preview mode).");
         }
-        return Ok(());
-    }
 
-    // 5. Dry-run mode
-    if args.dry_run {
-        let cascade_ids = cascade_dependents.clone().unwrap_or_default();
-        if ctx.is_rich() {
-            let orphan_ids: Vec<String> = if args.force && !args.cascade {
-                all_dependents
-            } else {
-                vec![]
-            };
-            render_dry_run_rich(&ids, &cascade_ids, &orphan_ids, storage, ctx);
+        // 4. Check for dependents (if not --force and not --cascade)
+        let delete_set: HashSet<String> = ids.iter().cloned().collect();
+        let blocked_dependents = collect_direct_dependents(storage, &ids)?;
+        let cascade_dependents = if args.cascade {
+            Some(collect_sorted_cascade_dependents(storage, &ids)?)
         } else {
+            None
+        };
+
+        if !blocked_dependents.is_empty() && !args.force && !args.cascade {
+            // Preview mode: show what would happen
+            if ctx.is_json() || ctx.is_toon() {
+                let preview = DeletePreviewResult {
+                    preview: true,
+                    would_delete: ids.clone(),
+                    cascade_delete: Vec::new(),
+                    blocked_dependents,
+                    orphaned_issues: Vec::new(),
+                };
+                if ctx.is_toon() {
+                    ctx.toon(&preview);
+                } else {
+                    ctx.json_pretty(&preview);
+                }
+                return Ok(());
+            }
+            if ctx.is_quiet() {
+                return Ok(());
+            }
+            if ctx.is_rich() {
+                render_dependents_warning_rich(&blocked_dependents, storage, ctx);
+            } else {
+                println!("The following issues depend on issues being deleted:");
+                for dep in &blocked_dependents {
+                    println!("  - {dep}");
+                }
+                println!();
+                println!(
+                    "Use --force to orphan these dependents, or --cascade to delete them recursively."
+                );
+                println!("No changes made (preview mode).");
+            }
+            return Ok(());
+        }
+
+        // 5. Dry-run mode
+        if args.dry_run {
+            let cascade_ids = cascade_dependents.clone().unwrap_or_default();
+            if ctx.is_json() || ctx.is_toon() {
+                let orphaned_issues = if args.force && !args.cascade {
+                    blocked_dependents
+                } else {
+                    Vec::new()
+                };
+                let preview = DeletePreviewResult {
+                    preview: true,
+                    would_delete: ids.clone(),
+                    cascade_delete: cascade_ids,
+                    blocked_dependents: Vec::new(),
+                    orphaned_issues,
+                };
+                if ctx.is_toon() {
+                    ctx.toon(&preview);
+                } else {
+                    ctx.json_pretty(&preview);
+                }
+                return Ok(());
+            }
+            if ctx.is_quiet() {
+                return Ok(());
+            }
+            if ctx.is_rich() {
+                let orphan_ids: Vec<String> = if args.force && !args.cascade {
+                    blocked_dependents
+                } else {
+                    vec![]
+                };
+                render_dry_run_rich(&ids, &cascade_ids, &orphan_ids, storage, ctx);
+                return Ok(());
+            }
             println!("Dry-run: Would delete {} issue(s):", ids.len());
             for id in &ids {
                 let issue = storage
@@ -143,64 +197,81 @@ pub fn execute(
                     println!("  - {dep}");
                 }
             }
-            if args.force && !all_dependents.is_empty() {
-                println!("Would orphan {} dependent(s):", all_dependents.len());
-                for dep in &all_dependents {
+            if args.force && !blocked_dependents.is_empty() {
+                println!("Would orphan {} dependent(s):", blocked_dependents.len());
+                for dep in &blocked_dependents {
                     println!("  - {dep}");
                 }
             }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    // 6. Build final delete set
-    let mut final_delete_set: HashSet<String> = delete_set;
-    if let Some(cascade_ids) = &cascade_dependents {
-        final_delete_set.extend(cascade_ids.iter().cloned());
-    }
-
-    // 7. Get actor
-    let actor = config::resolve_actor(&config_layer);
-
-    // 8. Perform deletion
-    let mut result = DeleteResult::new();
-
-    // First, remove all dependency links for issues being deleted
-    for id in &final_delete_set {
-        let deps_removed = storage.remove_all_dependencies(id, &actor)?;
-        result.dependencies_removed += deps_removed;
-    }
-
-    // Track orphaned issues (only relevant for --force mode)
-    if args.force && !args.cascade {
-        result.orphaned_issues.clone_from(&all_dependents);
-    }
-
-    // Delete each issue (create tombstone, then purge if --hard)
-    let mut final_ids: Vec<String> = final_delete_set.into_iter().collect();
-    final_ids.sort();
-    for id in &final_ids {
-        if args.hard {
-            // Hard delete: physically remove from DB so it's pruned from JSONL
-            storage.purge_issue(id, &actor)?;
-        } else {
-            storage.delete_issue(id, &actor, &args.reason, None)?;
+        // 6. Build final delete set
+        let mut final_delete_set: HashSet<String> = delete_set;
+        if let Some(cascade_ids) = &cascade_dependents {
+            final_delete_set.extend(cascade_ids.iter().cloned());
         }
-        result.deleted.push(id.clone());
-    }
-    result.deleted_count = result.deleted.len();
+
+        // 7. Get actor
+        let actor = config::resolve_actor(&config_layer);
+
+        // 8. Perform deletion
+        let mut result = DeleteResult::new();
+
+        // First, remove all dependency links for issues being deleted
+        for id in &final_delete_set {
+            let deps_removed = storage.remove_all_dependencies(id, &actor)?;
+            result.dependencies_removed += deps_removed;
+        }
+
+        // Track orphaned issues (only relevant for --force mode)
+        if args.force && !args.cascade {
+            result.orphaned_issues.clone_from(&blocked_dependents);
+        }
+
+        // Delete each issue (create tombstone, then purge if --hard)
+        let mut final_ids: Vec<String> = final_delete_set.into_iter().collect();
+        final_ids.sort();
+        for id in &final_ids {
+            if args.hard {
+                result.labels_removed += storage.get_labels(id)?.len();
+                result.events_removed += storage.count_issue_events(id)?;
+                // Hard delete: physically remove from DB so it's pruned from JSONL
+                storage.purge_issue(id, &actor)?;
+            } else {
+                storage.delete_issue(id, &actor, &args.reason, None)?;
+            }
+            result.deleted.push(id.clone());
+        }
+        result.deleted_count = result.deleted.len();
+        result
+    };
+
+    let deleted_ids: HashSet<String> = result.deleted.iter().cloned().collect();
+    storage_ctx.flush_no_db_then(|ctx| {
+        let last_touched = crate::util::get_last_touched_id(&ctx.paths.beads_dir);
+        if !last_touched.is_empty() && deleted_ids.contains(&last_touched) {
+            crate::util::clear_last_touched(&ctx.paths.beads_dir);
+        }
+        Ok(())
+    })?;
 
     // 9. Output
-    if ctx.is_json() {
-        ctx.json_pretty(&result);
-        storage_ctx.flush_no_db_if_dirty()?;
+    if ctx.is_json() || ctx.is_toon() {
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
         return Ok(());
     }
 
-    result.deleted.sort();
+    if ctx.is_quiet() {
+        return Ok(());
+    }
 
     if ctx.is_rich() {
-        render_delete_result_rich(&result, storage, ctx);
+        render_delete_result_rich(&result, &storage_ctx.storage, ctx);
     } else {
         println!("Deleted {} issue(s):", result.deleted_count);
         for id in &result.deleted {
@@ -219,7 +290,6 @@ pub fn execute(
         }
     }
 
-    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 
@@ -246,7 +316,7 @@ fn read_ids_from_file(path: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// Recursively collect all dependents for cascade deletion.
+/// Recursively collect all blocked issues for cascade deletion.
 fn collect_cascade_dependents(
     storage: &SqliteStorage,
     initial_ids: &[String],
@@ -255,7 +325,7 @@ fn collect_cascade_dependents(
     let mut to_process: Vec<String> = initial_ids.to_vec();
 
     while let Some(id) = to_process.pop() {
-        let dependents = storage.get_dependents(&id)?;
+        let dependents = storage.get_blocked_issue_ids(&id)?;
         for dep_id in dependents {
             if all_ids.insert(dep_id.clone()) {
                 // New ID, add to processing queue
@@ -280,7 +350,7 @@ fn collect_direct_dependents(
     let mut dependents = Vec::new();
 
     for id in initial_ids {
-        let direct_dependents = storage.get_dependents(id)?;
+        let direct_dependents = storage.get_blocked_issue_ids(id)?;
         for dep_id in direct_dependents {
             if !delete_set.contains(&dep_id) {
                 dependents.push(dep_id);

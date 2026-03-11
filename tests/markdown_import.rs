@@ -97,6 +97,59 @@ bug
 }
 
 #[test]
+fn test_markdown_import_updates_last_touched_context() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_last_touched_import");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## First imported
+### Type
+task
+
+## Second imported
+### Type
+bug
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md"],
+        "create_import_last_touched",
+    );
+    assert!(
+        output.status.success(),
+        "create --file failed: {}",
+        output.stderr
+    );
+
+    let update = run_br(
+        &workspace,
+        ["update", "--status", "in_progress"],
+        "update_after_import_last_touched",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let list = run_br(
+        &workspace,
+        ["list", "--json"],
+        "list_after_import_last_touched",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+
+    let payload = extract_json_payload(&list.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    let second = issues
+        .iter()
+        .find(|issue| issue["title"] == "Second imported")
+        .expect("second imported issue");
+    assert_eq!(second["status"], "in_progress");
+}
+
+#[test]
 fn test_markdown_import_implicit_description_keeps_first_non_empty_line_only() {
     let workspace = BrWorkspace::new();
 
@@ -391,6 +444,50 @@ invalid-type:bd-123
             .contains("warning: skipping invalid dependency type"),
         "expected warning for invalid dependency type"
     );
+}
+
+#[test]
+fn test_markdown_import_all_failed_returns_error() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_all_failed");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Broken One
+### Priority
+999
+
+## Broken Two
+### Priority
+999
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_all_failed",
+    );
+    assert!(
+        !output.status.success(),
+        "all-failed markdown import should return an error"
+    );
+    assert!(
+        output.stderr.contains("failed to create any issues from"),
+        "expected summary failure, got: {}",
+        output.stderr
+    );
+
+    let list = run_br(
+        &workspace,
+        ["list", "--json"],
+        "list_after_all_failed_import",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let listed: serde_json::Value =
+        serde_json::from_str(&extract_json_payload(&list.stdout)).expect("list json");
+    assert_eq!(listed.as_array().expect("list array").len(), 0);
 }
 
 #[test]

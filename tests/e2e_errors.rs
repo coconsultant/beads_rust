@@ -158,6 +158,86 @@ fn e2e_update_tombstone_rejected() {
 }
 
 #[test]
+fn e2e_update_invalid_parent_does_not_partially_apply_other_changes() {
+    let _log = common::test_log("e2e_update_invalid_parent_does_not_partially_apply_other_changes");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Original title", "--json"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--title",
+            "Changed title",
+            "--parent",
+            "bd-missing",
+        ],
+        "update_invalid_parent",
+    );
+    assert!(
+        !update.status.success(),
+        "invalid parent update should fail"
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", &id, "--json"],
+        "show_after_invalid_parent",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let shown: Value =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+    assert_eq!(shown[0]["title"].as_str(), Some("Original title"));
+    assert!(shown[0]["parent"].is_null());
+}
+
+#[test]
+fn e2e_update_self_parent_does_not_partially_apply_other_changes() {
+    let _log = common::test_log("e2e_update_self_parent_does_not_partially_apply_other_changes");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Self parent target", "--json"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let update = run_br(
+        &workspace,
+        ["update", &id, "--status", "in_progress", "--parent", &id],
+        "update_self_parent",
+    );
+    assert!(!update.status.success(), "self parent update should fail");
+
+    let show = run_br(
+        &workspace,
+        ["show", &id, "--json"],
+        "show_after_self_parent",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let shown: Value =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+    assert_eq!(shown[0]["status"].as_str(), Some("open"));
+    assert!(shown[0]["parent"].is_null());
+}
+
+#[test]
 fn e2e_dependency_errors() {
     let _log = common::test_log("e2e_dependency_errors");
     let workspace = BrWorkspace::new();
@@ -1400,6 +1480,282 @@ fn e2e_delete_json_sorts_deleted_ids() {
     expected.sort_unstable();
     assert_eq!(deleted_ids, expected);
     assert_eq!(json["deleted_count"], 2);
+}
+
+#[test]
+fn e2e_delete_dry_run_sorts_requested_ids() {
+    let _log = common::test_log("e2e_delete_dry_run_sorts_requested_ids");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_a = run_br(&workspace, ["create", "Dry Run A"], "create_dry_run_a");
+    assert!(create_a.status.success());
+    let id_a = parse_created_id(&create_a.stdout);
+
+    let create_b = run_br(&workspace, ["create", "Dry Run B"], "create_dry_run_b");
+    assert!(create_b.status.success());
+    let id_b = parse_created_id(&create_b.stdout);
+
+    let result = run_br(
+        &workspace,
+        ["delete", &id_b, &id_a, "--dry-run"],
+        "delete_dry_run_sorted_ids",
+    );
+    assert!(
+        result.status.success(),
+        "delete dry-run failed: {}",
+        result.stderr
+    );
+
+    let listed_ids: Vec<&str> = result
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("  - "))
+        .filter_map(|line| line.split(':').next())
+        .take(2)
+        .collect();
+
+    let mut expected = vec![id_a.as_str(), id_b.as_str()];
+    expected.sort_unstable();
+    assert_eq!(listed_ids, expected);
+}
+
+#[test]
+fn e2e_delete_dry_run_json_returns_structured_preview() {
+    let _log = common::test_log("e2e_delete_dry_run_json_returns_structured_preview");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_a = run_br(
+        &workspace,
+        ["create", "Dry Run JSON A"],
+        "create_dry_run_json_a",
+    );
+    assert!(create_a.status.success());
+    let id_a = parse_created_id(&create_a.stdout);
+
+    let create_b = run_br(
+        &workspace,
+        ["create", "Dry Run JSON B"],
+        "create_dry_run_json_b",
+    );
+    assert!(create_b.status.success());
+    let id_b = parse_created_id(&create_b.stdout);
+
+    let result = run_br(
+        &workspace,
+        ["delete", &id_b, &id_a, "--dry-run", "--json"],
+        "delete_dry_run_json",
+    );
+    assert!(
+        result.status.success(),
+        "delete dry-run --json failed: {}",
+        result.stderr
+    );
+
+    let payload = extract_json_payload(&result.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("delete dry-run preview json");
+    assert_eq!(json["preview"], true);
+    let ids = json["would_delete"].as_array().expect("would_delete array");
+    let mut expected = vec![id_a.as_str(), id_b.as_str()];
+    expected.sort_unstable();
+    let actual: Vec<&str> = ids
+        .iter()
+        .map(|value| value.as_str().expect("preview delete id"))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn e2e_delete_with_dependents_json_returns_structured_preview() {
+    let _log = common::test_log("e2e_delete_with_dependents_json_returns_structured_preview");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_a = run_br(&workspace, ["create", "Issue A"], "create_a_json_preview");
+    assert!(create_a.status.success());
+    let id_a = parse_created_id(&create_a.stdout);
+
+    let create_b = run_br(&workspace, ["create", "Issue B"], "create_b_json_preview");
+    assert!(create_b.status.success());
+    let id_b = parse_created_id(&create_b.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &id_b, &id_a],
+        "dep_add_json_preview",
+    );
+    assert!(dep_add.status.success());
+
+    let result = run_br(
+        &workspace,
+        ["delete", &id_a, "--json"],
+        "delete_with_dependents_json_preview",
+    );
+    assert!(
+        result.status.success(),
+        "delete with dependents --json should return preview: {}",
+        result.stderr
+    );
+
+    let payload = extract_json_payload(&result.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("delete dependent preview json");
+    assert_eq!(json["preview"], true);
+    assert_eq!(json["would_delete"][0], id_a);
+    let blocked = json["blocked_dependents"]
+        .as_array()
+        .expect("blocked_dependents array");
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0], id_b);
+}
+
+#[test]
+fn e2e_delete_ignores_non_blocking_related_dependencies() {
+    let _log = common::test_log("e2e_delete_ignores_non_blocking_related_dependencies");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_anchor = run_br(&workspace, ["create", "Anchor"], "create_anchor");
+    assert!(create_anchor.status.success());
+    let anchor_id = parse_created_id(&create_anchor.stdout);
+
+    let create_related = run_br(&workspace, ["create", "Related"], "create_related");
+    assert!(create_related.status.success());
+    let related_id = parse_created_id(&create_related.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &related_id, &anchor_id, "--type", "related"],
+        "dep_add_related",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let delete = run_br(
+        &workspace,
+        ["delete", &anchor_id, "--json"],
+        "delete_related_edge_json",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+
+    let payload = extract_json_payload(&delete.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("delete json");
+    assert_eq!(json["deleted_count"], 1);
+    assert_eq!(json["deleted"][0], anchor_id);
+    assert!(
+        json.get("preview").is_none(),
+        "non-blocking related edges should not trigger preview: {json}"
+    );
+}
+
+#[test]
+fn e2e_delete_child_with_parent_child_dependency_previews_parent() {
+    let _log = common::test_log("e2e_delete_child_with_parent_child_dependency_previews_parent");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create_parent = run_br(&workspace, ["create", "Parent"], "create_parent");
+    assert!(create_parent.status.success());
+    let parent_id = parse_created_id(&create_parent.stdout);
+
+    let create_child = run_br(&workspace, ["create", "Child"], "create_child");
+    assert!(create_child.status.success());
+    let child_id = parse_created_id(&create_child.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        [
+            "dep",
+            "add",
+            &child_id,
+            &parent_id,
+            "--type",
+            "parent-child",
+        ],
+        "dep_add_parent_child",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let delete = run_br(
+        &workspace,
+        ["delete", &child_id, "--json"],
+        "delete_child_parent_child_json",
+    );
+    assert!(
+        delete.status.success(),
+        "delete should return preview json: {}",
+        delete.stderr
+    );
+
+    let payload = extract_json_payload(&delete.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("delete preview json");
+    assert_eq!(json["preview"], true);
+    assert_eq!(json["would_delete"][0], child_id);
+    let blocked = json["blocked_dependents"]
+        .as_array()
+        .expect("blocked_dependents array");
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0], parent_id);
+}
+
+#[test]
+fn e2e_delete_hard_json_reports_removed_labels_and_events() {
+    let _log = common::test_log("e2e_delete_hard_json_reports_removed_labels_and_events");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    let create = run_br(
+        &workspace,
+        ["create", "Delete counters issue"],
+        "create_delete_counters",
+    );
+    assert!(create.status.success());
+    let issue_id = parse_created_id(&create.stdout);
+
+    let label_add = run_br(
+        &workspace,
+        ["label", "add", &issue_id, "triage"],
+        "label_add_delete_counters",
+    );
+    assert!(
+        label_add.status.success(),
+        "label add failed: {}",
+        label_add.stderr
+    );
+
+    let delete = run_br(
+        &workspace,
+        ["delete", &issue_id, "--hard", "--json"],
+        "delete_hard_counters_json",
+    );
+    assert!(delete.status.success(), "delete failed: {}", delete.stderr);
+
+    let payload = extract_json_payload(&delete.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("delete hard json");
+    assert_eq!(json["labels_removed"], 1);
+    assert!(
+        json["events_removed"].as_u64().unwrap_or(0) >= 2,
+        "hard delete should report removed audit events: {json}"
+    );
 }
 
 #[test]

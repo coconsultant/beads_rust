@@ -278,3 +278,178 @@ fn e2e_config_precedence_legacy_used_when_user_missing() {
     );
     assert_eq!(get_user.stdout.trim(), "2");
 }
+
+#[test]
+fn e2e_config_get_ignores_global_no_db_flag() {
+    let _log = common::test_log("e2e_config_get_ignores_global_no_db_flag");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    storage
+        .set_config("db_only_key", "from-db")
+        .expect("set db-only config");
+
+    let normal = run_br(
+        &workspace,
+        ["config", "get", "db_only_key"],
+        "get_db_only_key",
+    );
+    assert!(
+        normal.status.success(),
+        "config get db_only_key failed: {}",
+        normal.stderr
+    );
+    assert_eq!(normal.stdout.trim(), "from-db");
+
+    let no_db = run_br(
+        &workspace,
+        ["--no-db", "config", "get", "db_only_key"],
+        "get_db_only_key_no_db",
+    );
+    assert!(
+        no_db.status.success(),
+        "--no-db config get db_only_key failed: {}",
+        no_db.stderr
+    );
+    assert_eq!(no_db.stdout.trim(), "from-db");
+}
+
+#[test]
+fn e2e_config_set_preserves_malformed_project_yaml() {
+    let _log = common::test_log("e2e_config_set_preserves_malformed_project_yaml");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let project_config = workspace.root.join(".beads").join("config.yaml");
+    let malformed = "actor: [broken\n";
+    fs::write(&project_config, malformed).expect("write malformed project config");
+
+    let set = run_br(
+        &workspace,
+        ["config", "set", "actor", "alice"],
+        "set_malformed",
+    );
+    assert!(
+        !set.status.success(),
+        "config set should fail on malformed YAML"
+    );
+    assert!(
+        set.stderr.contains("Failed to parse YAML config"),
+        "unexpected stderr: {}",
+        set.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(&project_config).expect("read config after failed set"),
+        malformed
+    );
+}
+
+#[test]
+fn e2e_config_delete_preserves_db_when_project_yaml_is_malformed() {
+    let _log = common::test_log("e2e_config_delete_preserves_db_when_project_yaml_is_malformed");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    storage
+        .set_config("db_only_key", "from-db")
+        .expect("set db-only config");
+
+    let project_config = workspace.root.join(".beads").join("config.yaml");
+    let malformed = "actor: [broken\n";
+    fs::write(&project_config, malformed).expect("write malformed project config");
+
+    let delete = run_br(
+        &workspace,
+        ["config", "delete", "db_only_key"],
+        "delete_malformed_project_yaml",
+    );
+    assert!(
+        !delete.status.success(),
+        "config delete should fail on malformed YAML"
+    );
+    assert!(
+        delete.stderr.contains("Failed to parse YAML config"),
+        "unexpected stderr: {}",
+        delete.stderr
+    );
+    assert_eq!(
+        storage
+            .get_config("db_only_key")
+            .expect("read db config after failed delete")
+            .as_deref(),
+        Some("from-db")
+    );
+    assert_eq!(
+        fs::read_to_string(&project_config).expect("read config after failed delete"),
+        malformed
+    );
+}
+
+#[test]
+fn e2e_config_delete_no_db_preserves_db_values() {
+    let _log = common::test_log("e2e_config_delete_no_db_preserves_db_values");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open db");
+    storage
+        .set_config("db_only_key", "from-db")
+        .expect("set db-only config");
+
+    let delete = run_br(
+        &workspace,
+        ["--no-db", "config", "delete", "db_only_key", "--json"],
+        "delete_db_only_key_no_db",
+    );
+    assert!(
+        delete.status.success(),
+        "--no-db config delete failed: {}",
+        delete.stderr
+    );
+
+    let payload = common::cli::extract_json_payload(&delete.stdout);
+    let result: serde_json::Value = serde_json::from_str(&payload).expect("delete json");
+    assert_eq!(result["deleted_from_db"], false);
+
+    let db_value = storage
+        .get_config("db_only_key")
+        .expect("read db config after no-db delete");
+    assert_eq!(db_value.as_deref(), Some("from-db"));
+}
+
+#[test]
+fn e2e_config_list_rejects_project_and_user_together() {
+    let _log = common::test_log("e2e_config_list_rejects_project_and_user_together");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let list = run_br(
+        &workspace,
+        ["config", "list", "--project", "--user"],
+        "config_list_conflict",
+    );
+    assert!(
+        !list.status.success(),
+        "config list should reject mutually exclusive flags"
+    );
+    assert!(
+        list.stderr.contains("cannot be used with"),
+        "unexpected stderr: {}",
+        list.stderr
+    );
+}

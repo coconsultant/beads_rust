@@ -10,7 +10,8 @@ use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 /// Internal arguments for the close command.
 #[derive(Debug, Clone, Default)]
@@ -72,14 +73,14 @@ pub struct CloseWithSuggestResult {
 }
 
 /// An issue that became unblocked after closing.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnblockedIssue {
     pub id: String,
     pub title: String,
     pub priority: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClosedIssue {
     pub id: String,
     pub title: String,
@@ -89,7 +90,7 @@ pub struct ClosedIssue {
     pub close_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedIssue {
     pub id: String,
     pub reason: String,
@@ -101,6 +102,13 @@ struct CloseExecution {
     closed: Vec<ClosedIssue>,
     skipped: Vec<SkippedIssue>,
     unblocked: Vec<UnblockedIssue>,
+    ordered_outcomes: Vec<CloseOutcome>,
+}
+
+#[derive(Debug, Clone)]
+enum CloseOutcome {
+    Closed(ClosedIssue),
+    Skipped(SkippedIssue),
 }
 
 fn build_close_json_payload(
@@ -141,6 +149,104 @@ fn render_close_json(
     let json = build_close_json_payload(args, closed_issues, skipped_issues, unblocked_issues)?;
     println!("{json}");
     Ok(())
+}
+
+fn emit_close_structured_output(
+    args: &CloseArgs,
+    closed_issues: Vec<ClosedIssue>,
+    skipped_issues: Vec<SkippedIssue>,
+    unblocked_issues: Vec<UnblockedIssue>,
+    ctx: &OutputContext,
+) -> Result<()> {
+    if args.suggest_next {
+        let result = CloseWithSuggestResult {
+            closed: closed_issues,
+            skipped: skipped_issues,
+            unblocked: unblocked_issues,
+        };
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else if ctx.is_json() {
+            ctx.json_pretty(&result);
+        } else {
+            let json_ctx = OutputContext::from_flags(true, false, true);
+            json_ctx.json_pretty(&result);
+        }
+        return Ok(());
+    }
+
+    if skipped_issues.is_empty() {
+        if ctx.is_toon() {
+            ctx.toon(&closed_issues);
+        } else if ctx.is_json() {
+            ctx.json_pretty(&closed_issues);
+        } else {
+            render_close_json(args, closed_issues, skipped_issues, unblocked_issues)?;
+        }
+        return Ok(());
+    }
+
+    let result = CloseResult {
+        closed: closed_issues,
+        skipped: skipped_issues,
+    };
+    if ctx.is_toon() {
+        ctx.toon(&result);
+    } else if ctx.is_json() {
+        ctx.json_pretty(&result);
+    } else {
+        let json_ctx = OutputContext::from_flags(true, false, true);
+        json_ctx.json_pretty(&result);
+    }
+    Ok(())
+}
+
+fn reorder_routed_items_by_requested_inputs<T>(
+    requested_inputs: &[String],
+    routed_items: Vec<(Vec<String>, Vec<T>)>,
+    context: &str,
+) -> Result<Vec<T>> {
+    let mut positions_by_input: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, input) in requested_inputs.iter().enumerate() {
+        positions_by_input
+            .entry(input.as_str())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
+    for (batch_inputs, batch_items) in routed_items {
+        if batch_inputs.len() != batch_items.len() {
+            return Err(BeadsError::Config(format!(
+                "{context} produced mismatched issue/result counts"
+            )));
+        }
+
+        for (input, item) in batch_inputs.into_iter().zip(batch_items) {
+            let Some(index) = positions_by_input
+                .get_mut(input.as_str())
+                .and_then(VecDeque::pop_front)
+            else {
+                return Err(BeadsError::Config(format!(
+                    "{context} returned unexpected issue input {input}"
+                )));
+            };
+            ordered_items[index] = Some(item);
+        }
+    }
+
+    ordered_items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "{context} did not produce a result for {}",
+                    requested_inputs[index]
+                ))
+            })
+        })
+        .collect()
 }
 
 fn compute_batch_closable_ids(
@@ -218,21 +324,11 @@ pub fn execute_with_args(
     ctx: &OutputContext,
 ) -> Result<()> {
     tracing::info!("Executing close command");
-    let use_json = use_json || ctx.is_json();
+    let use_structured_output = use_json || ctx.is_json() || ctx.is_toon();
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-
-    let config_layer = storage_ctx.load_config(cli)?;
-    let actor = config::resolve_actor(&config_layer);
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
-
-    // Get IDs - use last touched if none provided
-    let mut ids = args.ids.clone();
-    if ids.is_empty() {
+    let mut target_inputs = args.ids.clone();
+    if target_inputs.is_empty() {
         let last_touched = crate::util::get_last_touched_id(&beads_dir);
         if last_touched.is_empty() {
             return Err(BeadsError::validation(
@@ -240,29 +336,129 @@ pub fn execute_with_args(
                 "no issue IDs provided and no last-touched issue",
             ));
         }
-        ids.push(last_touched);
+        target_inputs.push(last_touched);
     }
 
-    // Validate suggest-next only works with single ID
-    if args.suggest_next && ids.len() > 1 {
+    if args.suggest_next && target_inputs.len() > 1 {
         return Err(BeadsError::validation(
             "suggest-next",
             "--suggest-next only works with a single issue ID",
         ));
     }
+    let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
 
-    // Resolve all IDs
+    let mut closed_issues = Vec::new();
+    let mut skipped_issues = Vec::new();
+    let mut unblocked_issues = Vec::new();
+
+    if routed_batches.iter().any(|batch| batch.is_external) {
+        let normalized_local_beads_dir =
+            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+        let mut routed_outcomes = Vec::new();
+
+        for batch in routed_batches {
+            let mut batch_args = args.clone();
+            batch_args.ids.clone_from(&batch.issue_inputs);
+
+            let normalized_batch_beads_dir =
+                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
+            let mut batch_cli = cli.clone();
+            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                cli.db.clone()
+            } else {
+                None
+            };
+
+            let execution = execute_route(&batch_args, &batch_cli, &batch.beads_dir)?;
+            let CloseExecution {
+                unblocked,
+                ordered_outcomes,
+                ..
+            } = execution;
+            routed_outcomes.push((batch.issue_inputs, ordered_outcomes));
+            unblocked_issues.extend(unblocked);
+        }
+
+        let ordered_outcomes = reorder_routed_items_by_requested_inputs(
+            &target_inputs,
+            routed_outcomes,
+            "close routing",
+        )?;
+        for outcome in ordered_outcomes {
+            match outcome {
+                CloseOutcome::Closed(issue) => closed_issues.push(issue),
+                CloseOutcome::Skipped(issue) => skipped_issues.push(issue),
+            }
+        }
+    } else {
+        let mut local_args = args.clone();
+        local_args.ids = target_inputs;
+        let execution = execute_route(&local_args, cli, &beads_dir)?;
+        closed_issues = execution.closed;
+        skipped_issues = execution.skipped;
+        unblocked_issues = execution.unblocked;
+    }
+
+    let closed_count = closed_issues.len();
+    let skipped_count = skipped_issues.len();
+
+    if use_structured_output {
+        emit_close_structured_output(args, closed_issues, skipped_issues, unblocked_issues, ctx)?;
+    } else if closed_issues.is_empty() && skipped_issues.is_empty() {
+        ctx.info("No issues to close.");
+    } else {
+        for closed in &closed_issues {
+            let mut msg = format!("Closed {}: {}", closed.id, closed.title);
+            if let Some(reason) = &closed.close_reason {
+                msg.push_str(&format!(" ({reason})"));
+            }
+            ctx.success(&msg);
+        }
+        for skipped in &skipped_issues {
+            ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
+        }
+        if !unblocked_issues.is_empty() {
+            ctx.newline();
+            ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
+            for issue in &unblocked_issues {
+                ctx.print_line(&format!("  {}: {}", issue.id, issue.title));
+            }
+        }
+    }
+
+    if closed_count == 0 && skipped_count > 0 {
+        return Err(BeadsError::NothingToDo {
+            reason: format!("all {skipped_count} issue(s) skipped"),
+        });
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_route(
+    args: &CloseArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+) -> Result<CloseExecution> {
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+    let id_config = config::id_config_from_layer(&config_layer);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let all_ids = storage_ctx.storage.get_all_ids()?;
+    let update_last_touched_inline = !storage_ctx.no_db;
+    let last_touched_dir = storage_ctx.paths.beads_dir.clone();
+    let storage = &mut storage_ctx.storage;
+
     let resolved_ids = resolver.resolve_all(
-        &ids,
+        &args.ids,
         |id| all_ids.iter().any(|existing| existing == id),
         |hash| find_matching_ids(&all_ids, hash),
     )?;
 
-    // Optimization: fetch epic counts if any issues might be epics
-    // to warn about open children.
     let epic_counts = storage.get_epic_counts()?;
-
-    // Track blocked issues before closing (for suggest-next)
     let blocked_before: Vec<String> = if args.suggest_next {
         storage
             .get_blocked_issues()?
@@ -282,46 +478,50 @@ pub fn execute_with_args(
     let mut external_blockers_by_id: HashMap<String, Vec<String>> = HashMap::new();
     let mut closed_issues: Vec<ClosedIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
 
     for resolved in &resolved_ids {
         let id = &resolved.id;
         tracing::info!(id = %id, "Closing issue");
 
-        // Get current issue
         let Some(issue) =
             preserve_blocked_cache_on_error(storage, cache_dirty, "close", storage.get_issue(id))?
         else {
-            skipped_issues.push(SkippedIssue {
+            let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: "issue not found".to_string(),
-            });
+            };
+            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
             continue;
         };
 
-        // Check if already closed
         if issue.status.is_terminal() {
-            skipped_issues.push(SkippedIssue {
+            let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: format!("already {}", issue.status.as_str()),
-            });
+            };
+            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
             continue;
         }
 
-        // Epic safeguard: warn if closing an epic with open children
         if !args.force
             && issue.issue_type == crate::model::IssueType::Epic
             && let Some(&(total, closed)) = epic_counts.get(id)
             && closed < total
         {
-            skipped_issues.push(SkippedIssue {
+            let skipped = SkippedIssue {
                 id: id.clone(),
                 reason: format!(
                     "epic has {}/{} open children (use --force to close anyway)",
                     total - closed,
                     total
                 ),
-            });
+            };
+            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
             continue;
         }
 
@@ -343,7 +543,6 @@ pub fn execute_with_args(
                 storage.get_blockers(id),
             )?;
             if blockers.is_empty() {
-                // Fallback in case of cache inconsistency or implicit blocking
                 blockers = preserve_blocked_cache_on_error(
                     storage,
                     cache_dirty,
@@ -400,10 +599,12 @@ pub fn execute_with_args(
             } else {
                 format!("blocked by: {}", blocker_ids.join(", "))
             };
-            skipped_issues.push(SkippedIssue {
+            let skipped = SkippedIssue {
                 id: id.clone(),
                 reason,
-            });
+            };
+            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            skipped_issues.push(skipped);
             continue;
         }
 
@@ -418,22 +619,23 @@ pub fn execute_with_args(
             ..Default::default()
         };
 
-        // Apply update
         let update_result = storage.update_issue(id, &update, &actor);
         preserve_blocked_cache_on_error(storage, cache_dirty, "close", update_result)?;
         cache_dirty = true;
+        if update_last_touched_inline {
+            crate::util::set_last_touched_id(&last_touched_dir, id);
+        }
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
 
-        // Update last touched
-        crate::util::set_last_touched_id(&beads_dir, id);
-
-        closed_issues.push(ClosedIssue {
+        let closed = ClosedIssue {
             id: id.clone(),
             title: issue.title.clone(),
             status: "closed".to_string(),
             closed_at: now.to_rfc3339(),
             close_reason: Some(close_reason),
-        });
+        };
+        ordered_outcomes.push(CloseOutcome::Closed(closed.clone()));
+        closed_issues.push(closed);
     }
 
     if cache_dirty {
@@ -444,13 +646,7 @@ pub fn execute_with_args(
         storage.rebuild_blocked_cache(true)?;
     }
 
-    // Handle suggest-next: find issues that became unblocked
     let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {
-        // Rebuild blocked cache to reflect the closure
-        // Note: we just explicitly rebuilt it above.
-        // We just need to fetch the new state.
-
-        // Find issues that were blocked before but aren't now
         let blocked_after: Vec<String> = preserve_blocked_cache_on_error(
             storage,
             cache_dirty,
@@ -489,44 +685,21 @@ pub fn execute_with_args(
         Vec::new()
     };
 
-    // Track counts before output (which may move the vecs)
-    let closed_count = closed_issues.len();
-    let skipped_count = skipped_issues.len();
-
-    // Output
-    if use_json {
-        render_close_json(args, closed_issues, skipped_issues, unblocked_issues)?;
-    } else if closed_issues.is_empty() && skipped_issues.is_empty() {
-        ctx.info("No issues to close.");
-    } else {
-        for closed in &closed_issues {
-            let mut msg = format!("Closed {}: {}", closed.id, closed.title);
-            if let Some(reason) = &closed.close_reason {
-                msg.push_str(&format!(" ({reason})"));
-            }
-            ctx.success(&msg);
+    storage_ctx.flush_no_db_then(|ctx| {
+        if ctx.no_db
+            && let Some(closed) = closed_issues.last()
+        {
+            crate::util::set_last_touched_id(&ctx.paths.beads_dir, &closed.id);
         }
-        for skipped in &skipped_issues {
-            ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
-        }
-        if !unblocked_issues.is_empty() {
-            ctx.newline();
-            ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
-            for issue in &unblocked_issues {
-                ctx.print_line(&format!("  {}: {}", issue.id, issue.title));
-            }
-        }
-    }
+        Ok(())
+    })?;
 
-    storage_ctx.flush_no_db_if_dirty()?;
-
-    if closed_count == 0 && skipped_count > 0 {
-        return Err(BeadsError::NothingToDo {
-            reason: format!("all {skipped_count} issue(s) skipped"),
-        });
-    }
-
-    Ok(())
+    Ok(CloseExecution {
+        closed: closed_issues,
+        skipped: skipped_issues,
+        unblocked: unblocked_issues,
+        ordered_outcomes,
+    })
 }
 
 #[cfg(test)]

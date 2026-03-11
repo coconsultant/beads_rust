@@ -453,13 +453,53 @@ fn e2e_epic_childless_epic_not_eligible() {
     );
     assert!(close_eligible.status.success());
     let payload_close = extract_json_payload(&close_eligible.stdout);
-    // Could be empty array or object with count=0
-    let result: Value = serde_json::from_str(&payload_close).unwrap_or(Value::Array(vec![]));
-    if result.is_array() {
-        assert!(result.as_array().unwrap().is_empty());
-    } else {
-        assert_eq!(result["count"], 0);
-    }
+    let result: Value = serde_json::from_str(&payload_close).expect("close-eligible json");
+    assert_eq!(result["count"], 0);
+    assert_eq!(
+        result["closed"]
+            .as_array()
+            .expect("closed array for close-eligible")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn e2e_epic_close_eligible_dry_run_json_empty_array() {
+    let _log = common::test_log("e2e_epic_close_eligible_dry_run_json_empty_array");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create_epic = run_br(
+        &workspace,
+        ["create", "Lonely epic", "--type", "epic"],
+        "create_epic",
+    );
+    assert!(
+        create_epic.status.success(),
+        "create epic failed: {}",
+        create_epic.stderr
+    );
+
+    let dry_run = run_br(
+        &workspace,
+        ["epic", "close-eligible", "--dry-run", "--json"],
+        "close_eligible_dry_run_json_empty",
+    );
+    assert!(
+        dry_run.status.success(),
+        "dry-run failed: {}",
+        dry_run.stderr
+    );
+
+    let payload = extract_json_payload(&dry_run.stdout);
+    let result: Value = serde_json::from_str(&payload).expect("close-eligible dry-run json");
+    let eligible = result
+        .as_array()
+        .expect("dry-run close-eligible should return an array");
+    assert!(eligible.is_empty(), "expected no eligible epics");
 }
 
 #[test]

@@ -10,6 +10,8 @@ use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use rich_rust::prelude::*;
 use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use tracing::{debug, info};
 
 /// Execute the label command.
@@ -24,29 +26,22 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-
-    let config_layer = storage_ctx.load_config(cli)?;
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-    let actor = config::resolve_actor(&config_layer);
-    let storage = &mut storage_ctx.storage;
 
     match command {
-        LabelCommands::Add(args) => {
-            label_add(args, storage, &resolver, &all_ids, &actor, json, ctx)
+        LabelCommands::Add(args) => execute_routed_label_add(args, cli, ctx, &beads_dir),
+        LabelCommands::Remove(args) => execute_routed_label_remove(args, cli, ctx, &beads_dir),
+        LabelCommands::List(args) => execute_label_list_command(args, json, cli, ctx, &beads_dir),
+        LabelCommands::ListAll => {
+            let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+            label_list_all(&storage_ctx.storage, json, ctx)
         }
-        LabelCommands::Remove(args) => {
-            label_remove(args, storage, &resolver, &all_ids, &actor, json, ctx)
+        LabelCommands::Rename(args) => {
+            let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+            let config_layer = storage_ctx.load_config(cli)?;
+            let actor = config::resolve_actor(&config_layer);
+            label_rename(args, &mut storage_ctx, &actor, json, ctx)
         }
-        LabelCommands::List(args) => label_list(args, storage, &resolver, &all_ids, json, ctx),
-        LabelCommands::ListAll => label_list_all(storage, json, ctx),
-        LabelCommands::Rename(args) => label_rename(args, storage, &actor, json, ctx),
-    }?;
-
-    storage_ctx.flush_no_db_if_dirty()?;
-    Ok(())
+    }
 }
 
 /// JSON output for label add/remove operations.
@@ -127,27 +122,65 @@ fn parse_issues_and_label(
     Ok((issue_ids.to_vec(), label))
 }
 
-fn label_add(
+fn execute_routed_label_add(
     args: &LabelAddArgs,
-    storage: &mut SqliteStorage,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
+    validate_label(&label)?;
+
+    let routed_batches = config::routing::group_issue_inputs_by_route(&issue_inputs, beads_dir)?;
+    let mut routed_results = Vec::new();
+
+    for batch in routed_batches {
+        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        let config_layer = storage_ctx.load_config(&batch_cli)?;
+        let id_config = config::id_config_from_layer(&config_layer);
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        let all_ids = storage_ctx.storage.get_all_ids()?;
+        let actor = config::resolve_actor(&config_layer);
+
+        let batch_results = label_add(
+            &batch.issue_inputs,
+            &label,
+            &mut storage_ctx,
+            &resolver,
+            &all_ids,
+            &actor,
+        )?;
+        routed_results.push((batch.issue_inputs, batch_results));
+    }
+
+    let results = reorder_routed_items_by_requested_inputs(
+        &issue_inputs,
+        routed_results,
+        "label add routing",
+    )?;
+    render_label_action_results(&results, "add", ctx);
+    Ok(())
+}
+
+fn label_add(
+    issue_inputs: &[String],
+    label: &str,
+    storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
     all_ids: &[String],
     actor: &str,
-    _json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
-    let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
-
-    validate_label(&label)?;
-
+) -> Result<Vec<LabelActionResult>> {
+    let storage = &mut storage_ctx.storage;
     let mut results = Vec::new();
+    let mut last_issue_id = None;
 
-    for input in &issue_inputs {
+    for input in issue_inputs {
         let issue_id = resolve_issue_id(storage, resolver, all_ids, input)?;
 
         info!(issue_id = %issue_id, label = %label, "Adding label");
 
-        let added = storage.add_label(&issue_id, &label, actor)?;
+        let added = storage.add_label(&issue_id, label, actor)?;
 
         debug!(already_exists = !added, "Label status check");
 
@@ -158,81 +191,174 @@ fn label_add(
         results.push(LabelActionResult {
             status: if added { "added" } else { "exists" }.to_string(),
             issue_id: issue_id.clone(),
-            label: label.clone(),
+            label: label.to_string(),
         });
+        last_issue_id = Some(issue_id);
     }
 
-    if ctx.is_json() {
-        ctx.json_pretty(&results);
-    } else if matches!(ctx.mode(), OutputMode::Rich) {
-        render_label_action_results_rich(&results, "add", ctx);
-    } else {
-        for result in &results {
-            if result.status == "added" {
-                println!(
-                    "\u{2713} Added label {} to {}",
-                    result.label, result.issue_id
-                );
-            } else {
-                println!(
-                    "\u{2713} Label {} already exists on {}",
-                    result.label, result.issue_id
-                );
-            }
+    storage_ctx.flush_no_db_then(|ctx| {
+        if let Some(issue_id) = last_issue_id.as_deref() {
+            crate::util::set_last_touched_id(&ctx.paths.beads_dir, issue_id);
         }
+        Ok(())
+    })?;
+
+    Ok(results)
+}
+
+fn execute_routed_label_remove(
+    args: &LabelRemoveArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
+    let routed_batches = config::routing::group_issue_inputs_by_route(&issue_inputs, beads_dir)?;
+    let mut routed_results = Vec::new();
+
+    for batch in routed_batches {
+        let batch_cli = routed_cli_for_batch(cli, batch.is_external);
+        let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        let config_layer = storage_ctx.load_config(&batch_cli)?;
+        let id_config = config::id_config_from_layer(&config_layer);
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        let all_ids = storage_ctx.storage.get_all_ids()?;
+        let actor = config::resolve_actor(&config_layer);
+
+        let batch_results = label_remove(
+            &batch.issue_inputs,
+            &label,
+            &mut storage_ctx,
+            &resolver,
+            &all_ids,
+            &actor,
+        )?;
+        routed_results.push((batch.issue_inputs, batch_results));
     }
 
+    let results = reorder_routed_items_by_requested_inputs(
+        &issue_inputs,
+        routed_results,
+        "label remove routing",
+    )?;
+    render_label_action_results(&results, "remove", ctx);
     Ok(())
 }
 
 fn label_remove(
-    args: &LabelRemoveArgs,
-    storage: &mut SqliteStorage,
+    issue_inputs: &[String],
+    label: &str,
+    storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
     all_ids: &[String],
     actor: &str,
-    _json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
-    let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
-
+) -> Result<Vec<LabelActionResult>> {
+    let storage = &mut storage_ctx.storage;
     let mut results = Vec::new();
+    let mut last_issue_id = None;
 
-    for input in &issue_inputs {
+    for input in issue_inputs {
         let issue_id = resolve_issue_id(storage, resolver, all_ids, input)?;
 
         info!(issue_id = %issue_id, label = %label, "Removing label");
 
-        let removed = storage.remove_label(&issue_id, &label, actor)?;
+        let removed = storage.remove_label(&issue_id, label, actor)?;
 
         results.push(LabelActionResult {
             status: if removed { "removed" } else { "not_found" }.to_string(),
             issue_id: issue_id.clone(),
-            label: label.clone(),
+            label: label.to_string(),
         });
+        last_issue_id = Some(issue_id);
     }
 
-    if ctx.is_json() {
-        ctx.json_pretty(&results);
-    } else if matches!(ctx.mode(), OutputMode::Rich) {
-        render_label_action_results_rich(&results, "remove", ctx);
+    storage_ctx.flush_no_db_then(|ctx| {
+        if let Some(issue_id) = last_issue_id.as_deref() {
+            crate::util::set_last_touched_id(&ctx.paths.beads_dir, issue_id);
+        }
+        Ok(())
+    })?;
+
+    Ok(results)
+}
+
+fn execute_label_list_command(
+    args: &LabelListArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    if let Some(input) = &args.issue {
+        let route = config::routing::resolve_route(input, beads_dir)?;
+        let route_cli = routed_cli_for_batch(cli, route.is_external);
+        let storage_ctx = config::open_storage_with_cli(&route.beads_dir, &route_cli)?;
+        let config_layer = storage_ctx.load_config(&route_cli)?;
+        let id_config = config::id_config_from_layer(&config_layer);
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        let all_ids = storage_ctx.storage.get_all_ids()?;
+        label_list(args, &storage_ctx.storage, &resolver, &all_ids, json, ctx)
     } else {
-        for result in &results {
-            if result.status == "removed" {
-                println!(
-                    "\u{2713} Removed label {} from {}",
-                    result.label, result.issue_id
-                );
-            } else {
-                println!(
-                    "\u{2713} Label {} not found on {} (no-op)",
-                    result.label, result.issue_id
-                );
+        let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+        let config_layer = storage_ctx.load_config(cli)?;
+        let id_config = config::id_config_from_layer(&config_layer);
+        let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        let all_ids = storage_ctx.storage.get_all_ids()?;
+        label_list(args, &storage_ctx.storage, &resolver, &all_ids, json, ctx)
+    }
+}
+
+fn routed_cli_for_batch(cli: &config::CliOverrides, is_external: bool) -> config::CliOverrides {
+    let mut route_cli = cli.clone();
+    if is_external {
+        route_cli.db = None;
+    }
+    route_cli
+}
+
+fn render_label_action_results(
+    results: &Vec<LabelActionResult>,
+    action: &str,
+    ctx: &OutputContext,
+) {
+    if ctx.is_json() {
+        ctx.json_pretty(results);
+    } else if ctx.is_toon() {
+        ctx.toon(results);
+    } else if ctx.is_quiet() {
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_label_action_results_rich(results, action, ctx);
+    } else {
+        for result in results {
+            match (action, result.status.as_str()) {
+                ("add", "added") => {
+                    println!(
+                        "\u{2713} Added label {} to {}",
+                        result.label, result.issue_id
+                    );
+                }
+                ("add", _) => {
+                    println!(
+                        "\u{2713} Label {} already exists on {}",
+                        result.label, result.issue_id
+                    );
+                }
+                ("remove", "removed") => {
+                    println!(
+                        "\u{2713} Removed label {} from {}",
+                        result.label, result.issue_id
+                    );
+                }
+                ("remove", _) => {
+                    println!(
+                        "\u{2713} Label {} not found on {} (no-op)",
+                        result.label, result.issue_id
+                    );
+                }
+                _ => {}
             }
         }
     }
-
-    Ok(())
 }
 
 fn label_list(
@@ -250,6 +376,10 @@ fn label_list(
 
         if ctx.is_json() {
             ctx.json_pretty(&labels);
+        } else if ctx.is_toon() {
+            ctx.toon(&labels);
+        } else if ctx.is_quiet() {
+            return Ok(());
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_labels_for_issue_rich(&issue_id, &labels, ctx);
         } else if labels.is_empty() {
@@ -267,6 +397,10 @@ fn label_list(
 
         if ctx.is_json() {
             ctx.json_pretty(&unique_labels);
+        } else if ctx.is_toon() {
+            ctx.toon(&unique_labels);
+        } else if ctx.is_quiet() {
+            return Ok(());
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_unique_labels_rich(&unique_labels, ctx);
         } else if unique_labels.is_empty() {
@@ -295,6 +429,10 @@ fn label_list_all(storage: &SqliteStorage, _json: bool, ctx: &OutputContext) -> 
 
     if ctx.is_json() {
         ctx.json_pretty(&label_counts);
+    } else if ctx.is_toon() {
+        ctx.toon(&label_counts);
+    } else if ctx.is_quiet() {
+        return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_label_counts_rich(&label_counts, ctx);
     } else if label_counts.is_empty() {
@@ -316,11 +454,12 @@ fn label_list_all(storage: &SqliteStorage, _json: bool, ctx: &OutputContext) -> 
 
 fn label_rename(
     args: &LabelRenameArgs,
-    storage: &mut SqliteStorage,
+    storage_ctx: &mut config::OpenStorageResult,
     actor: &str,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let storage = &mut storage_ctx.storage;
     validate_label(&args.new_name)?;
 
     if args.old_name == args.new_name {
@@ -331,6 +470,15 @@ fn label_rename(
                 affected_issues: 0,
             };
             ctx.json_pretty(&result);
+        } else if ctx.is_toon() {
+            let result = RenameResult {
+                old_name: args.old_name.clone(),
+                new_name: args.new_name.clone(),
+                affected_issues: 0,
+            };
+            ctx.toon(&result);
+        } else if ctx.is_quiet() {
+            return Ok(());
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_rename_noop_rich(&args.old_name, ctx);
         } else {
@@ -358,6 +506,15 @@ fn label_rename(
                 affected_issues: 0,
             };
             ctx.json_pretty(&result);
+        } else if ctx.is_toon() {
+            let result = RenameResult {
+                old_name: args.old_name.clone(),
+                new_name: args.new_name.clone(),
+                affected_issues: 0,
+            };
+            ctx.toon(&result);
+        } else if ctx.is_quiet() {
+            return Ok(());
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_rename_not_found_rich(&args.old_name, ctx);
         } else {
@@ -366,6 +523,8 @@ fn label_rename(
         return Ok(());
     }
 
+    storage_ctx.flush_no_db_if_dirty()?;
+
     if ctx.is_json() {
         let result = RenameResult {
             old_name: args.old_name.clone(),
@@ -373,6 +532,15 @@ fn label_rename(
             affected_issues: count,
         };
         ctx.json_pretty(&result);
+    } else if ctx.is_toon() {
+        let result = RenameResult {
+            old_name: args.old_name.clone(),
+            new_name: args.new_name.clone(),
+            affected_issues: count,
+        };
+        ctx.toon(&result);
+    } else if ctx.is_quiet() {
+        return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_rename_result_rich(&args.old_name, &args.new_name, count, ctx);
     } else {
@@ -401,6 +569,54 @@ fn resolve_issue_id(
             |hash| Ok(find_matching_ids(all_ids, hash)),
         )
         .map(|resolved| resolved.id)
+}
+
+fn reorder_routed_items_by_requested_inputs<T>(
+    requested_inputs: &[String],
+    routed_items: Vec<(Vec<String>, Vec<T>)>,
+    context: &str,
+) -> Result<Vec<T>> {
+    let mut positions_by_input: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, input) in requested_inputs.iter().enumerate() {
+        positions_by_input
+            .entry(input.as_str())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut ordered_items: Vec<Option<T>> = (0..requested_inputs.len()).map(|_| None).collect();
+    for (batch_inputs, batch_items) in routed_items {
+        if batch_inputs.len() != batch_items.len() {
+            return Err(BeadsError::Config(format!(
+                "{context} produced mismatched issue/result counts"
+            )));
+        }
+
+        for (input, item) in batch_inputs.into_iter().zip(batch_items) {
+            let Some(index) = positions_by_input
+                .get_mut(input.as_str())
+                .and_then(VecDeque::pop_front)
+            else {
+                return Err(BeadsError::Config(format!(
+                    "{context} returned unexpected issue input {input}"
+                )));
+            };
+            ordered_items[index] = Some(item);
+        }
+    }
+
+    ordered_items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "{context} did not produce a result for {}",
+                    requested_inputs[index]
+                ))
+            })
+        })
+        .collect()
 }
 
 // ============================================================================

@@ -41,6 +41,8 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
 
     if ctx.is_json() {
         ctx.json_pretty(&output);
+    } else if ctx.is_toon() {
+        ctx.toon(&output);
     } else if ctx.is_rich() {
         render_where_rich(&output, ctx);
     } else {
@@ -81,11 +83,30 @@ fn detect_prefix(
     jsonl_path: &Path,
     cli: &config::CliOverrides,
 ) -> Option<String> {
+    if let Ok(startup) = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())
+        && let Some(prefix) = startup
+            .merged_config
+            .runtime
+            .get("issue_prefix")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+    {
+        return Some(prefix.to_string());
+    }
+
+    match inspect_jsonl_prefix(jsonl_path) {
+        JsonlPrefixState::Detected(prefix) => return Some(prefix),
+        JsonlPrefixState::Mixed => return None,
+        JsonlPrefixState::Missing => {}
+    }
+
     if let Ok(storage_ctx) = config::open_storage_with_cli(beads_dir, cli) {
-        if let Ok(Some(prefix)) = storage_ctx.storage.get_config("issue_prefix")
-            && !prefix.trim().is_empty()
-        {
-            return Some(prefix);
+        if let Ok(config_layer) = storage_ctx.load_config(cli) {
+            let prefix = config::id_config_from_layer(&config_layer).prefix;
+            if !prefix.trim().is_empty() {
+                return Some(prefix);
+            }
         }
 
         if let Ok(ids) = storage_ctx.storage.get_all_ids()
@@ -97,35 +118,62 @@ fn detect_prefix(
         }
     }
 
-    prefix_from_jsonl(jsonl_path)
+    None
 }
 
+#[cfg(test)]
 fn prefix_from_jsonl(path: &Path) -> Option<String> {
+    match inspect_jsonl_prefix(path) {
+        JsonlPrefixState::Detected(prefix) => Some(prefix),
+        JsonlPrefixState::Missing | JsonlPrefixState::Mixed => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JsonlPrefixState {
+    Missing,
+    Detected(String),
+    Mixed,
+}
+
+fn inspect_jsonl_prefix(path: &Path) -> JsonlPrefixState {
     if !path.is_file() {
-        return None;
+        return JsonlPrefixState::Missing;
     }
 
-    let file = File::open(path).ok()?;
+    let Ok(file) = File::open(path) else {
+        return JsonlPrefixState::Missing;
+    };
     let reader = BufReader::new(file);
-    for line in reader.lines().map_while(std::result::Result::ok) {
+    let mut detected_prefix: Option<String> = None;
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
 
-        let value: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
         };
         let Some(id) = value.get("id").and_then(|value| value.as_str()) else {
             continue;
         };
-        if let Ok(parsed) = parse_id(id) {
-            return Some(parsed.prefix);
+
+        let Ok(parsed) = parse_id(id) else {
+            continue;
+        };
+        match &detected_prefix {
+            None => detected_prefix = Some(parsed.prefix),
+            Some(prefix) if *prefix == parsed.prefix => {}
+            Some(_) => return JsonlPrefixState::Mixed,
         }
     }
 
-    None
+    detected_prefix.map_or(JsonlPrefixState::Missing, JsonlPrefixState::Detected)
 }
 
 fn print_human(output: &WhereOutput) {
@@ -207,6 +255,7 @@ mod tests {
     use super::*;
     use crate::config::CliOverrides;
     use crate::error::BeadsError;
+    use crate::storage::SqliteStorage;
     use std::fs;
     use tempfile::TempDir;
 
@@ -253,5 +302,70 @@ mod tests {
 
         let err = resolve_where_output(&cli).expect_err("invalid db override should error");
         assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn prefix_from_jsonl_returns_none_for_mixed_prefixes() {
+        let temp = TempDir::new().expect("tempdir");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(
+            &jsonl_path,
+            concat!(
+                r#"{"id":"proj-abc12","title":"Example"}"#,
+                "\n",
+                r#"{"id":"other-def34","title":"Second"}"#,
+                "\n",
+            ),
+        )
+        .expect("write jsonl");
+
+        assert_eq!(prefix_from_jsonl(&jsonl_path), None);
+    }
+
+    #[test]
+    fn prefix_from_jsonl_skips_invalid_json_lines() {
+        let temp = TempDir::new().expect("tempdir");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(
+            &jsonl_path,
+            concat!(
+                r#"{"id":"proj-abc12","title":"Example"}"#,
+                "\n",
+                "{invalid json}\n",
+            ),
+        )
+        .expect("write jsonl");
+
+        assert_eq!(prefix_from_jsonl(&jsonl_path), Some("proj".to_string()));
+    }
+
+    #[test]
+    fn detect_prefix_omits_storage_prefix_when_jsonl_prefixes_conflict() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("open db");
+        storage
+            .set_config("issue_prefix", "proj")
+            .expect("set issue prefix");
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(
+            &jsonl_path,
+            concat!(
+                r#"{"id":"proj-abc12","title":"Example"}"#,
+                "\n",
+                r#"{"id":"other-def34","title":"Second"}"#,
+                "\n",
+            ),
+        )
+        .expect("write mixed-prefix jsonl");
+
+        assert_eq!(
+            detect_prefix(&beads_dir, &jsonl_path, &CliOverrides::default()),
+            None
+        );
     }
 }

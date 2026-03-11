@@ -2220,11 +2220,11 @@ pub enum ConfigCommands {
     /// List all available config options
     List {
         /// Show only project config
-        #[arg(long)]
+        #[arg(long, conflicts_with = "user")]
         project: bool,
 
         /// Show only user config
-        #[arg(long)]
+        #[arg(long, conflicts_with = "project")]
         user: bool,
     },
 
