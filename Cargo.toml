@@ -138,27 +138,28 @@ opt-level = 1
 default = ["self_update"]
 self_update = ["dep:self_update"]
 
-# Override crates.io fsqlite with GitHub HEAD to pick up uring-fs removal
-# (pure-Rust UnixVfs replaces IoUringVfs, eliminating glibc 2.39 requirement)
+# Override crates.io fsqlite with a known-good Git revision that includes the
+# pure-Rust UnixVfs work. Tracking `main` directly made builds nondeterministic
+# and currently pulls a broken upstream revision into this crate.
 [patch.crates-io]
-fsqlite          = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite" }
-fsqlite-ast      = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-ast" }
-fsqlite-btree    = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-btree" }
-fsqlite-core     = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-core" }
-fsqlite-error    = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-error" }
-fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-ext-fts5" }
-fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-ext-json" }
-fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-ext-rtree" }
-fsqlite-func     = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-func" }
-fsqlite-mvcc     = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-mvcc" }
-fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-observability" }
-fsqlite-pager    = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-pager" }
-fsqlite-parser   = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-parser" }
-fsqlite-planner  = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-planner" }
-fsqlite-types    = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-types" }
-fsqlite-vdbe     = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-vdbe" }
-fsqlite-vfs      = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-vfs" }
-fsqlite-wal      = { git = "https://github.com/Dicklesworthstone/frankensqlite", branch = "main", package = "fsqlite-wal" }
+fsqlite          = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite" }
+fsqlite-ast      = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ast" }
+fsqlite-btree    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-btree" }
+fsqlite-core     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-core" }
+fsqlite-error    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-error" }
+fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ext-fts5" }
+fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ext-json" }
+fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-ext-rtree" }
+fsqlite-func     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-func" }
+fsqlite-mvcc     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-mvcc" }
+fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-observability" }
+fsqlite-pager    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-pager" }
+fsqlite-parser   = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-parser" }
+fsqlite-planner  = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-planner" }
+fsqlite-types    = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-types" }
+fsqlite-vdbe     = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-vdbe" }
+fsqlite-vfs      = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-vfs" }
+fsqlite-wal      = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "bc9bdff85ade981ff676f0dd1b15c2f50f7064f8", package = "fsqlite-wal" }
 
 [lints.rust]
 unsafe_code = "forbid"
