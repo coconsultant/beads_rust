@@ -114,6 +114,25 @@ fn assert_sqlite_header(db_path: &Path, context: &str) {
     );
 }
 
+fn resolved_database_path(fixture: &FixtureWorkspace, surface: &str) -> PathBuf {
+    let where_run = run_br(
+        &fixture.workspace,
+        ["where", "--json"],
+        &surface_label(&fixture.metadata.name, surface),
+    );
+    assert!(
+        where_run.status.success(),
+        "{} {surface} failed: {}",
+        fixture.metadata.name,
+        where_run.stderr
+    );
+    let where_json = parse_stdout_json(&where_run, &format!("{} {surface}", fixture.metadata.name));
+    where_json["database_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .expect("where output should include database_path")
+}
+
 fn assert_config_error(run: &BrRun, needle: &str, context: &str) {
     assert!(
         !run.status.success(),
@@ -182,30 +201,34 @@ fn assert_surface_outcome(
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let json = parse_stdout_json(&run, &context);
             if fixture.metadata.name == "metadata_custom_paths" && surface == "where" {
+                let expected_db_path = fixture.beads_dir.join("custom.db");
+                let expected_jsonl_path = fixture.beads_dir.join("custom.jsonl");
                 assert!(
                     json["database_path"]
                         .as_str()
-                        .is_some_and(|path| path.ends_with("/custom.db")),
+                        .is_some_and(|path| path == expected_db_path.display().to_string()),
                     "where should resolve custom database path: {json}"
                 );
                 assert!(
                     json["jsonl_path"]
                         .as_str()
-                        .is_some_and(|path| path.ends_with("/custom.jsonl")),
+                        .is_some_and(|path| path == expected_jsonl_path.display().to_string()),
                     "where should resolve custom JSONL path: {json}"
                 );
             }
             if fixture.metadata.name == "metadata_custom_paths" && surface == "info" {
+                let expected_db_path = fixture.beads_dir.join("custom.db");
+                let expected_jsonl_path = fixture.beads_dir.join("custom.jsonl");
                 assert!(
                     json["database_path"]
                         .as_str()
-                        .is_some_and(|path| path.ends_with("/custom.db")),
+                        .is_some_and(|path| path == expected_db_path.display().to_string()),
                     "info should resolve custom database path: {json}"
                 );
                 assert!(
                     json["jsonl_path"]
                         .as_str()
-                        .is_some_and(|path| path.ends_with("/custom.jsonl")),
+                        .is_some_and(|path| path == expected_jsonl_path.display().to_string()),
                     "info should resolve custom JSONL path: {json}"
                 );
             }
@@ -213,7 +236,7 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let _json = parse_stdout_json(&run, &context);
-            assert_sqlite_header(&fixture.beads_dir.join("beads.db"), &context);
+            assert_sqlite_header(&resolved_database_path(fixture, "resolved_db"), &context);
         }
         WorkspaceFailureCommandOutcome::DoctorClean => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
@@ -424,7 +447,7 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
                     })
                 {
                     assert_sqlite_header(
-                        &show_workspace.beads_dir.join("beads.db"),
+                        &resolved_database_path(&show_workspace, "core_resolved_db"),
                         &format!("{} core show", fixture.metadata.name),
                     );
                 }
@@ -531,7 +554,7 @@ fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
                 let issue_id = create_issue_id(&create_json);
                 if expected_create == WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery {
                     assert_sqlite_header(
-                        &workspace.beads_dir.join("beads.db"),
+                        &resolved_database_path(&workspace, "core_create_resolved_db"),
                         &format!("{} core create", fixture.metadata.name),
                     );
                 }

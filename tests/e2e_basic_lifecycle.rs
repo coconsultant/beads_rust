@@ -531,6 +531,7 @@ fn e2e_sync_roundtrip() {
         updated_lines.push(serde_json::to_string(&issue).expect("serialize issue"));
     }
     fs::write(&jsonl_path, updated_lines.join("\n") + "\n").expect("write jsonl");
+    let expected_jsonl = fs::read(&jsonl_path).expect("read edited jsonl bytes");
 
     sleep(Duration::from_millis(50));
 
@@ -539,6 +540,11 @@ fn e2e_sync_roundtrip() {
         sync_import.status.success(),
         "sync import failed: {}",
         sync_import.stderr
+    );
+    let post_import_jsonl = fs::read(&jsonl_path).expect("read jsonl after import");
+    assert_eq!(
+        post_import_jsonl, expected_jsonl,
+        "sync --import-only must not rewrite issues.jsonl"
     );
 
     let show = run_br(&workspace, ["show", &id, "--json"], "show_after_import");
