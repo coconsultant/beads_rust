@@ -168,6 +168,33 @@ fn e2e_beads_dir_takes_precedence_over_cwd() {
     );
 }
 
+#[test]
+fn e2e_bd_db_env_override_allows_access_outside_workspace() {
+    let _log = common::test_log("e2e_bd_db_env_override_allows_access_outside_workspace");
+
+    let actual_workspace = BrWorkspace::new();
+    let cwd_workspace = BrWorkspace::new();
+
+    let init = run_br(&actual_workspace, ["init"], "init_actual");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&actual_workspace, ["create", "BD_DB env test"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let db_path = actual_workspace.root.join(".beads").join("beads.db");
+    let env_vars = vec![("BD_DB", db_path.to_str().expect("db path"))];
+
+    let list = run_br_with_env(&cwd_workspace, ["list", "--json"], env_vars, "list_via_bd_db");
+    assert!(list.status.success(), "list via BD_DB failed: {}", list.stderr);
+
+    let payload = extract_json_payload(&list.stdout);
+    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    assert!(
+        list_json.iter().any(|item| item["title"] == "BD_DB env test"),
+        "issue not found via BD_DB override"
+    );
+}
+
 // ============================================================================
 // BEADS_JSONL tests
 // ============================================================================

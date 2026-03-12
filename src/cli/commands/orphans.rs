@@ -48,7 +48,7 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
-        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
+        output_empty(args.robot, ctx);
         return Ok(());
     };
 
@@ -95,7 +95,7 @@ fn execute_inner(
     let Some(repo_root) = git_repo_root_for_path(&storage_ctx.paths.jsonl_path)
         .or_else(|| git_repo_root_for_path(beads_dir))
     else {
-        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
+        output_empty(args.robot, ctx);
         return Ok(());
     };
 
@@ -108,7 +108,7 @@ fn execute_inner(
     );
 
     if commit_refs.is_empty() {
-        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
+        output_empty(args.robot, ctx);
         return Ok(());
     }
 
@@ -160,17 +160,23 @@ fn execute_inner(
     orphan_issues.sort_by(|a, b| a.id.cmp(&b.id));
     debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
-    if ctx.is_json() || ctx.is_toon() || args.robot {
-        if ctx.is_toon() {
-            ctx.toon(&orphans);
-        } else {
-            ctx.json_pretty(&orphans);
-        }
+    if args.robot {
+        emit_json_output(&orphans);
+        return Ok(());
+    }
+
+    if ctx.is_json() {
+        ctx.json_pretty(&orphans);
+        return Ok(());
+    }
+
+    if ctx.is_toon() {
+        ctx.toon(&orphans);
         return Ok(());
     }
 
     if orphans.is_empty() {
-        output_empty(ctx.is_json() || ctx.is_toon() || args.robot, ctx);
+        output_empty(args.robot, ctx);
         return Ok(());
     }
 
@@ -363,15 +369,24 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
     Ok(results)
 }
 
+fn emit_json_output<T: Serialize>(value: &T) {
+    let json_ctx = OutputContext::from_flags(true, false, true);
+    json_ctx.json_pretty(value);
+}
+
 /// Output empty result in appropriate format.
-fn output_empty(json: bool, ctx: &OutputContext) {
-    if json || ctx.is_json() || ctx.is_toon() {
-        let empty: Vec<OrphanIssue> = Vec::new();
-        if ctx.is_toon() {
-            ctx.toon(&empty);
-        } else {
-            ctx.json_pretty(&empty);
-        }
+fn output_empty(force_json: bool, ctx: &OutputContext) {
+    let empty: Vec<OrphanIssue> = Vec::new();
+    if force_json {
+        emit_json_output(&empty);
+        return;
+    }
+    if ctx.is_json() {
+        ctx.json_pretty(&empty);
+        return;
+    }
+    if ctx.is_toon() {
+        ctx.toon(&empty);
         return;
     }
     if ctx.is_quiet() {

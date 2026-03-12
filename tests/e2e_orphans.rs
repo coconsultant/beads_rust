@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
@@ -482,6 +482,47 @@ fn e2e_orphans_robot_flag_json_output() {
 }
 
 #[test]
+fn e2e_orphans_robot_flag_overrides_toon_env_output() {
+    common::init_test_logging();
+    info!("e2e_orphans_robot_flag_overrides_toon_env_output: starting");
+    let workspace = BrWorkspace::new();
+
+    init_git(&workspace, "git_init");
+    let init = run_br(&workspace, ["init"], "br_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Robot TOON override"], "create_issue");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    git_commit(
+        &workspace,
+        &format!("Implement TOON override ({issue_id})"),
+        "commit_ref",
+    );
+
+    let orphans = run_br_with_env(
+        &workspace,
+        ["orphans", "--robot"],
+        [("TOON_DEFAULT_FORMAT", "toon")],
+        "orphans_robot_toon_env",
+    );
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
+
+    let payload = extract_json_payload(&orphans.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse JSON");
+    assert!(
+        json.is_array(),
+        "robot flag should override TOON env and produce JSON array"
+    );
+    info!("e2e_orphans_robot_flag_overrides_toon_env_output: assertions passed");
+}
+
+#[test]
 fn e2e_orphans_empty_json_array_when_no_orphans() {
     common::init_test_logging();
     info!("e2e_orphans_empty_json_array_when_no_orphans: starting");
@@ -507,6 +548,35 @@ fn e2e_orphans_empty_json_array_when_no_orphans() {
     assert!(json.is_array());
     assert!(json.as_array().unwrap().is_empty(), "expected empty array");
     info!("e2e_orphans_empty_json_array_when_no_orphans: assertions passed");
+}
+
+#[test]
+fn e2e_orphans_empty_robot_output_overrides_toon_env_output() {
+    common::init_test_logging();
+    info!("e2e_orphans_empty_robot_output_overrides_toon_env_output: starting");
+    let workspace = BrWorkspace::new();
+
+    init_git(&workspace, "git_init");
+    let init = run_br(&workspace, ["init"], "br_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let orphans = run_br_with_env(
+        &workspace,
+        ["orphans", "--robot"],
+        [("TOON_DEFAULT_FORMAT", "toon")],
+        "orphans_empty_robot_toon_env",
+    );
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
+
+    let payload = extract_json_payload(&orphans.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse JSON");
+    assert!(json.is_array(), "robot flag should still return JSON for empty output");
+    assert!(json.as_array().unwrap().is_empty(), "expected empty array");
+    info!("e2e_orphans_empty_robot_output_overrides_toon_env_output: assertions passed");
 }
 
 #[test]

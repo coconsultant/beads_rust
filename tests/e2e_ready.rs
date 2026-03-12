@@ -184,6 +184,47 @@ fn ready_cli_excludes_in_progress_issues() {
 }
 
 #[test]
+fn ready_cli_text_reports_no_ready_issues_when_work_exists() {
+    let _log = common::test_log("ready_cli_text_reports_no_ready_issues_when_work_exists");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let claimed_issue = run_br(
+        &workspace,
+        ["create", "Claimed issue"],
+        "create_claimed_issue_text",
+    );
+    assert!(
+        claimed_issue.status.success(),
+        "create claimed failed: {}",
+        claimed_issue.stderr
+    );
+    let claimed_id = parse_created_id(&claimed_issue.stdout);
+
+    let claim = run_br(
+        &workspace,
+        ["update", &claimed_id, "--status", "in_progress"],
+        "claim_issue_text",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+
+    let result = run_br(&workspace, ["ready"], "ready_empty_text");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    assert!(
+        result.stdout.contains("No ready issues"),
+        "ready text should explain that work exists but none is ready: {}",
+        result.stdout
+    );
+    assert!(
+        !result.stdout.contains("No open issues"),
+        "ready text should not claim there are no open issues when work is in progress: {}",
+        result.stdout
+    );
+}
+
+#[test]
 fn ready_cli_filters_by_assignee() {
     let _log = common::test_log("ready_cli_filters_by_assignee");
     let (workspace, ids) = setup_workspace_with_issues();

@@ -88,6 +88,7 @@ fn execute_routed(
         outer_ctx.inherited_output_mode(),
         false,
     );
+    let quiet = cli.quiet.unwrap_or(false);
     let normalized_local_beads_dir =
         dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
 
@@ -125,18 +126,18 @@ fn execute_routed(
         }
         let details_list =
             reorder_routed_items_by_requested_inputs(&target_ids, routed_details, "show routing")?;
+        let structured_ctx = OutputContext::from_output_format(output_format, quiet, true);
 
         match output_format {
-            crate::cli::OutputFormat::Json => outer_ctx.json_pretty(&details_list),
+            crate::cli::OutputFormat::Json => structured_ctx.json_pretty(&details_list),
             crate::cli::OutputFormat::Toon => {
-                outer_ctx.toon_with_stats(&details_list, args.stats);
+                structured_ctx.toon_with_stats(&details_list, args.stats);
             }
             crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => unreachable!(),
         }
         return Ok(());
     }
 
-    let quiet = cli.quiet.unwrap_or(false);
     let mut routed_render_items = Vec::new();
     for batch in routed_batches {
         let mut batch_args = args.clone();

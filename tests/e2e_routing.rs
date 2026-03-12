@@ -14,6 +14,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
+use toon_rust::try_decode;
 
 /// Helper to create a routes.jsonl file with given entries.
 fn create_routes_file(workspace: &BrWorkspace, entries: &[(&str, &str)]) {
@@ -318,6 +319,74 @@ fn e2e_routing_routes_jsonl_external_route() {
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0]["id"].as_str(), Some(external_id.as_str()));
     assert_eq!(shown[0]["title"].as_str(), Some("External issue"));
+}
+
+#[test]
+fn e2e_routing_show_format_json_routes_external_issue() {
+    let _log = common::test_log("e2e_routing_show_format_json_routes_external_issue");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main_format_json");
+    init_workspace(&external_workspace, "init_external_format_json");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External format json issue",
+        "create_external_format_json",
+    );
+
+    let show = run_br(
+        &main_workspace,
+        ["show", &external_id, "--format", "json"],
+        "show_external_format_json",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+
+    let shown: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0]["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(
+        shown[0]["title"].as_str(),
+        Some("External format json issue")
+    );
+}
+
+#[test]
+fn e2e_routing_show_format_toon_routes_external_issue() {
+    let _log = common::test_log("e2e_routing_show_format_toon_routes_external_issue");
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+
+    init_workspace(&main_workspace, "init_main_format_toon");
+    init_workspace(&external_workspace, "init_external_format_toon");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External format toon issue",
+        "create_external_format_toon",
+    );
+
+    let show = run_br(
+        &main_workspace,
+        ["show", &external_id, "--format", "toon"],
+        "show_external_format_toon",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+
+    let shown = Value::from(try_decode(show.stdout.trim(), None).expect("valid show TOON"));
+    let items = shown.as_array().expect("show TOON array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"].as_str(), Some(external_id.as_str()));
+    assert_eq!(
+        items[0]["title"].as_str(),
+        Some("External format toon issue")
+    );
 }
 
 #[test]

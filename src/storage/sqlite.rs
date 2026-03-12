@@ -41,6 +41,10 @@ pub struct MutationContext {
     pub events: Vec<Event>,
     pub dirty_ids: HashSet<String>,
     pub invalidate_blocked_cache: bool,
+    /// When set, only these issue IDs (and their transitive parent-child
+    /// descendants) need their blocked-cache entries recomputed.  If `None`
+    /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
+    pub cache_affected_ids: Option<HashSet<String>>,
     pub force_flush: bool,
 }
 
@@ -53,6 +57,7 @@ impl MutationContext {
             events: Vec::new(),
             dirty_ids: HashSet::new(),
             invalidate_blocked_cache: false,
+            cache_affected_ids: None,
             force_flush: false,
         }
     }
@@ -97,6 +102,18 @@ impl MutationContext {
 
     pub const fn invalidate_cache(&mut self) {
         self.invalidate_blocked_cache = true;
+    }
+
+    /// Signal that only specific issues need their blocked-cache entries
+    /// recomputed (incremental update).  Merges with any previously recorded
+    /// affected IDs.  If `invalidate_cache()` was already called without
+    /// affected IDs, this is a no-op (full rebuild already scheduled).
+    pub fn invalidate_cache_for(&mut self, ids: &[&str]) {
+        self.invalidate_blocked_cache = true;
+        let set = self.cache_affected_ids.get_or_insert_with(HashSet::new);
+        for id in ids {
+            set.insert((*id).to_string());
+        }
     }
 }
 
@@ -550,7 +567,14 @@ impl SqliteStorage {
 
             // Rebuild blocked cache inside the transaction if needed
             if ctx.invalidate_blocked_cache {
-                Self::rebuild_blocked_cache_impl(&storage.conn)?;
+                match ctx.cache_affected_ids {
+                    Some(ref affected) if !affected.is_empty() => {
+                        Self::incremental_blocked_cache_update(&storage.conn, affected)?;
+                    }
+                    _ => {
+                        Self::rebuild_blocked_cache_impl(&storage.conn)?;
+                    }
+                }
             }
 
             if ctx.force_flush {
@@ -781,12 +805,20 @@ impl SqliteStorage {
     /// frankensqlite produces false positives for that query once the issue
     /// count exceeds ~20 rows (see #131).  This Rust-side DFS is immune to
     /// that bug and also avoids unbounded SQL recursion.
+    ///
+    /// Performance: All edges are bulk-loaded into an in-memory adjacency list
+    /// with a single SQL query, then BFS runs purely in memory.  This is O(V+E)
+    /// in total rather than O(V * query_latency) with per-node queries.
     fn check_cycle(
         conn: &Connection,
         issue_id: &str,
         depends_on_id: &str,
         blocking_only: bool,
     ) -> Result<bool> {
+        // Bulk-load all relevant edges into an in-memory adjacency list.
+        // This replaces per-node SQL queries with a single bulk query.
+        let adj = Self::load_cycle_check_adjacency(conn, blocking_only)?;
+
         let mut visited: HashSet<String> = HashSet::new();
         let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
 
@@ -798,34 +830,65 @@ impl SqliteStorage {
                 continue; // already visited
             }
 
-            // Get next nodes in the blocker graph
-            // 1. Standard dependencies where 'current' is the blocked issue
-            let mut sql = String::from(
-                "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type != 'parent-child'",
-            );
-            if blocking_only {
-                sql.push_str(" AND type IN ('blocks', 'conditional-blocks', 'waits-for')");
-            }
-            let rows = conn.query_with_params(&sql, &[SqliteValue::from(current.as_str())])?;
-            for row in &rows {
-                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text) {
-                    frontier.push(next_id.to_string());
-                }
-            }
-
-            // 2. Parent-child dependencies where 'current' is the parent
-            let rows = conn.query_with_params(
-                "SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child'",
-                &[SqliteValue::from(current.as_str())],
-            )?;
-            for row in &rows {
-                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text) {
-                    frontier.push(next_id.to_string());
-                }
+            if let Some(neighbors) = adj.get(&current) {
+                frontier.extend(neighbors.iter().cloned());
             }
         }
 
         Ok(false)
+    }
+
+    /// Bulk-load all dependency edges relevant to cycle detection into an
+    /// in-memory adjacency list (source -> Vec<target>).
+    ///
+    /// Two kinds of edges are included:
+    /// 1. Standard deps (issue_id -> depends_on_id) filtered by type.
+    /// 2. Parent-child edges reversed (depends_on_id -> issue_id), since a
+    ///    parent finishing requires its children to finish first.
+    fn load_cycle_check_adjacency(
+        conn: &Connection,
+        blocking_only: bool,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+
+        // 1. Standard dependencies (issue_id -> depends_on_id)
+        let sql = if blocking_only {
+            "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')"
+        } else {
+            "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type != 'parent-child'"
+        };
+        let rows = conn.query(sql)?;
+        for row in &rows {
+            if let (Some(from), Some(to)) = (
+                row.get(0).and_then(SqliteValue::as_text),
+                row.get(1).and_then(SqliteValue::as_text),
+            ) {
+                adj.entry(from.to_string())
+                    .or_default()
+                    .push(to.to_string());
+            }
+        }
+
+        // 2. Parent-child edges: parent -> child (depends_on_id is parent,
+        //    issue_id is child), so the direction in the blocker graph is
+        //    parent -> child.
+        let pc_rows = conn.query(
+            "SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'",
+        )?;
+        for row in &pc_rows {
+            if let (Some(parent), Some(child)) = (
+                row.get(0).and_then(SqliteValue::as_text),
+                row.get(1).and_then(SqliteValue::as_text),
+            ) {
+                adj.entry(parent.to_string())
+                    .or_default()
+                    .push(child.to_string());
+            }
+        }
+
+        Ok(adj)
     }
 
     /// Update an issue's fields.
@@ -2143,6 +2206,117 @@ impl SqliteStorage {
         Ok(count)
     }
 
+    /// Incremental blocked-cache update: recompute only the entries for the
+    /// given seed issue IDs and their transitive parent-child descendants.
+    ///
+    /// This avoids the full DELETE + INSERT cycle of `rebuild_blocked_cache_impl`
+    /// when only a small number of dependency edges changed.
+    fn incremental_blocked_cache_update(
+        conn: &Connection,
+        seed_ids: &HashSet<String>,
+    ) -> Result<usize> {
+        // 1. Expand seed IDs to include all transitive children via parent-child edges.
+        let children_by_parent = Self::load_local_parent_child_edges_impl(conn)?;
+        let mut affected: HashSet<String> = seed_ids.clone();
+        let mut queue: Vec<String> = seed_ids.iter().cloned().collect();
+        while let Some(id) = queue.pop() {
+            if let Some(children) = children_by_parent.get(&id) {
+                for child in children {
+                    if affected.insert(child.clone()) {
+                        queue.push(child.clone());
+                    }
+                }
+            }
+        }
+
+        // Also expand upward: if a seed is a child, its parent may be affected
+        // (e.g., open-child blocker list changes).
+        let mut parents_to_add: Vec<String> = Vec::new();
+        for (parent, children) in &children_by_parent {
+            for child in children {
+                if affected.contains(child) && !affected.contains(parent) {
+                    parents_to_add.push(parent.clone());
+                }
+            }
+        }
+        for p in parents_to_add {
+            affected.insert(p);
+        }
+
+        // 2. Compute the full blocked map (same logic as full rebuild).
+        let mut blocked_issues_map = Self::load_direct_blockers_impl(conn)?;
+        Self::propagate_blocked_parents(&mut blocked_issues_map, &children_by_parent);
+        let child_blockers = Self::load_local_open_child_blockers_impl(conn)?;
+        for (parent_id, mut blockers) in child_blockers {
+            blocked_issues_map
+                .entry(parent_id)
+                .or_default()
+                .append(&mut blockers);
+        }
+
+        // 3. Delete only affected rows from the cache.
+        for chunk in affected.iter().collect::<Vec<_>>().chunks(400) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "DELETE FROM blocked_issues_cache WHERE issue_id IN ({})",
+                placeholders.join(", ")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            conn.execute_with_params(&sql, &params)?;
+        }
+
+        // 4. Re-insert only affected rows that have blockers.
+        let mut count = 0;
+        let mut entries = Vec::new();
+        for id in &affected {
+            if let Some(mut blockers) = blocked_issues_map.remove(id.as_str()) {
+                if blockers.is_empty() {
+                    continue;
+                }
+                blockers.sort();
+                blockers.dedup();
+                let blockers_json = match serde_json::to_string(&blockers) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        tracing::warn!(
+                            issue_id = %id,
+                            %error,
+                            "Failed to serialize blocker list; treating issue as unblocked"
+                        );
+                        continue;
+                    }
+                };
+                entries.push((id.clone(), blockers_json));
+            }
+        }
+
+        for chunk in entries.chunks(450) {
+            let placeholders: Vec<&str> =
+                chunk.iter().map(|_| "(?, ?, CURRENT_TIMESTAMP)").collect();
+            let sql = format!(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
+                placeholders.join(", ")
+            );
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for (issue_id, blockers_json) in chunk {
+                params.push(SqliteValue::from(issue_id.as_str()));
+                params.push(SqliteValue::from(blockers_json.as_str()));
+            }
+            conn.execute_with_params(&sql, &params)?;
+            count += chunk.len();
+        }
+
+        tracing::debug!(
+            affected_count = affected.len(),
+            blocked_count = count,
+            "Incremental blocked cache update"
+        );
+        Ok(count)
+    }
+
     fn load_direct_blockers_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
         // Exclude external dependencies from the persisted cache because their
         // status is not locally known and must be resolved at query time.
@@ -2804,7 +2978,7 @@ impl SqliteStorage {
                 Some(format!("Added dependency on {depends_on_id} ({dep_type})")),
             );
             ctx.mark_dirty(issue_id);
-            ctx.invalidate_cache();
+            ctx.invalidate_cache_for(&[issue_id, depends_on_id]);
 
             Ok(true)
         })
@@ -2845,7 +3019,7 @@ impl SqliteStorage {
                     Some(format!("Removed dependency on {depends_on_id}")),
                 );
                 ctx.mark_dirty(issue_id);
-                ctx.invalidate_cache();
+                ctx.invalidate_cache_for(&[issue_id, depends_on_id]);
             }
 
             Ok(rows > 0)

@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_title};
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -191,8 +191,7 @@ fn execute_inner(
         }
         OutputFormat::Text | OutputFormat::Csv => {
             if ready_issues.is_empty() {
-                // Match bd empty output format
-                println!("✨ No open issues");
+                println!("{}", empty_ready_message(storage)?);
             } else if matches!(ctx.mode(), OutputMode::Rich) {
                 let columns = IssueTableColumns {
                     id: true,
@@ -231,6 +230,21 @@ fn execute_inner(
     }
 
     Ok(())
+}
+
+fn empty_ready_message(storage: &SqliteStorage) -> Result<&'static str> {
+    let has_open_issues = !storage
+        .list_issues(&ListFilters {
+            include_deferred: true,
+            limit: Some(1),
+            ..Default::default()
+        })?
+        .is_empty();
+    Ok(if has_open_issues {
+        "✨ No ready issues"
+    } else {
+        "✨ No open issues"
+    })
 }
 
 fn format_ready_line(
