@@ -100,14 +100,16 @@ impl MutationContext {
         self.dirty_ids.insert(issue_id.to_string());
     }
 
-    pub const fn invalidate_cache(&mut self) {
+    pub fn invalidate_cache(&mut self) {
         self.invalidate_blocked_cache = true;
+        // Force full rebuild by clearing any incremental affected set.
+        self.cache_affected_ids = None;
     }
 
     /// Signal that only specific issues need their blocked-cache entries
     /// recomputed (incremental update).  Merges with any previously recorded
-    /// affected IDs.  If `invalidate_cache()` was already called without
-    /// affected IDs, this is a no-op (full rebuild already scheduled).
+    /// affected IDs.  If `invalidate_cache()` was already called (which sets
+    /// `cache_affected_ids = None`), the full rebuild path takes precedence.
     pub fn invalidate_cache_for(&mut self, ids: &[&str]) {
         self.invalidate_blocked_cache = true;
         let set = self.cache_affected_ids.get_or_insert_with(HashSet::new);
