@@ -290,6 +290,31 @@ impl SqliteStorage {
         Ok(rows)
     }
 
+    /// Probe whether a rollback-only write against an issue can safely touch
+    /// the scheduling/status indexes used by update-style mutations.
+    ///
+    /// This is used to distinguish a genuine on-disk corruption problem from a
+    /// higher-level application error after a write fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns any database error raised while executing the probe.
+    pub(crate) fn probe_issue_mutation_write_path(&self, issue_id: &str) -> Result<()> {
+        self.conn.execute("BEGIN IMMEDIATE")?;
+
+        let probe_result = self.conn.execute_with_params(
+            "UPDATE issues SET priority = priority, status = status WHERE id = ?",
+            &[SqliteValue::from(issue_id)],
+        );
+        let rollback_result = self.conn.execute("ROLLBACK");
+
+        if let Err(rollback_err) = rollback_result {
+            tracing::warn!(error = %rollback_err, "ROLLBACK failed after issue write probe");
+        }
+
+        probe_result.map(|_| ()).map_err(Into::into)
+    }
+
     /// Execute a closure inside a write transaction with robust retry logic
     /// for lock contention.
     ///
