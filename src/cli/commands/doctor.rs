@@ -9,6 +9,7 @@ use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
     PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
+    validate_sync_path_with_external,
 };
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
@@ -842,6 +843,26 @@ fn discover_jsonl(beads_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn should_fallback_to_workspace_jsonl(beads_dir: &Path, paths: &config::ConfigPaths) -> bool {
+    let has_env_override = std::env::var("BEADS_JSONL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    !has_env_override
+        && paths.metadata.jsonl_export == "issues.jsonl"
+        && paths.jsonl_path == beads_dir.join("issues.jsonl")
+}
+
+fn select_doctor_jsonl_path(beads_dir: &Path, paths: &config::ConfigPaths) -> Option<PathBuf> {
+    if paths.jsonl_path.exists() {
+        Some(paths.jsonl_path.clone())
+    } else if should_fallback_to_workspace_jsonl(beads_dir, paths) {
+        discover_jsonl(beads_dir)
+    } else {
+        Some(paths.jsonl_path.clone())
+    }
+}
+
 fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -951,7 +972,7 @@ fn check_db_count(
 ///
 /// This validates that the JSONL path:
 /// 1. Does not target git internals (.git/)
-/// 2. Is within the .beads directory (or has explicit external opt-in)
+/// 2. Is within the .beads directory, or passes the configured external-path policy
 /// 3. Has an allowed extension
 #[allow(clippy::too_many_lines)]
 fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<CheckResult>) {
@@ -974,6 +995,39 @@ fn check_sync_jsonl_path(jsonl_path: &Path, beads_dir: &Path, checks: &mut Vec<C
                     "remediation": "Move JSONL file inside .beads/ directory"
                 })),
             );
+            return;
+        }
+
+        let is_external = config::resolved_jsonl_path_is_external(beads_dir, jsonl_path);
+        if is_external {
+            match validate_sync_path_with_external(jsonl_path, beads_dir, true) {
+                Ok(()) => {
+                    push_check(
+                        checks,
+                        check_name,
+                        CheckStatus::Ok,
+                        Some("Configured external JSONL path is valid for sync I/O".to_string()),
+                        Some(serde_json::json!({
+                            "path": jsonl_path.display().to_string(),
+                            "beads_dir": beads_dir.display().to_string(),
+                            "external": true
+                        })),
+                    );
+                }
+                Err(err) => {
+                    push_check(
+                        checks,
+                        check_name,
+                        CheckStatus::Error,
+                        Some(format!("Configured external JSONL path is invalid: {err}")),
+                        Some(serde_json::json!({
+                            "path": jsonl_path.display().to_string(),
+                            "beads_dir": beads_dir.display().to_string(),
+                            "external": true
+                        })),
+                    );
+                }
+            }
             return;
         }
 
@@ -1294,11 +1348,7 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
 
     check_merge_artifacts(beads_dir, &mut checks)?;
 
-    let jsonl_path = if paths.jsonl_path.exists() {
-        Some(paths.jsonl_path.clone())
-    } else {
-        discover_jsonl(beads_dir)
-    };
+    let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
         check_sync_jsonl_path(path, beads_dir, &mut checks);
         check_sync_conflict_markers(path, &mut checks);
@@ -1676,6 +1726,120 @@ mod tests {
                 .is_some_and(|message| message.contains("Failed to inspect recoverable anomalies")),
             "unexpected check message: {:?}",
             anomaly_check.message
+        );
+    }
+
+    #[test]
+    fn test_select_doctor_jsonl_path_keeps_missing_explicit_override() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let configured_jsonl = beads_dir.join("custom.jsonl");
+        let legacy_jsonl = beads_dir.join("issues.jsonl");
+        fs::write(&legacy_jsonl, "{\"id\":\"bd-legacy\"}\n").unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path: beads_dir.join("beads.db"),
+            jsonl_path: configured_jsonl.clone(),
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: "custom.jsonl".to_string(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        assert_eq!(
+            select_doctor_jsonl_path(&beads_dir, &paths),
+            Some(configured_jsonl)
+        );
+    }
+
+    #[test]
+    fn test_collect_doctor_report_surfaces_missing_explicit_metadata_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let configured_jsonl = beads_dir.join("custom.jsonl");
+        fs::write(beads_dir.join("issues.jsonl"), "{\"id\":\"bd-legacy\"}\n").unwrap();
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path: configured_jsonl.clone(),
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: "custom.jsonl".to_string(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let parse_check = find_check(&report.report.checks, "jsonl.parse").expect("jsonl parse");
+
+        assert!(matches!(parse_check.status, CheckStatus::Error));
+        assert_eq!(report.jsonl_path, Some(configured_jsonl.clone()));
+        assert_eq!(
+            parse_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some(configured_jsonl.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn test_collect_doctor_report_accepts_configured_external_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let external_jsonl = external_dir.join("issues.jsonl");
+        fs::write(&external_jsonl, "{\"id\":\"bd-external\"}\n").unwrap();
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path: external_jsonl.clone(),
+            metadata: config::Metadata {
+                database: "beads.db".to_string(),
+                jsonl_export: external_jsonl.to_string_lossy().into_owned(),
+                backend: None,
+                deletions_retention_days: None,
+            },
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let sync_path_check =
+            find_check(&report.report.checks, "sync_jsonl_path").expect("sync path check");
+
+        assert!(matches!(sync_path_check.status, CheckStatus::Ok));
+        assert_eq!(
+            sync_path_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some(external_jsonl.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            sync_path_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("external"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 

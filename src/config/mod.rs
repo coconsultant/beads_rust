@@ -214,6 +214,23 @@ fn discover_beads_dir_with_env(
         return resolve_explicit_beads_dir(&path, "BEADS_DIR");
     }
 
+    let candidate = discover_beads_dir_candidate_with_env(start, None)?;
+    routing::follow_redirects(&candidate, 10)
+}
+
+fn discover_beads_dir_candidate_with_env(
+    start: Option<&Path>,
+    env_override: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = env_override {
+        return validate_explicit_beads_dir(path, "beads directory override");
+    } else if let Ok(value) = env::var("BEADS_DIR")
+        && !value.trim().is_empty()
+    {
+        let path = PathBuf::from(value);
+        return validate_explicit_beads_dir(&path, "BEADS_DIR");
+    }
+
     let mut current = match start {
         Some(path) => path.to_path_buf(),
         None => env::current_dir()?,
@@ -222,7 +239,7 @@ fn discover_beads_dir_with_env(
     loop {
         let candidate = current.join(".beads");
         if candidate.is_dir() {
-            return routing::follow_redirects(&candidate, 10);
+            return Ok(candidate);
         }
 
         if !current.pop() {
@@ -272,6 +289,16 @@ pub fn discover_optional_beads_dir_with_cli(cli: &CliOverrides) -> Result<Option
     }
 }
 
+pub(crate) fn discover_optional_beads_dir_candidate_with_cli(
+    cli: &CliOverrides,
+) -> Result<Option<PathBuf>> {
+    match discover_beads_dir_candidate_with_cli_from(None, cli, None, None) {
+        Ok(path) => Ok(Some(path)),
+        Err(BeadsError::NotInitialized) if cli.db.is_none() => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 fn discover_beads_dir_with_cli_from(
     start: Option<&Path>,
     cli: &CliOverrides,
@@ -294,6 +321,41 @@ fn discover_beads_dir_with_cli_from(
     }
 
     discover_beads_dir_with_env(start, beads_dir_env_override).map_err(
+        |err| match (err, startup_db_override.as_deref()) {
+            (BeadsError::NotInitialized, Some(db_path)) => BeadsError::WithContext {
+                context: format!(
+                    "Cannot resolve the project .beads directory for database override '{}'; run from the target workspace or set BEADS_DIR",
+                    db_path.display()
+                ),
+                source: Box::new(BeadsError::NotInitialized),
+            },
+            (err, _) => err,
+        },
+    )
+}
+
+fn discover_beads_dir_candidate_with_cli_from(
+    start: Option<&Path>,
+    cli: &CliOverrides,
+    beads_dir_env_override: Option<&Path>,
+    db_env_override: Option<&Path>,
+) -> Result<PathBuf> {
+    let startup_db_override = cli
+        .db
+        .clone()
+        .or_else(|| db_env_override.map(Path::to_path_buf))
+        .or_else(startup_db_override_from_env);
+
+    if let Some(db_path) = startup_db_override.as_deref()
+        && let Ok(beads_dir) = derive_beads_dir_from_db_path(db_path)
+    {
+        return validate_explicit_beads_dir(
+            &beads_dir,
+            &format!("database override '{}'", db_path.display()),
+        );
+    }
+
+    discover_beads_dir_candidate_with_env(start, beads_dir_env_override).map_err(
         |err| match (err, startup_db_override.as_deref()) {
             (BeadsError::NotInitialized, Some(db_path)) => BeadsError::WithContext {
                 context: format!(
@@ -331,7 +393,7 @@ fn derive_beads_dir_from_db_path(db_path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
+fn validate_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
     if !path.is_dir() {
         return Err(BeadsError::Config(format!(
             "{source} not found or not a .beads directory: {}",
@@ -339,7 +401,12 @@ fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
         )));
     }
 
-    routing::follow_redirects(path, 10).map_err(|err| BeadsError::WithContext {
+    Ok(path.to_path_buf())
+}
+
+fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
+    let candidate = validate_explicit_beads_dir(path, source)?;
+    routing::follow_redirects(&candidate, 10).map_err(|err| BeadsError::WithContext {
         context: format!("{source} is invalid"),
         source: Box::new(err),
     })
@@ -2554,6 +2621,22 @@ labels:
         fs::create_dir_all(&beads_dir).expect("create beads dir");
         fs::create_dir_all(&start).expect("create nested dir");
 
+        let discovered = discover_beads_dir_with_cli_from(
+            Some(&start),
+            &CliOverrides::default(),
+            None,
+            Some(Path::new("/tmp/not-a-beads-db")),
+        )
+        .expect("external env db should still reuse discovered workspace");
+        assert_eq!(discovered, beads_dir);
+    }
+
+    #[test]
+    fn discover_beads_dir_with_cli_from_errors_for_external_db_override_without_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        let start = temp.path().join("nested").join("dir");
+        fs::create_dir_all(&start).expect("create nested dir");
+
         let err = discover_beads_dir_with_cli_from(
             Some(&start),
             &CliOverrides::default(),
@@ -3117,7 +3200,7 @@ routing:
         };
 
         let resolved = resolve_jsonl_path(&beads_dir, &metadata, None);
-        // This SHOULD be custom.jsonl, but current Priority 2 bug forces issues.jsonl
+        // Metadata override should win over discovered legacy/default filenames.
         assert_eq!(resolved, beads_dir.join("custom.jsonl"));
     }
 
@@ -3228,7 +3311,7 @@ routing:
         let metadata = Metadata::load(&beads_dir).expect("metadata");
         let resolved = resolve_jsonl_path(&beads_dir, &metadata, Some(&db_override));
 
-        // This SHOULD be custom-name.jsonl, but current Priority 2 bug forces issues.jsonl
+        // Metadata override should still win when the database path is explicit.
         assert_eq!(
             resolved,
             beads_dir.join("custom-name.jsonl"),

@@ -53,15 +53,15 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
 }
 
 fn resolve_where_output(cli: &config::CliOverrides) -> Result<Option<WhereOutput>> {
-    let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
+    let Some(source_dir) = config::discover_optional_beads_dir_candidate_with_cli(cli)? else {
         return Ok(None);
     };
 
-    let final_dir = follow_redirects(&beads_dir, 10)?;
-    let redirected_from = if final_dir == beads_dir {
+    let final_dir = follow_redirects(&source_dir, 10)?;
+    let redirected_from = if final_dir == source_dir {
         None
     } else {
-        Some(canonicalize_lossy(&beads_dir).display().to_string())
+        Some(canonicalize_lossy(&source_dir).display().to_string())
     };
 
     let paths = config::resolve_paths(&final_dir, cli.db.as_ref())?;
@@ -256,8 +256,31 @@ mod tests {
     use crate::config::CliOverrides;
     use crate::error::BeadsError;
     use crate::storage::SqliteStorage;
+    use std::env;
     use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static TEST_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DirGuard {
+        previous: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(target: &Path) -> Self {
+            let previous = env::current_dir().expect("current dir");
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+        }
+    }
 
     #[test]
     fn resolve_where_output_uses_explicit_db_override() {
@@ -289,6 +312,56 @@ mod tests {
         assert_eq!(
             output.jsonl_path,
             Some(canonicalize_lossy(&jsonl_path).display().to_string())
+        );
+        assert_eq!(output.prefix.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn resolve_where_output_preserves_redirect_origin() {
+        let _lock = TEST_DIR_LOCK.lock().expect("test dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let source_root = temp.path().join("source");
+        let target_root = temp.path().join("target");
+        let source_beads = source_root.join(".beads");
+        let target_beads = target_root.join(".beads");
+
+        fs::create_dir_all(&source_beads).expect("create source beads dir");
+        fs::create_dir_all(&target_beads).expect("create target beads dir");
+        fs::write(source_beads.join("redirect"), "../../target/.beads").expect("write redirect");
+        fs::write(
+            target_beads.join("issues.jsonl"),
+            r#"{"id":"proj-abc12","title":"Example"}"#,
+        )
+        .expect("write jsonl");
+
+        let _guard = DirGuard::new(&source_root);
+        let output = resolve_where_output(&CliOverrides::default())
+            .expect("where output")
+            .expect("workspace output");
+
+        assert_eq!(
+            output.path,
+            canonicalize_lossy(&target_beads).display().to_string()
+        );
+        assert_eq!(
+            output.redirected_from,
+            Some(canonicalize_lossy(&source_beads).display().to_string())
+        );
+        assert_eq!(
+            output.database_path,
+            Some(
+                canonicalize_lossy(&target_beads.join("beads.db"))
+                    .display()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            output.jsonl_path,
+            Some(
+                canonicalize_lossy(&target_beads.join("issues.jsonl"))
+                    .display()
+                    .to_string()
+            )
         );
         assert_eq!(output.prefix.as_deref(), Some("proj"));
     }
