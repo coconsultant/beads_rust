@@ -368,7 +368,7 @@ impl ParsedId {
         let full_id = self.to_id_string();
         full_id.starts_with(potential_parent)
             && full_id.len() > potential_parent.len()
-            && full_id.chars().nth(potential_parent.len()) == Some('.')
+            && full_id[potential_parent.len()..].starts_with('.')
     }
 }
 

@@ -4700,7 +4700,8 @@ mod tests {
 
         let err = restore_foreign_keys_after_import(&storage, true).unwrap_err();
         assert!(
-            err.to_string().contains("orphaned rows in comments.issue_id"),
+            err.to_string()
+                .contains("orphaned rows in comments.issue_id"),
             "unexpected error: {err}"
         );
 

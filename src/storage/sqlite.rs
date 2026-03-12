@@ -2143,9 +2143,9 @@ impl SqliteStorage {
     fn load_direct_blockers_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
         let rows = conn.query(
             r"
-            // Direct dependencies (blocks, conditional-blocks, waits-for)
-            // Exclude external dependencies from the cache as their status is
-            // not locally known and must be resolved at runtime.
+            -- Direct dependencies (blocks, conditional-blocks, waits-for)
+            -- Exclude external dependencies from the cache as their status is
+            -- not locally known and must be resolved at runtime.
             SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
             FROM dependencies d
             LEFT JOIN issues i ON d.depends_on_id = i.id
