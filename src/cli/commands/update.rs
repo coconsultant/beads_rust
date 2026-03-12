@@ -1,6 +1,6 @@
 //! Update command implementation.
 
-use super::resolve_issue_id;
+use super::{resolve_issue_id, update_issue_with_recovery};
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -268,33 +268,62 @@ fn execute_prepared_route(
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
     let mut render_items = Vec::new();
     let resolved_ids = prepared.resolved_ids.clone();
-    let storage = &mut prepared.storage_ctx.storage;
+    let mut route_has_mutated = false;
 
     for id in &prepared.resolved_ids {
         // Get issue before update for change tracking
-        let issue_before = storage.get_issue(id)?;
+        let issue_before = prepared.storage_ctx.storage.get_issue(id)?;
 
         // Apply basic field updates
         if !prepared.update.is_empty() {
-            storage.update_issue(id, &prepared.update, &prepared.actor)?;
+            update_issue_with_recovery(
+                &mut prepared.storage_ctx,
+                !route_has_mutated,
+                "update",
+                id,
+                &prepared.update,
+                &prepared.actor,
+            )?;
+            route_has_mutated = true;
         }
 
         // Apply labels
         for label in &prepared.add_labels {
-            storage.add_label(id, label, &prepared.actor)?;
+            prepared
+                .storage_ctx
+                .storage
+                .add_label(id, label, &prepared.actor)?;
+            route_has_mutated = true;
         }
         for label in &prepared.remove_labels {
-            storage.remove_label(id, label, &prepared.actor)?;
+            prepared
+                .storage_ctx
+                .storage
+                .remove_label(id, label, &prepared.actor)?;
+            route_has_mutated = true;
         }
         if prepared.set_labels {
-            storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor)?;
+            prepared.storage_ctx.storage.set_labels(
+                id,
+                &prepared.valid_set_labels,
+                &prepared.actor,
+            )?;
+            route_has_mutated = true;
         }
 
         // Apply parent
-        apply_parent_update(storage, id, &prepared.resolved_parent, &prepared.actor)?;
+        apply_parent_update(
+            &mut prepared.storage_ctx.storage,
+            id,
+            &prepared.resolved_parent,
+            &prepared.actor,
+        )?;
+        if !matches!(&prepared.resolved_parent, ParentUpdatePlan::Unchanged) {
+            route_has_mutated = true;
+        }
 
         // Get issue after update for output
-        let issue_after = storage.get_issue(id)?;
+        let issue_after = prepared.storage_ctx.storage.get_issue(id)?;
 
         if let Some(issue) = issue_after {
             if ctx.is_json() || ctx.is_toon() {

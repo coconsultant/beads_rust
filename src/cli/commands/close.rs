@@ -1,7 +1,7 @@
 //! Close command implementation.
 
 use crate::cli::CloseArgs as CliCloseArgs;
-use crate::cli::commands::preserve_blocked_cache_on_error;
+use crate::cli::commands::{preserve_blocked_cache_on_error, update_issue_with_recovery};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Status};
@@ -452,7 +452,6 @@ fn execute_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
 
     let resolved_ids = resolver.resolve_all(
         &args.ids,
@@ -460,9 +459,10 @@ fn execute_route(
         |hash| find_matching_ids(&all_ids, hash),
     )?;
 
-    let epic_counts = storage.get_epic_counts()?;
+    let epic_counts = storage_ctx.storage.get_epic_counts()?;
     let blocked_before: Vec<String> = if args.suggest_next {
-        storage
+        storage_ctx
+            .storage
             .get_blocked_issues()?
             .into_iter()
             .map(|(i, _)| i.id)
@@ -487,8 +487,13 @@ fn execute_route(
         let id = &resolved.id;
         tracing::info!(id = %id, "Closing issue");
 
-        let Some(issue) =
-            preserve_blocked_cache_on_error(storage, cache_dirty, "close", storage.get_issue(id))?
+        let issue_result = storage_ctx.storage.get_issue(id);
+        let Some(issue) = preserve_blocked_cache_on_error(
+            &mut storage_ctx.storage,
+            cache_dirty,
+            "close",
+            issue_result,
+        )?
         else {
             let skipped = SkippedIssue {
                 id: id.clone(),
@@ -536,24 +541,27 @@ fn execute_route(
             continue;
         }
 
+        let is_blocked_result = storage_ctx.storage.is_blocked(id);
         let mut blocker_ids = if preserve_blocked_cache_on_error(
-            storage,
+            &mut storage_ctx.storage,
             cache_dirty,
             "close",
-            storage.is_blocked(id),
+            is_blocked_result,
         )? {
+            let blockers_result = storage_ctx.storage.get_blockers(id);
             let mut blockers = preserve_blocked_cache_on_error(
-                storage,
+                &mut storage_ctx.storage,
                 cache_dirty,
                 "close",
-                storage.get_blockers(id),
+                blockers_result,
             )?;
             if blockers.is_empty() {
+                let dependencies_result = storage_ctx.storage.get_dependencies(id);
                 blockers = preserve_blocked_cache_on_error(
-                    storage,
+                    &mut storage_ctx.storage,
                     cache_dirty,
                     "close",
-                    storage.get_dependencies(id),
+                    dependencies_result,
                 )?;
             }
             blockers
@@ -625,8 +633,20 @@ fn execute_route(
             ..Default::default()
         };
 
-        let update_result = storage.update_issue(id, &update, &actor);
-        preserve_blocked_cache_on_error(storage, cache_dirty, "close", update_result)?;
+        let update_result = update_issue_with_recovery(
+            &mut storage_ctx,
+            !cache_dirty,
+            "close",
+            id,
+            &update,
+            &actor,
+        );
+        preserve_blocked_cache_on_error(
+            &mut storage_ctx.storage,
+            cache_dirty,
+            "close",
+            update_result,
+        )?;
         cache_dirty = true;
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
 
@@ -646,15 +666,16 @@ fn execute_route(
             "Rebuilding blocked cache after closing {} issues",
             closed_issues.len()
         );
-        storage.rebuild_blocked_cache(true)?;
+        storage_ctx.storage.rebuild_blocked_cache(true)?;
     }
 
     let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {
+        let blocked_after_result = storage_ctx.storage.get_blocked_issues();
         let blocked_after: Vec<String> = preserve_blocked_cache_on_error(
-            storage,
+            &mut storage_ctx.storage,
             cache_dirty,
             "close",
-            storage.get_blocked_issues(),
+            blocked_after_result,
         )?
         .into_iter()
         .map(|(i, _)| i.id)
@@ -669,11 +690,12 @@ fn execute_route(
 
         let mut unblocked = Vec::new();
         for uid in newly_unblocked {
+            let issue_result = storage_ctx.storage.get_issue(&uid);
             if let Some(issue) = preserve_blocked_cache_on_error(
-                storage,
+                &mut storage_ctx.storage,
                 cache_dirty,
                 "close",
-                storage.get_issue(&uid),
+                issue_result,
             )? && issue.status.is_active()
             {
                 unblocked.push(UnblockedIssue {

@@ -1,4 +1,7 @@
-use crate::storage::SqliteStorage;
+use crate::config;
+use crate::error::BeadsError;
+use crate::model::Issue;
+use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, find_matching_ids};
 
 pub mod agents;
@@ -95,6 +98,58 @@ pub(super) fn preserve_blocked_cache_on_error<T>(
                 });
             }
             Err(operation_err)
+        }
+    }
+}
+
+pub(super) fn update_issue_with_recovery(
+    storage_ctx: &mut config::OpenStorageResult,
+    allow_recovery: bool,
+    command: &str,
+    issue_id: &str,
+    update: &IssueUpdate,
+    actor: &str,
+) -> crate::Result<Issue> {
+    match storage_ctx.storage.update_issue(issue_id, update, actor) {
+        Ok(issue) => Ok(issue),
+        Err(update_err) => {
+            if !allow_recovery || !matches!(update_err, BeadsError::Database(_)) {
+                return Err(update_err);
+            }
+
+            let probe_err = match storage_ctx
+                .storage
+                .probe_issue_mutation_write_path(issue_id)
+            {
+                Ok(()) => return Err(update_err),
+                Err(probe_err) => probe_err,
+            };
+
+            if !storage_ctx.should_attempt_jsonl_recovery(&probe_err) {
+                return Err(update_err);
+            }
+
+            tracing::warn!(
+                command = command,
+                issue_id = %issue_id,
+                original_error = %update_err,
+                probe_error = %probe_err,
+                db_path = %storage_ctx.paths.db_path.display(),
+                jsonl_path = %storage_ctx.paths.jsonl_path.display(),
+                "Issue write hit a recoverable database corruption path; rebuilding from JSONL and retrying once"
+            );
+
+            let original_error = update_err.to_string();
+            storage_ctx.recover_database_from_jsonl().map_err(|recovery_err| {
+                BeadsError::WithContext {
+                    context: format!(
+                        "automatic database recovery failed after {command} write for issue '{issue_id}'; original write error: {original_error}"
+                    ),
+                    source: Box::new(recovery_err),
+                }
+            })?;
+
+            storage_ctx.storage.update_issue(issue_id, update, actor)
         }
     }
 }

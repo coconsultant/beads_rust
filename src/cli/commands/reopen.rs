@@ -1,7 +1,7 @@
 //! Reopen command implementation.
 
 use crate::cli::ReopenArgs;
-use crate::cli::commands::preserve_blocked_cache_on_error;
+use crate::cli::commands::{preserve_blocked_cache_on_error, update_issue_with_recovery};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
@@ -177,7 +177,6 @@ fn execute_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
 
     let resolved_ids = resolver.resolve_all(
         &args.ids,
@@ -194,8 +193,13 @@ fn execute_route(
         let id = &resolved.id;
         tracing::info!(id = %id, "Reopening issue");
 
-        let Some(issue) =
-            preserve_blocked_cache_on_error(storage, cache_dirty, "reopen", storage.get_issue(id))?
+        let issue_result = storage_ctx.storage.get_issue(id);
+        let Some(issue) = preserve_blocked_cache_on_error(
+            &mut storage_ctx.storage,
+            cache_dirty,
+            "reopen",
+            issue_result,
+        )?
         else {
             let skipped = SkippedIssue {
                 id: id.clone(),
@@ -243,16 +247,33 @@ fn execute_route(
             ..Default::default()
         };
 
-        let update_result = storage.update_issue(id, &update, &actor);
-        preserve_blocked_cache_on_error(storage, cache_dirty, "reopen", update_result)?;
+        let update_result = update_issue_with_recovery(
+            &mut storage_ctx,
+            !cache_dirty,
+            "reopen",
+            id,
+            &update,
+            &actor,
+        );
+        preserve_blocked_cache_on_error(
+            &mut storage_ctx.storage,
+            cache_dirty,
+            "reopen",
+            update_result,
+        )?;
         cache_dirty = true;
         tracing::info!(id = %id, reason = ?args.reason, "Issue reopened");
 
         if let Some(ref reason) = args.reason {
             let comment_text = format!("Reopened: {reason}");
             tracing::debug!(id = %id, "Adding reopen comment");
-            let comment_result = storage.add_comment(id, &actor, &comment_text);
-            preserve_blocked_cache_on_error(storage, cache_dirty, "reopen", comment_result)?;
+            let comment_result = storage_ctx.storage.add_comment(id, &actor, &comment_text);
+            preserve_blocked_cache_on_error(
+                &mut storage_ctx.storage,
+                cache_dirty,
+                "reopen",
+                comment_result,
+            )?;
         }
 
         let reopened = ReopenedIssue {
@@ -270,7 +291,7 @@ fn execute_route(
             "Rebuilding blocked cache after reopening {} issues",
             reopened_issues.len()
         );
-        storage.rebuild_blocked_cache(true)?;
+        storage_ctx.storage.rebuild_blocked_cache(true)?;
     }
 
     storage_ctx.flush_no_db_if_dirty()?;

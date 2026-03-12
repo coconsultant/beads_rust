@@ -1,6 +1,6 @@
 //! Defer and Undefer command implementations.
 
-use crate::cli::commands::preserve_blocked_cache_on_error;
+use crate::cli::commands::{preserve_blocked_cache_on_error, update_issue_with_recovery};
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -188,7 +188,6 @@ fn execute_defer_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
 
     let defer_until = args
         .until
@@ -211,8 +210,13 @@ fn execute_defer_route(
         let id = &resolved.id;
         tracing::info!(id = %id, until = ?defer_until, "Deferring issue");
 
-        let Some(issue) =
-            preserve_blocked_cache_on_error(storage, cache_dirty, "defer", storage.get_issue(id))?
+        let issue_result = storage_ctx.storage.get_issue(id);
+        let Some(issue) = preserve_blocked_cache_on_error(
+            &mut storage_ctx.storage,
+            cache_dirty,
+            "defer",
+            issue_result,
+        )?
         else {
             let skipped = SkippedIssue {
                 id: id.clone(),
@@ -252,8 +256,20 @@ fn execute_defer_route(
             ..Default::default()
         };
 
-        let update_result = storage.update_issue(id, &update, &actor);
-        preserve_blocked_cache_on_error(storage, cache_dirty, "defer", update_result)?;
+        let update_result = update_issue_with_recovery(
+            &mut storage_ctx,
+            !cache_dirty,
+            "defer",
+            id,
+            &update,
+            &actor,
+        );
+        preserve_blocked_cache_on_error(
+            &mut storage_ctx.storage,
+            cache_dirty,
+            "defer",
+            update_result,
+        )?;
         cache_dirty = true;
         tracing::info!(id = %id, defer_until = ?defer_until, "Issue deferred");
 
@@ -273,7 +289,7 @@ fn execute_defer_route(
             "Rebuilding blocked cache after deferring {} issues",
             deferred_issues.len()
         );
-        storage.rebuild_blocked_cache(true)?;
+        storage_ctx.storage.rebuild_blocked_cache(true)?;
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -410,7 +426,6 @@ fn execute_undefer_route(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
-    let storage = &mut storage_ctx.storage;
 
     let resolved_ids = resolver.resolve_all(
         &args.ids,
@@ -427,11 +442,12 @@ fn execute_undefer_route(
         let id = &resolved.id;
         tracing::info!(id = %id, "Undeferring issue");
 
+        let issue_result = storage_ctx.storage.get_issue(id);
         let Some(issue) = preserve_blocked_cache_on_error(
-            storage,
+            &mut storage_ctx.storage,
             cache_dirty,
             "undefer",
-            storage.get_issue(id),
+            issue_result,
         )?
         else {
             let skipped = SkippedIssue {
@@ -468,8 +484,20 @@ fn execute_undefer_route(
             ..Default::default()
         };
 
-        let update_result = storage.update_issue(id, &update, &actor);
-        preserve_blocked_cache_on_error(storage, cache_dirty, "undefer", update_result)?;
+        let update_result = update_issue_with_recovery(
+            &mut storage_ctx,
+            !cache_dirty,
+            "undefer",
+            id,
+            &update,
+            &actor,
+        );
+        preserve_blocked_cache_on_error(
+            &mut storage_ctx.storage,
+            cache_dirty,
+            "undefer",
+            update_result,
+        )?;
         cache_dirty = true;
         tracing::info!(id = %id, "Issue undeferred");
 
@@ -489,7 +517,7 @@ fn execute_undefer_route(
             "Rebuilding blocked cache after undeferring {} issues",
             undeferred_issues.len()
         );
-        storage.rebuild_blocked_cache(true)?;
+        storage_ctx.storage.rebuild_blocked_cache(true)?;
     }
 
     storage_ctx.flush_no_db_if_dirty()?;

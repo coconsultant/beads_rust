@@ -459,7 +459,7 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
     ) || matches!(
         open_err,
         BeadsError::Database(FrankenError::Internal(detail))
-            if is_duplicate_schema_entry_open_error(detail)
+            if is_recoverable_database_internal_error(detail)
     )
 }
 
@@ -486,6 +486,15 @@ fn is_duplicate_schema_entry_open_error(detail: &str) -> bool {
         || detail_lower
             .strip_prefix("index ")
             .is_some_and(|rest| rest.ends_with(" already exists"))
+}
+
+fn is_recoverable_database_internal_error(detail: &str) -> bool {
+    let detail_lower = detail.trim().to_ascii_lowercase();
+
+    is_duplicate_schema_entry_open_error(detail)
+        || detail_lower.contains("database disk image is malformed")
+        || detail_lower.contains("malformed database disk image")
+        || detail_lower.contains("missing from index")
 }
 
 fn rebuild_database_from_jsonl(
@@ -833,6 +842,8 @@ pub struct OpenStorageResult {
     pub paths: ConfigPaths,
     pub no_db: bool,
     startup_layers: Vec<ConfigLayer>,
+    bootstrap_layer: ConfigLayer,
+    resolved_lock_timeout: Option<u64>,
     loaded_jsonl_hash: Option<String>,
 }
 
@@ -850,6 +861,39 @@ impl OpenStorageResult {
             Some(&self.storage),
             cli,
         )
+    }
+
+    #[must_use]
+    pub(crate) fn should_attempt_jsonl_recovery(&self, err: &BeadsError) -> bool {
+        !self.no_db
+            && should_attempt_jsonl_recovery(err, &self.paths.db_path, &self.paths.jsonl_path)
+    }
+
+    /// Rebuild the current SQLite database from the resolved JSONL export.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if recovery fails or if this context is in `--no-db`
+    /// mode.
+    pub(crate) fn recover_database_from_jsonl(&mut self) -> Result<()> {
+        if self.no_db {
+            return Err(BeadsError::Config(
+                "cannot rebuild SQLite database from JSONL while --no-db mode is active"
+                    .to_string(),
+            ));
+        }
+
+        let (storage, _) = repair_database_from_jsonl(
+            &self.paths.beads_dir,
+            &self.paths.db_path,
+            &self.paths.jsonl_path,
+            self.resolved_lock_timeout,
+            &self.bootstrap_layer,
+            false,
+        )?;
+        self.storage = storage;
+        self.loaded_jsonl_hash = None;
+        Ok(())
     }
 
     /// Flush JSONL if no-db mode is enabled and there are pending changes.
@@ -988,6 +1032,8 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             paths,
             no_db,
             startup_layers,
+            bootstrap_layer: merged_layer,
+            resolved_lock_timeout,
             loaded_jsonl_hash,
         })
     } else {
@@ -1002,6 +1048,8 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
             paths,
             no_db,
             startup_layers,
+            bootstrap_layer: merged_layer,
+            resolved_lock_timeout,
             loaded_jsonl_hash: None,
         })
     }
@@ -3263,6 +3311,20 @@ routing:
             &BeadsError::Database(FrankenError::Internal(
                 "malformed database schema (blocked_issues_cache) - table \"blocked_issues_cache\" already exists"
                     .to_string()
+            )),
+            &db_path,
+            &jsonl_path
+        ));
+        assert!(should_attempt_jsonl_recovery(
+            &BeadsError::Database(FrankenError::Internal(
+                "database disk image is malformed".to_string()
+            )),
+            &db_path,
+            &jsonl_path
+        ));
+        assert!(should_attempt_jsonl_recovery(
+            &BeadsError::Database(FrankenError::Internal(
+                "row 13 missing from index idx_issues_list_active_order".to_string()
             )),
             &db_path,
             &jsonl_path
