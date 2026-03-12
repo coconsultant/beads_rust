@@ -44,18 +44,6 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 "cannot be combined with title arguments",
             ));
         }
-        if args.parent.is_some() {
-            return Err(BeadsError::validation(
-                "parent",
-                "--parent is not supported with --file",
-            ));
-        }
-        if args.dry_run {
-            return Err(BeadsError::validation(
-                "dry_run",
-                "--dry-run is not supported with --file",
-            ));
-        }
         if args.external_ref.is_some() {
             return Err(BeadsError::validation(
                 "external_ref",
@@ -197,11 +185,11 @@ pub fn create_issue_impl(
         Status::Open
     };
 
+    let mut count = storage.count_issues()?;
     let mut retries = 0;
     loop {
         // 2. Generate ID
         let now = Utc::now();
-        let count = storage.count_issues()?;
 
         let id_input = NewIdInput {
             title,
@@ -562,7 +550,9 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
-    let mut all_ids = storage.get_all_ids()?;
+    let all_ids_orig = storage.get_all_ids()?;
+    let mut all_ids = all_ids_orig.clone();
+    let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
     'outer: for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
@@ -577,6 +567,12 @@ fn execute_import(
         let design = parsed.design.clone();
         let acceptance_criteria = parsed.acceptance_criteria.clone();
 
+        // Resolve parent (item-specific header or CLI global fallback)
+        let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
+        let resolved_parent = parent_candidate
+            .map(|p| resolve_issue_id(storage, &id_resolver, &all_ids, p))
+            .transpose()?;
+
         let mut retries = 0;
         let mut final_id = String::new();
         let mut created = false;
@@ -590,7 +586,7 @@ fn execute_import(
                 issue_count: count,
                 id_config: &id_config,
             };
-            let id = match generate_new_id(storage, None, &id_input) {
+            let id = match generate_new_id(storage, resolved_parent.as_deref(), &id_input) {
                 Ok(id) => id,
                 Err(err) => {
                     eprintln!("✗ Failed to create {title}: {err}");
@@ -785,22 +781,26 @@ fn execute_import(
     }
 
     if ctx.is_json() || ctx.is_toon() {
-        let ids: Vec<String> = created_ids.iter().map(|(id, _)| id.clone()).collect();
-        match storage.get_issues_for_export(&ids) {
-            Ok(issues) => {
-                // Ensure output order matches creation order
-                let mut issues_by_id: std::collections::HashMap<String, crate::model::Issue> =
-                    issues.into_iter().map(|i| (i.id.clone(), i)).collect();
-                for (id, _) in &created_ids {
-                    if let Some(issue) = issues_by_id.remove(id) {
-                        created_issues.push(issue);
-                    } else {
-                        eprintln!("warning: could not load created issue {id} for JSON output");
+        if args.dry_run {
+            // In dry run, we already populated created_issues in the loop
+        } else {
+            let ids: Vec<String> = created_ids.iter().map(|(id, _)| id.clone()).collect();
+            match storage.get_issues_for_export(&ids) {
+                Ok(issues) => {
+                    // Ensure output order matches creation order
+                    let mut issues_by_id: std::collections::HashMap<String, crate::model::Issue> =
+                        issues.into_iter().map(|i| (i.id.clone(), i)).collect();
+                    for (id, _) in &created_ids {
+                        if let Some(issue) = issues_by_id.remove(id) {
+                            created_issues.push(issue);
+                        } else {
+                            eprintln!("warning: could not load created issue {id} for JSON output");
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("warning: could not load created issues for JSON output: {e}");
+                Err(e) => {
+                    eprintln!("warning: could not load created issues for JSON output: {e}");
+                }
             }
         }
     }
@@ -830,11 +830,19 @@ fn execute_import(
     } else if ctx.is_json() {
         ctx.json_pretty(&created_issues);
     } else if !created_ids.is_empty() {
-        ctx.success(&format!(
-            "Created {} issues from {}:",
-            created_ids.len(),
-            path.display()
-        ));
+        if args.dry_run {
+            ctx.info(&format!(
+                "Dry run: would create {} issues from {}:",
+                created_ids.len(),
+                path.display()
+            ));
+        } else {
+            ctx.success(&format!(
+                "Created {} issues from {}:",
+                created_ids.len(),
+                path.display()
+            ));
+        }
         for (id, title) in created_ids {
             ctx.print_line(&format!("  {id}: {title}"));
         }
@@ -1225,8 +1233,6 @@ mod tests {
         info!("test_parse_optional_date_with_timezone: starting");
         let result = parse_optional_date(Some("2026-06-15T14:30:00+05:30"));
         assert!(result.is_ok());
-        let date = result.unwrap();
-        assert!(date.is_some());
         info!("test_parse_optional_date_with_timezone: assertions passed");
     }
 

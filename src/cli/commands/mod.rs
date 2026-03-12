@@ -1,4 +1,4 @@
-use crate::config;
+use crate::config::OpenStorageResult;
 use crate::error::BeadsError;
 use crate::model::Issue;
 use crate::storage::{IssueUpdate, SqliteStorage};
@@ -103,7 +103,7 @@ pub(super) fn preserve_blocked_cache_on_error<T>(
 }
 
 pub(super) fn update_issue_with_recovery(
-    storage_ctx: &mut config::OpenStorageResult,
+    storage_ctx: &mut OpenStorageResult,
     allow_recovery: bool,
     command: &str,
     issue_id: &str,

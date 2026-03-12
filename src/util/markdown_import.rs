@@ -27,6 +27,8 @@ use std::str::FromStr;
 pub struct ParsedIssue {
     /// Issue title from the H2 header.
     pub title: String,
+    /// Parent issue ID (e.g. "bd-123").
+    pub parent: Option<String>,
     /// Priority string (e.g., "0", "P1", "2").
     pub priority: Option<String>,
     /// Issue type (e.g., "task", "bug", "feature").
@@ -50,6 +52,7 @@ pub struct ParsedIssue {
 enum Section {
     /// Before any H3, capturing implicit description
     BeforeH3,
+    Parent,
     Priority,
     Type,
     Description,
@@ -65,6 +68,7 @@ impl Section {
     fn from_header(header: &str) -> Self {
         let normalized = header.trim().to_lowercase();
         match normalized.as_str() {
+            "parent" => Self::Parent,
             "priority" => Self::Priority,
             "type" => Self::Type,
             "description" => Self::Description,
@@ -231,6 +235,9 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
                 issue.description = Some(content);
             }
         }
+        Section::Parent => {
+            issue.parent = Some(content);
+        }
         Section::Priority => {
             issue.priority = Some(content);
         }
@@ -387,6 +394,9 @@ mod tests {
     #[test]
     fn test_parse_simple_issue() {
         let content = r"## My First Issue
+### Parent
+proj-abc123
+
 ### Description
 This is the description.
 
@@ -399,6 +409,7 @@ bug
         let issues = parse_markdown_content(content).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "My First Issue");
+        assert_eq!(issues[0].parent, Some("proj-abc123".to_string()));
         assert_eq!(
             issues[0].description,
             Some("This is the description.".to_string())
@@ -638,5 +649,15 @@ Explicit description content
             issues[0].description,
             Some("Explicit description content".to_string())
         );
+    }
+
+    #[test]
+    fn test_parent_section_parsing() {
+        let content = r"## Test Issue
+### Parent
+bd-123
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues[0].parent, Some("bd-123".to_string()));
     }
 }
