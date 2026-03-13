@@ -315,6 +315,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     })
 }
 
+/// Validate `list`-compatible CLI filters without executing the query.
 pub(crate) fn validate_list_args(args: &ListArgs) -> Result<()> {
     let _ = build_filters(args)?;
     validate_sort_key(args.sort.as_deref())?;
