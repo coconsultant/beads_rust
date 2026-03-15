@@ -420,10 +420,29 @@ impl SqliteStorage {
     /// Check whether a foreign-key-backed table contains rows whose reference
     /// column points at a missing issue.
     ///
+    /// Only whitelisted table/column pairs are accepted to prevent SQL injection
+    /// through the string-interpolated query.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
+    /// Returns an error if the query fails or the table/column pair is not
+    /// whitelisted.
     pub(crate) fn has_missing_issue_reference(&self, table: &str, column: &str) -> Result<bool> {
+        const ALLOWED_PAIRS: &[(&str, &str)] = &[
+            ("dependencies", "issue_id"),
+            ("labels", "issue_id"),
+            ("comments", "issue_id"),
+            ("events", "issue_id"),
+            ("dirty_issues", "issue_id"),
+            ("export_hashes", "issue_id"),
+            ("blocked_issues_cache", "issue_id"),
+            ("child_counters", "parent_id"),
+        ];
+        if !ALLOWED_PAIRS.contains(&(table, column)) {
+            return Err(crate::error::BeadsError::Config(format!(
+                "has_missing_issue_reference: disallowed table/column pair ({table}, {column})"
+            )));
+        }
         let row = self.conn.query_row(&format!(
             "SELECT COUNT(*) FROM {table} WHERE {column} NOT IN (SELECT id FROM issues)"
         ))?;
