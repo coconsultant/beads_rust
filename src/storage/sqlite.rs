@@ -8268,10 +8268,7 @@ mod tests {
             // Reset user_version so the reopen takes the full schema path
             // (the fast path only applies runtime pragmas and does not
             // recreate missing indexes).
-            storage
-                .conn
-                .execute("PRAGMA user_version = 0")
-                .unwrap();
+            storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
         let reopened = SqliteStorage::open(&db_path).unwrap();
@@ -8289,10 +8286,7 @@ mod tests {
         );
 
         // Use PRAGMA index_list instead of sqlite_master (more reliable in fsqlite)
-        let index_rows = reopened
-            .conn
-            .query("PRAGMA index_list('issues')")
-            .unwrap();
+        let index_rows = reopened.conn.query("PRAGMA index_list('issues')").unwrap();
         let index_names: HashSet<String> = index_rows
             .iter()
             .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(str::to_owned))

@@ -449,21 +449,19 @@ fn parse_event_timestamp(value: &str) -> Result<DateTime<Utc>> {
 ///
 /// Returns an error if the database query fails.
 pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
-    let rows = conn.query(
-        &format!(
-            r"
+    let rows = conn.query(&format!(
+        r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
             {}
             ",
-            if limit > 0 {
-                format!("LIMIT {limit}")
-            } else {
-                String::new()
-            }
-        ),
-    )?;
+        if limit > 0 {
+            format!("LIMIT {limit}")
+        } else {
+            String::new()
+        }
+    ))?;
 
     let mut result: Vec<Event> = rows.iter().map(event_from_row).collect::<Result<_>>()?;
     // fsqlite may not honour ORDER BY DESC or LIMIT in all query plans;

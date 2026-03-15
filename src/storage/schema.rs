@@ -775,10 +775,7 @@ fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) ->
     // that fsqlite's in-memory schema cache registers all columns.
     conn.execute("DROP TABLE issues")?;
 
-    let create_canonical = format!(
-        "CREATE TABLE issues ({})",
-        create_cols.join(", ")
-    );
+    let create_canonical = format!("CREATE TABLE issues ({})", create_cols.join(", "));
     conn.execute(&create_canonical)?;
 
     // Copy data back.
@@ -1076,9 +1073,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         }
 
         if user_version < 4 && table_exists(conn, "issues") {
-            tracing::info!(
-                "Migrating database to schema version 4 (ready excludes in_progress)"
-            );
+            tracing::info!("Migrating database to schema version 4 (ready excludes in_progress)");
             conn.execute("DROP INDEX IF EXISTS idx_issues_ready")?;
             conn.execute(
                 "CREATE INDEX idx_issues_ready
