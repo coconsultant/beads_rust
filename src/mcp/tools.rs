@@ -415,7 +415,7 @@ fn parse_timestamp(s: &str) -> McpResult<(chrono::DateTime<chrono::Utc>, Option<
     // because "-0" appears in date portions (e.g. months 01-09).
     let has_tz_suffix = normalized.contains('Z')
         || normalized.contains('+')
-        || normalized.ends_with("z")
+        || normalized.ends_with('z')
         || normalized
             .rfind('-')
             .is_some_and(|pos| pos > 10 && normalized[pos..].contains(':'));
@@ -491,6 +491,11 @@ fn parse_update_fields(
     let mut updates = IssueUpdate::default();
 
     if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
+        if title.is_empty() || title.len() > 500 {
+            return Err(McpError::invalid_params(
+                "Title must be 1-500 characters",
+            ));
+        }
         updates.title = Some(title.to_string());
     }
     updates.description = nullable_str(args, "description");
@@ -659,8 +664,14 @@ fn build_list_filters(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    // Forgive by Default: if the status filter includes Deferred, automatically
-    // enable include_deferred so the query doesn't contradict itself.
+    // Forgive by Default: if the status filter explicitly includes Closed or
+    // Deferred, automatically enable the corresponding include flag so the
+    // query doesn't contradict itself (the default exclusion filters would
+    // otherwise produce zero results).
+    let include_closed = include_closed
+        || statuses
+            .as_ref()
+            .is_some_and(|s| s.contains(&Status::Closed));
     let include_deferred = statuses
         .as_ref()
         .is_some_and(|s| s.contains(&Status::Deferred));

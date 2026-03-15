@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     issue_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
-    actor TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',
     old_value TEXT,
     new_value TEXT,
     comment TEXT,
