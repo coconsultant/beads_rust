@@ -35,6 +35,7 @@ use tracing::warn;
 ///
 /// Accepts `.beads` (default) and `_beads` (for monorepos that
 /// disallow dot-directories).
+#[must_use]
 pub fn is_beads_dir_name(name: &std::ffi::OsStr) -> bool {
     name == ".beads" || name == "_beads"
 }
@@ -4608,11 +4609,8 @@ routing:
 
         // Use a specific backup file path that does NOT exist, so the
         // restore step fails with a missing-backup error.
-        let wal_backup_file = recovery_dir.join(recovery_backup_filename(
-            &wal_path,
-            "fixed-stamp",
-            "bak",
-        ));
+        let wal_backup_file =
+            recovery_dir.join(recovery_backup_filename(&wal_path, "fixed-stamp", "bak"));
 
         let err = restore_database_family_after_failed_rebuild(&RecoveryBackupSet {
             db_path: db_path.clone(),
@@ -4631,7 +4629,9 @@ routing:
         );
         assert!(
             err.to_string().contains("expected")
-                && err.to_string().contains(&wal_backup_file.display().to_string()),
+                && err
+                    .to_string()
+                    .contains(&wal_backup_file.display().to_string()),
             "unexpected error: {err}"
         );
         assert_eq!(

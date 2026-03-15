@@ -164,12 +164,9 @@ fn try_skip_formatting(chars: &[char], i: usize, processed: &mut String) -> Opti
                 }
                 if prev_space && !next_space {
                     // Look for a right-flanking closing * (preceded by non-space)
-                    let has_closing =
-                        chars[i + 1..].iter().enumerate().any(|(k, &ch)| {
-                            ch == '*'
-                                && k > 0
-                                && !chars[i + 1 + k - 1].is_whitespace()
-                        });
+                    let has_closing = chars[i + 1..].iter().enumerate().any(|(k, &ch)| {
+                        ch == '*' && k > 0 && !chars[i + 1 + k - 1].is_whitespace()
+                    });
                     if !has_closing {
                         return None;
                     }
