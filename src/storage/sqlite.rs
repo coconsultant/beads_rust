@@ -2006,12 +2006,12 @@ impl SqliteStorage {
             }
         }
 
-        // Ready condition 1: status is `open` or `in_progress` by default; optionally
-        // include explicitly deferred issues when requested.
+        // Ready condition 1: only `open` issues are "ready" (in_progress means
+        // already claimed). Optionally include deferred issues when requested.
         if filters.include_deferred {
-            sql.push_str(" AND status IN ('open', 'in_progress', 'deferred')");
+            sql.push_str(" AND status IN ('open', 'deferred')");
         } else {
-            sql.push_str(" AND status IN ('open', 'in_progress')");
+            sql.push_str(" AND status = 'open'");
         }
 
         // Ready condition 2: NOT in blocked_issues_cache (NOT IN — frankensqlite
@@ -9653,6 +9653,36 @@ mod tests {
 
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "bd-legacy-ready");
+    }
+
+    #[test]
+    fn test_get_ready_issues_excludes_in_progress() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        // Create an open issue (should appear in ready)
+        let open_issue = make_issue("bd-open", "Open Issue", Status::Open, 2, None, t1, None);
+        storage.create_issue(&open_issue, "tester").unwrap();
+
+        // Create an in_progress issue (should NOT appear in ready)
+        let ip_issue = make_issue(
+            "bd-inprogress",
+            "In Progress Issue",
+            Status::InProgress,
+            1,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&ip_issue, "tester").unwrap();
+
+        let ready = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+            .unwrap();
+
+        // Only the open issue should be ready; in_progress is already claimed
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "bd-open");
     }
 
     #[test]

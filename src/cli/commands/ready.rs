@@ -233,17 +233,17 @@ fn execute_inner(
 }
 
 fn empty_ready_message(storage: &SqliteStorage) -> Result<&'static str> {
-    let has_open_issues = !storage
+    let has_non_closed_issues = !storage
         .list_issues(&ListFilters {
             include_deferred: true,
             limit: Some(1),
             ..Default::default()
         })?
         .is_empty();
-    Ok(if has_open_issues {
-        "✨ No ready issues"
+    Ok(if has_non_closed_issues {
+        "✨ No ready issues — all remaining work is blocked, deferred, or in progress"
     } else {
-        "✨ No open issues"
+        "✨ All work complete — no issues to work on"
     })
 }
 

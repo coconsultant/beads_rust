@@ -587,7 +587,7 @@ fn ready_excludes_blocked_issues_with_filters() {
 // ============================================================================
 
 #[test]
-fn ready_includes_in_progress_and_open() {
+fn ready_excludes_in_progress_and_includes_only_open() {
     let mut storage = test_db();
 
     let open = fixtures::IssueBuilder::new("Open issue")
@@ -612,7 +612,7 @@ fn ready_includes_in_progress_and_open() {
     let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
 
     assert!(ids.contains(&open.id));
-    assert!(ids.contains(&in_progress.id));
+    assert!(!ids.contains(&in_progress.id), "in_progress issues are already claimed and should not appear in ready");
     assert!(!ids.contains(&closed.id));
     assert!(!ids.contains(&deferred.id));
 }
