@@ -113,12 +113,16 @@ pub fn execute(
         };
 
         if !blocked_dependents.is_empty() && !args.force && !args.cascade {
-            // Preview mode: show what would happen
+            // Preview mode: show what would happen.
+            // Compute the full transitive closure so the user sees the true blast
+            // radius of --cascade (not just first-level dependents).
+            let full_cascade: Vec<String> =
+                collect_sorted_cascade_dependents(&storage_ctx.storage, &ids)?;
             if ctx.is_json() || ctx.is_toon() {
                 let preview = DeletePreviewResult {
                     preview: true,
                     would_delete: ids.clone(),
-                    cascade_delete: Vec::new(),
+                    cascade_delete: full_cascade,
                     blocked_dependents,
                     orphaned_issues: Vec::new(),
                 };
@@ -133,16 +137,39 @@ pub fn execute(
                 return Ok(());
             }
             if ctx.is_rich() {
-                render_dependents_warning_rich(&blocked_dependents, &storage_ctx.storage, ctx);
+                render_dependents_warning_rich(
+                    &blocked_dependents,
+                    &full_cascade,
+                    &storage_ctx.storage,
+                    ctx,
+                );
             } else {
                 println!("The following issues depend on issues being deleted:");
                 for dep in &blocked_dependents {
                     println!("  - {dep}");
                 }
+                if full_cascade.len() > blocked_dependents.len() {
+                    println!(
+                        "\n{} additional issue(s) would be transitively affected by --cascade:",
+                        full_cascade.len() - blocked_dependents.len()
+                    );
+                    let direct_set: HashSet<&String> = blocked_dependents.iter().collect();
+                    for dep in &full_cascade {
+                        if !direct_set.contains(dep) {
+                            println!("  - {dep}");
+                        }
+                    }
+                }
                 println!();
                 println!(
                     "Use --force to orphan these dependents, or --cascade to delete them recursively."
                 );
+                if !full_cascade.is_empty() {
+                    println!(
+                        "--cascade would delete {} total dependent(s).",
+                        full_cascade.len()
+                    );
+                }
                 println!("No changes made (preview mode).");
             }
             return Ok(());
@@ -402,7 +429,8 @@ fn collect_sorted_cascade_dependents(
 
 /// Render the dependents warning panel in rich format.
 fn render_dependents_warning_rich(
-    dependents: &[String],
+    direct_dependents: &[String],
+    full_cascade: &[String],
     storage: &SqliteStorage,
     ctx: &OutputContext,
 ) {
@@ -410,8 +438,12 @@ fn render_dependents_warning_rich(
     let theme = ctx.theme();
     let width = ctx.width();
 
+    let mut all_ids: Vec<&String> = direct_dependents.iter().chain(full_cascade.iter()).collect();
+    all_ids.sort();
+    all_ids.dedup();
+    let all_ids_owned: Vec<String> = all_ids.into_iter().cloned().collect();
     let mut issues_by_id = std::collections::HashMap::new();
-    if let Ok(issues) = storage.get_issues_by_ids(dependents) {
+    if let Ok(issues) = storage.get_issues_by_ids(&all_ids_owned) {
         for issue in issues {
             issues_by_id.insert(issue.id.clone(), issue);
         }
@@ -424,10 +456,9 @@ fn render_dependents_warning_rich(
         theme.warning.clone(),
     );
 
-    for dep_id in dependents {
+    for dep_id in direct_dependents {
         content.append_styled("  \u{2022} ", theme.dimmed.clone());
         content.append_styled(dep_id, theme.issue_id.clone());
-        // Try to get title
         if let Some(issue) = issues_by_id.get(dep_id) {
             content.append_styled(": ", theme.dimmed.clone());
             content.append(&issue.title);
@@ -435,11 +466,46 @@ fn render_dependents_warning_rich(
         content.append("\n");
     }
 
+    // Show transitive dependents if the full cascade set is larger
+    let direct_set: HashSet<&String> = direct_dependents.iter().collect();
+    let transitive: Vec<&String> = full_cascade
+        .iter()
+        .filter(|id| !direct_set.contains(id))
+        .collect();
+    if !transitive.is_empty() {
+        content.append("\n");
+        content.append_styled(
+            &format!(
+                "{} additional issue(s) transitively affected by --cascade:\n\n",
+                transitive.len()
+            ),
+            theme.warning.clone(),
+        );
+        for dep_id in &transitive {
+            content.append_styled("  \u{21b3} ", theme.warning.clone());
+            content.append_styled(*dep_id, theme.issue_id.clone());
+            if let Some(issue) = issues_by_id.get(*dep_id) {
+                content.append_styled(": ", theme.dimmed.clone());
+                content.append(&issue.title);
+            }
+            content.append("\n");
+        }
+    }
+
     content.append("\n");
     content.append_styled(
         "Use --force to orphan these dependents, or --cascade to delete them recursively.\n",
         theme.dimmed.clone(),
     );
+    if !full_cascade.is_empty() {
+        content.append_styled(
+            &format!(
+                "--cascade would delete {} total dependent(s).\n",
+                full_cascade.len()
+            ),
+            theme.dimmed.clone(),
+        );
+    }
     content.append_styled("No changes made (preview mode).", theme.muted.clone());
 
     let panel = Panel::from_rich_text(&content, width)
@@ -823,5 +889,64 @@ mod tests {
         let cascade = collect_sorted_cascade_dependents(&storage, &["bd-a".to_string()]).unwrap();
         assert_eq!(cascade, vec!["bd-b".to_string(), "bd-c".to_string()]);
         info!("test_sorted_cascade_dependents_include_transitive_dependents: assertions passed");
+    }
+
+    #[test]
+    fn test_preview_cascade_closure_exceeds_direct_dependents() {
+        init_logging();
+        info!("test_preview_cascade_closure_exceeds_direct_dependents: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        // Chain: A → B → C → D (D depends on C, C depends on B, B depends on A)
+        let a = create_test_issue("bd-a", "Issue A");
+        let b = create_test_issue("bd-b", "Issue B");
+        let c = create_test_issue("bd-c", "Issue C");
+        let d = create_test_issue("bd-d", "Issue D");
+
+        storage.create_issue(&a, "tester").unwrap();
+        storage.create_issue(&b, "tester").unwrap();
+        storage.create_issue(&c, "tester").unwrap();
+        storage.create_issue(&d, "tester").unwrap();
+
+        storage
+            .mutate("test_add_chain_deps", "tester", |tx, _ctx| {
+                tx.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                    &[fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("bd-a"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                )?;
+                tx.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                    &[fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                )?;
+                tx.execute_with_params(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
+                    &[fsqlite_types::SqliteValue::from("bd-d"), fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Direct dependents of A: only B (first-level)
+        let direct = collect_direct_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        assert_eq!(direct, vec!["bd-b".to_string()]);
+
+        // Full cascade closure: B, C, and D (the complete transitive set)
+        let cascade = collect_sorted_cascade_dependents(&storage, &["bd-a".to_string()]).unwrap();
+        assert_eq!(
+            cascade,
+            vec![
+                "bd-b".to_string(),
+                "bd-c".to_string(),
+                "bd-d".to_string()
+            ]
+        );
+
+        // The cascade closure MUST be a strict superset of direct dependents
+        // This is the invariant that the preview must reflect
+        assert!(cascade.len() > direct.len());
+        for dep in &direct {
+            assert!(cascade.contains(dep));
+        }
+        info!("test_preview_cascade_closure_exceeds_direct_dependents: assertions passed");
     }
 }
