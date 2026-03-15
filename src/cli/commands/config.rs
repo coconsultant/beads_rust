@@ -387,7 +387,7 @@ fn edit_config() -> Result<()> {
 # See `br config list` for available options
 
 # Issue ID prefix
-# issue_prefix: bd
+# issue_prefix: br
 
 # Default priority for new issues (0-4)
 # default_priority: 2

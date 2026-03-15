@@ -62,7 +62,7 @@ pub fn execute(
     // Set prefix in config table if provided, otherwise derive from directory name
     // Normalize to lowercase since ID validation requires lowercase prefixes
     let actual_prefix = prefix.unwrap_or_else(|| {
-        let mut dir_name = "bd".to_string();
+        let mut dir_name = "br".to_string();
         if let Ok(canon) = dunce::canonicalize(base_dir)
             && let Some(name) = canon.file_name().and_then(|n| n.to_str())
         {

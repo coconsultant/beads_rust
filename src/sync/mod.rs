@@ -2474,9 +2474,13 @@ pub fn auto_flush(
         }
     }
 
-    // Configure export with defaults, including beads_dir for path validation
+    // Configure export with defaults, including beads_dir for path validation.
+    // When needs_flush is set (e.g. after purge_issue), force must be true
+    // even if there are also dirty issues from related mutations (like
+    // dependency removal), so that the safety guard does not block export
+    // of a DB that intentionally has fewer issues than the on-disk JSONL.
     let export_config = ExportConfig {
-        force: needs_flush && dirty_count == 0,
+        force: needs_flush,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
         ..Default::default()

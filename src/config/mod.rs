@@ -1147,10 +1147,12 @@ impl OpenStorageResult {
         }
 
         let export_config = ExportConfig {
-            // A no-db hard delete can intentionally remove the last issue.
-            // In that case `purge_issue` leaves no dirty rows, only the force-flush
-            // marker, so allow the empty export that makes JSONL match the storage state.
-            force: needs_flush && dirty_issue_count == 0,
+            // When needs_flush is set (e.g. after purge_issue), force must be
+            // true even if there are also dirty issues from related mutations
+            // (like dependency removal during --hard delete), so the safety
+            // guard does not block export of a DB that intentionally has fewer
+            // issues than the on-disk JSONL.
+            force: needs_flush,
             is_default_path: self.paths.jsonl_path == self.paths.beads_dir.join("issues.jsonl"),
             beads_dir: Some(self.paths.beads_dir.clone()),
             allow_external_jsonl: self.allow_external_jsonl,
@@ -1331,7 +1333,7 @@ fn resolve_bootstrap_issue_prefix(
         return Ok(name.to_string());
     }
 
-    Ok("bd".to_string())
+    Ok("br".to_string())
 }
 
 fn import_config_for_resolved_jsonl(
@@ -1410,6 +1412,17 @@ pub(crate) fn first_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Skip tombstones — they may retain a foreign prefix from before
+        // a prefix migration and should not influence inference.
+        if value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == "tombstone")
+        {
+            continue;
+        }
+
         let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -1443,6 +1456,17 @@ fn common_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
         let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
             BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
         })?;
+
+        // Skip tombstones — they may retain a foreign prefix legitimately
+        // (e.g. issues created under the old "bd-" prefix before migration).
+        if value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == "tombstone")
+        {
+            continue;
+        }
+
         let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -1779,7 +1803,7 @@ pub fn default_config_layer() -> ConfigLayer {
     let mut layer = ConfigLayer::default();
     layer
         .runtime
-        .insert("issue_prefix".to_string(), "bd".to_string());
+        .insert("issue_prefix".to_string(), "br".to_string());
     layer
 }
 
@@ -1895,7 +1919,7 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
         .cloned()
         .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| "bd".to_string());
+        .unwrap_or_else(|| "br".to_string());
 
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
@@ -2533,7 +2557,7 @@ labels:
     fn precedence_default_is_lowest() {
         // Verify that default layer values are overridden by any other layer
         let defaults = default_config_layer();
-        assert_eq!(defaults.runtime.get("issue_prefix").unwrap(), "bd");
+        assert_eq!(defaults.runtime.get("issue_prefix").unwrap(), "br");
 
         let mut db = ConfigLayer::default();
         db.runtime
@@ -3356,7 +3380,7 @@ routing:
         let layer = ConfigLayer::default();
         let config = id_config_from_layer(&layer);
 
-        assert_eq!(config.prefix, "bd");
+        assert_eq!(config.prefix, "br");
         assert_eq!(config.min_hash_length, 3);
         assert_eq!(config.max_hash_length, 8);
         assert!((config.max_collision_prob - 0.25).abs() < f64::EPSILON);

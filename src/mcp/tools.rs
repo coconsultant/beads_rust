@@ -897,7 +897,7 @@ impl ToolHandler for ShowIssueTool {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Issue ID (e.g. 'bd-1a2b3c'). MUST be an exact ID from list_issues. Placeholder values are rejected."
+                        "description": "Issue ID (e.g. 'br-1a2b3c'). MUST be an exact ID from list_issues. Placeholder values are rejected."
                     }
                 },
                 "required": ["id"],
@@ -1112,7 +1112,7 @@ impl ToolHandler for CreateIssueTool {
         let mut storage = open(&self.0)?;
 
         let now = chrono::Utc::now();
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("bd");
+        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
         let id_gen = crate::util::id::IdGenerator::new(
             crate::util::id::IdConfig::with_prefix(prefix),
         );
@@ -1223,7 +1223,7 @@ impl ToolHandler for UpdateIssueTool {
                         "description": "New title (1-500 chars)"
                     },
                     "description": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "New description (null to clear)"
                     },
                     "status": {
@@ -1816,7 +1816,7 @@ impl ToolHandler for ProjectOverviewTool {
         };
         let deferred = storage.list_issues(&deferred_filters).map_err(beads_to_mcp)?;
 
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("bd");
+        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
 
         let result = json!({
             "project": {

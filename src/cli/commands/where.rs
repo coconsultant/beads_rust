@@ -183,6 +183,17 @@ fn inspect_jsonl_prefix(path: &Path) -> JsonlPrefixState {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
+
+        // Skip tombstones — they may retain a foreign prefix from before
+        // a prefix migration and should not cause mixed-prefix detection.
+        if value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == "tombstone")
+        {
+            continue;
+        }
+
         let Some(id) = value.get("id").and_then(|value| value.as_str()) else {
             continue;
         };

@@ -927,7 +927,7 @@ fn execute_import(
     // rather than reading only from the DB, so that project config is respected.
     let layer = config::load_config(beads_dir, Some(storage), cli)?;
     let id_cfg = config::id_config_from_layer(&layer);
-    let prefix = if id_cfg.prefix == "bd" {
+    let prefix = if id_cfg.prefix == "br" {
         // Prefix is still the default — check if we should auto-detect from JSONL
         let db_prefix = storage.get_config("issue_prefix")?;
         if let Some(p) = db_prefix {
@@ -938,7 +938,7 @@ fn execute_import(
             storage.set_config("issue_prefix", &detected)?;
             detected
         } else {
-            "bd".to_string()
+            "br".to_string()
         }
     } else {
         // Config layer resolved a non-default prefix — use it

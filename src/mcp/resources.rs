@@ -78,7 +78,7 @@ impl ResourceHandler for ProjectInfoResource {
         let storage = self.0.open_storage().map_err(to_mcp)?;
 
         let config = storage.get_all_config().unwrap_or_default();
-        let prefix = self.0.issue_prefix.as_deref().unwrap_or("bd");
+        let prefix = self.0.issue_prefix.as_deref().unwrap_or("br");
 
         let info = json!({
             "beads_dir": self.0.beads_dir.display().to_string(),
@@ -252,7 +252,7 @@ impl ResourceHandler for SchemaResource {
                 "replies-to", "relates-to"
             ],
             "issue_fields": {
-                "id": "string — unique ID (e.g. bd-abc123)",
+                "id": "string — unique ID (e.g. br-abc123)",
                 "title": "string — 1-500 characters",
                 "description": "string|null — detailed description",
                 "status": "string — see statuses above",

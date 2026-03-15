@@ -26,7 +26,7 @@ pub struct IdConfig {
 impl Default for IdConfig {
     fn default() -> Self {
         Self {
-            prefix: "bd".to_string(),
+            prefix: "br".to_string(),
             min_hash_length: 3,
             max_hash_length: 8,
             max_collision_prob: 0.25,
@@ -307,10 +307,10 @@ use crate::error::{BeadsError, Result};
 
 /// Parsed components of an issue ID.
 ///
-/// Supports both root IDs (`bd-abc123`) and hierarchical IDs (`bd-abc123.1.2`).
+/// Supports both root IDs (`br-abc123`) and hierarchical IDs (`br-abc123.1.2`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedId {
-    /// The prefix (e.g., "bd").
+    /// The prefix (e.g., "br").
     pub prefix: String,
     /// The hash portion (e.g., "abc123").
     pub hash: String,
@@ -501,7 +501,7 @@ pub struct ResolverConfig {
 impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
-            default_prefix: "bd".to_string(),
+            default_prefix: "br".to_string(),
             allowed_prefixes: Vec::new(),
             allow_substring_match: true,
         }
@@ -862,10 +862,10 @@ mod tests {
 
     fn mock_db() -> Vec<String> {
         vec![
-            "bd-abc123".to_string(),
-            "bd-abd456".to_string(),
-            "bd-xyz789".to_string(),
-            "bd-abc123.1".to_string(),  // child
+            "br-abc123".to_string(),
+            "br-abd456".to_string(),
+            "br-xyz789".to_string(),
+            "br-abc123.1".to_string(),  // child
             "other-def111".to_string(), // different prefix
         ]
     }
@@ -882,9 +882,9 @@ mod tests {
     fn test_resolve_exact_match() {
         let resolver = IdResolver::with_defaults();
         let result = resolver
-            .resolve("bd-abc123", exists_in_mock, substring_in_mock)
+            .resolve("br-abc123", exists_in_mock, substring_in_mock)
             .unwrap();
-        assert_eq!(result.id, "bd-abc123");
+        assert_eq!(result.id, "br-abc123");
         assert_eq!(result.match_type, MatchType::Exact);
     }
 
@@ -894,31 +894,31 @@ mod tests {
         let result = resolver
             .resolve("abc123", exists_in_mock, substring_in_mock)
             .unwrap();
-        assert_eq!(result.id, "bd-abc123");
+        assert_eq!(result.id, "br-abc123");
         assert_eq!(result.match_type, MatchType::PrefixNormalized);
     }
 
     #[test]
     fn test_resolve_substring_match() {
         let resolver = IdResolver::with_defaults();
-        // "xyz" should uniquely match "bd-xyz789"
+        // "xyz" should uniquely match "br-xyz789"
         let result = resolver
             .resolve("xyz", exists_in_mock, substring_in_mock)
             .unwrap();
-        assert_eq!(result.id, "bd-xyz789");
+        assert_eq!(result.id, "br-xyz789");
         assert_eq!(result.match_type, MatchType::Substring);
     }
 
     #[test]
     fn test_resolve_ambiguous() {
         let resolver = IdResolver::with_defaults();
-        // "ab" matches both "bd-abc123" and "bd-abd456"
+        // "ab" matches both "br-abc123" and "br-abd456"
         let result = resolver.resolve("ab", exists_in_mock, substring_in_mock);
         assert!(result.is_err());
         if let Err(BeadsError::AmbiguousId { partial, matches }) = result {
             assert_eq!(partial, "ab");
-            assert!(matches.contains(&"bd-abc123".to_string()));
-            assert!(matches.contains(&"bd-abd456".to_string()));
+            assert!(matches.contains(&"br-abc123".to_string()));
+            assert!(matches.contains(&"br-abd456".to_string()));
         } else {
             unreachable!("Expected AmbiguousId error");
         }
@@ -940,9 +940,9 @@ mod tests {
     fn test_resolve_child_id() {
         let resolver = IdResolver::with_defaults();
         let result = resolver
-            .resolve("bd-abc123.1", exists_in_mock, substring_in_mock)
+            .resolve("br-abc123.1", exists_in_mock, substring_in_mock)
             .unwrap();
-        assert_eq!(result.id, "bd-abc123.1");
+        assert_eq!(result.id, "br-abc123.1");
         assert_eq!(result.match_type, MatchType::Exact);
     }
 
@@ -950,9 +950,9 @@ mod tests {
     fn test_resolve_case_insensitive() {
         let resolver = IdResolver::with_defaults();
         let result = resolver
-            .resolve("BD-ABC123", exists_in_mock, substring_in_mock)
+            .resolve("BR-ABC123", exists_in_mock, substring_in_mock)
             .unwrap();
-        assert_eq!(result.id, "bd-abc123");
+        assert_eq!(result.id, "br-abc123");
     }
 
     #[test]
@@ -978,16 +978,16 @@ mod tests {
     fn test_resolve_whitespace_trimmed() {
         let resolver = IdResolver::with_defaults();
         let result = resolver
-            .resolve("  bd-abc123  ", exists_in_mock, substring_in_mock)
+            .resolve("  br-abc123  ", exists_in_mock, substring_in_mock)
             .unwrap();
-        assert_eq!(result.id, "bd-abc123");
+        assert_eq!(result.id, "br-abc123");
     }
 
     #[test]
     fn test_resolve_fallible_propagates_lookup_error() {
         let resolver = IdResolver::with_defaults();
         let result = resolver.resolve_fallible(
-            "bd-abc123",
+            "br-abc123",
             |_id| Err(BeadsError::Config("lookup failed".to_string())),
             |_hash| Ok(Vec::new()),
         );
@@ -997,7 +997,7 @@ mod tests {
     #[test]
     fn test_resolve_all_fallible_propagates_lookup_error() {
         let resolver = IdResolver::with_defaults();
-        let inputs = vec!["bd-abc123".to_string(), "bd-xyz789".to_string()];
+        let inputs = vec!["br-abc123".to_string(), "br-xyz789".to_string()];
         let result = resolver.resolve_all_fallible(
             &inputs,
             |_id| Err(BeadsError::Config("exists lookup failed".to_string())),
@@ -1012,9 +1012,9 @@ mod tests {
     fn test_find_matching_ids_substring() {
         let ids = mock_db();
         let matches = find_matching_ids(&ids, "abc");
-        assert!(matches.contains(&"bd-abc123".to_string()));
-        // Note: bd-abc123.1 is a child and its base hash contains "abc"
-        assert!(matches.contains(&"bd-abc123.1".to_string()));
+        assert!(matches.contains(&"br-abc123".to_string()));
+        // Note: br-abc123.1 is a child and its base hash contains "abc"
+        assert!(matches.contains(&"br-abc123.1".to_string()));
     }
 
     #[test]
@@ -1215,7 +1215,7 @@ mod tests {
             |_| false,
         );
 
-        assert!(id.starts_with("bd-"));
+        assert!(id.starts_with("br-"));
         assert!(is_valid_id_format(&id));
     }
 
