@@ -192,7 +192,7 @@ fn execute_inner(
     }
 
     match render_mode {
-        OrphanRenderMode::Quiet => {}
+        OrphanRenderMode::Quiet => return Ok(()),
         OrphanRenderMode::Json => {
             if ctx.is_json() {
                 ctx.json_pretty(&orphans);
