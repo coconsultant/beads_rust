@@ -1,6 +1,8 @@
 use crate::model::Issue;
 use crate::output::Theme;
 use rich_rust::prelude::*;
+use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 /// Renders a dependency tree for an issue.
 pub struct DependencyTree<'a> {
@@ -71,12 +73,35 @@ impl<'a> DependencyTree<'a> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    let width = UnicodeWidthStr::width(s);
+    if width <= max {
         s.to_string()
+    } else if max <= 3 {
+        let mut w = 0;
+        let mut out = String::new();
+        for c in s.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > max {
+                break;
+            }
+            w += cw;
+            out.push(c);
+        }
+        out
     } else {
-        let mut truncated: String = s.chars().take(max.saturating_sub(3)).collect();
-        truncated.push_str("...");
-        truncated
+        let target = max - 3;
+        let mut w = 0;
+        let mut out = String::new();
+        for c in s.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > target {
+                break;
+            }
+            w += cw;
+            out.push(c);
+        }
+        out.push_str("...");
+        out
     }
 }
 
@@ -86,13 +111,28 @@ mod tests {
 
     #[test]
     fn test_dep_tree_truncation_safe() {
-        // String with emojis (multi-byte)
-        let title = "😊".repeat(20); // 80 bytes, 20 chars.
-        // Max 10 chars.
+        // Emojis are 2 visual columns each
+        let title = "😊".repeat(20); // 20 chars, 40 visual columns
+        // Max 10 visual columns → 3 emojis (6 cols) + "..." (3 cols) = 9 cols
         let truncated = truncate(&title, 10);
 
-        assert_eq!(truncated.chars().count(), 10);
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 10);
         assert!(truncated.starts_with("😊"));
         assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_dep_tree_truncation_ascii() {
+        let title = "Hello, World! This is a long title";
+        let truncated = truncate(title, 15);
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 15);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_dep_tree_truncation_short() {
+        let title = "Short";
+        let truncated = truncate(title, 40);
+        assert_eq!(truncated, "Short");
     }
 }
