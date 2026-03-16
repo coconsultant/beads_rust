@@ -169,6 +169,10 @@ pub fn execute(
     }
 }
 
+fn suppress_human_sync_output(ctx: &OutputContext, use_json: bool) -> bool {
+    ctx.is_quiet() && !use_json
+}
+
 fn validate_sync_paths(
     beads_dir: &Path,
     jsonl_path: &Path,
@@ -333,6 +337,10 @@ fn execute_status(
         db_newer = staleness.db_newer,
         "Computed sync staleness"
     );
+
+    if suppress_human_sync_output(ctx, use_json) {
+        return Ok(());
+    }
 
     if use_json {
         // Print JSON directly so --robot works even if OutputContext is non-JSON.
@@ -540,7 +548,7 @@ fn execute_flush(
                 manifest_path: None,
             };
             ctx.json_pretty(&result);
-        } else {
+        } else if !suppress_human_sync_output(ctx, use_json) {
             println!("Nothing to export (no dirty issues)");
         }
         return Ok(());
@@ -625,6 +633,8 @@ fn execute_flush(
 
     if use_json {
         ctx.json_pretty(&result);
+    } else if suppress_human_sync_output(ctx, use_json) {
+        return Ok(());
     } else if ctx.is_rich() {
         render_flush_result_rich(&result, &report.errors, ctx);
     } else {
@@ -854,7 +864,7 @@ fn execute_import(
                 blocked_cache_rebuilt: false,
             };
             ctx.json_pretty(&result);
-        } else {
+        } else if !suppress_human_sync_output(ctx, use_json) {
             println!("No JSONL file found at {}", jsonl_path.display());
         }
         return Ok(());
@@ -885,7 +895,7 @@ fn execute_import(
                         blocked_cache_rebuilt: false,
                     };
                     ctx.json_pretty(&result);
-                } else {
+                } else if !suppress_human_sync_output(ctx, use_json) {
                     println!("JSONL is current (hash unchanged since last import)");
                 }
                 return Ok(());
@@ -997,6 +1007,8 @@ fn execute_import(
 
     if use_json {
         ctx.json_pretty(&result);
+    } else if suppress_human_sync_output(ctx, use_json) {
+        return Ok(());
     } else if ctx.is_rich() {
         render_import_result_rich(&result, ctx);
     } else {
@@ -1302,6 +1314,8 @@ fn execute_merge(
             "notes": report.notes,
         });
         ctx.json_pretty(&output);
+    } else if suppress_human_sync_output(ctx, use_json) {
+        return Ok(());
     } else if ctx.is_rich() {
         render_merge_result_rich(&report, ctx);
     } else {

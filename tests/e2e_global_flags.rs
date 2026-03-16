@@ -1345,6 +1345,52 @@ fn e2e_quiet_flag_config_epic_label_and_q_subcommands() {
     );
 }
 
+#[test]
+fn e2e_quiet_flag_sync_subcommands() {
+    let _log = common::test_log("e2e_quiet_flag_sync_subcommands");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Quiet sync test", "--no-auto-flush"],
+        "create_sync_quiet",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "sync", "--status"],
+        "sync_status_quiet",
+        "sync --status --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "sync", "--flush-only"],
+        "sync_flush_quiet",
+        "sync --flush-only --quiet",
+    );
+    assert_quiet_command(
+        &workspace,
+        ["--quiet", "sync", "--import-only"],
+        "sync_import_quiet",
+        "sync --import-only --quiet",
+    );
+
+    let status_json = run_quiet_json(
+        &workspace,
+        ["--quiet", "sync", "--status", "--json"],
+        "sync_status_quiet_json",
+        "sync --status --quiet --json should remain json",
+    );
+    assert!(
+        status_json.get("dirty_count").is_some(),
+        "sync --status --quiet --json should include dirty_count: {status_json}"
+    );
+}
+
 // ============================================================================
 // --verbose flag tests
 // ============================================================================
