@@ -419,6 +419,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Status(_)
         | Commands::Changelog(_)
         | Commands::Graph(_)
+        | Commands::Orphans(_)
         | Commands::Create(_)
         | Commands::Update(_)
         | Commands::Delete(_)
@@ -444,7 +445,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Audit { .. }
         | Commands::Config { .. }
         | Commands::History(_)
-        | Commands::Orphans(_)
         | Commands::Agents(_) => false,
 
         #[cfg(feature = "mcp")]
@@ -684,7 +684,6 @@ mod tests {
             &["br", "schema"],
             &["br", "config", "path"],
             &["br", "history", "list"],
-            &["br", "orphans"],
         ];
 
         for argv in cases {
@@ -694,6 +693,12 @@ mod tests {
                 "command should not auto-import: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn orphans_auto_imports_before_reading_issue_state() {
+        let command = Cli::parse_from(["br", "orphans"]).command;
+        assert!(should_auto_import(&command));
     }
 
     #[test]
