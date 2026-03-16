@@ -514,8 +514,11 @@ fn execute_import(
 ) -> Result<()> {
     let parsed_issues = parse_markdown_file(path)?;
     if parsed_issues.is_empty() {
+        let empty_issues = Vec::<Issue>::new();
         if ctx.is_json() {
-            ctx.json(&Vec::<Issue>::new());
+            ctx.json(&empty_issues);
+        } else if ctx.is_toon() {
+            ctx.toon(&empty_issues);
         }
         return Ok(());
     }

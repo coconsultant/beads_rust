@@ -191,6 +191,47 @@ fn test_create_toon_output_decodes_single_issue() {
 }
 
 #[test]
+fn test_create_file_empty_markdown_emits_empty_toon_array() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path();
+    let markdown_path = path.join("empty.md");
+
+    let bin = assert_cmd::cargo::cargo_bin!("br");
+
+    Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("init")
+        .assert()
+        .success();
+
+    std::fs::write(&markdown_path, "").expect("write empty markdown import");
+
+    let output = Command::new(bin.as_os_str())
+        .current_dir(path)
+        .arg("create")
+        .arg("--file")
+        .arg("empty.md")
+        .env("BR_OUTPUT_FORMAT", "toon")
+        .output()
+        .expect("create --file with empty markdown in toon mode");
+
+    assert!(
+        output.status.success(),
+        "create --file with empty markdown failed: {output:?}"
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let decoded = try_decode(stdout.trim(), None).expect("valid TOON");
+    let decoded_json: serde_json::Value = decoded.into();
+
+    assert_eq!(
+        decoded_json,
+        serde_json::Value::Array(Vec::new()),
+        "empty markdown imports should emit an empty structured payload in TOON mode"
+    );
+}
+
+#[test]
 fn test_create_file_silent_outputs_only_ids() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path();
