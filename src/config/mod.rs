@@ -18,7 +18,7 @@ use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, compute_jsonl_hash, export_to_jsonl_with_policy,
     finalize_export, import_from_jsonl, preflight_import,
 };
-use crate::util::id::IdConfig;
+use crate::util::id::{IdConfig, split_prefix_remainder};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
@@ -1433,7 +1433,7 @@ pub(crate) fn first_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String
         let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Some((prefix, _)) = id.split_once('-') else {
+        let Some((prefix, _)) = split_prefix_remainder(id) else {
             continue;
         };
         if !prefix.is_empty() {
@@ -1478,7 +1478,7 @@ fn common_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
             continue;
         };
 
-        let Some((prefix, _)) = id.split_once('-') else {
+        let Some((prefix, _)) = split_prefix_remainder(id) else {
             return Err(BeadsError::InvalidId { id: id.to_string() });
         };
         if prefix.is_empty() {
@@ -3276,6 +3276,58 @@ routing:
             first_prefix_from_jsonl(&paths.jsonl_path).expect("infer prefix"),
             Some("br".to_string()),
             "Prefix inference should read from the resolved JSONL path"
+        );
+    }
+
+    #[test]
+    fn first_prefix_from_jsonl_preserves_hyphenated_prefixes() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        write_single_issue_jsonl(
+            &jsonl_path,
+            "document-intelligence-0sa",
+            "hyphenated prefix",
+        );
+
+        assert_eq!(
+            first_prefix_from_jsonl(&jsonl_path).expect("infer prefix"),
+            Some("document-intelligence".to_string())
+        );
+    }
+
+    #[test]
+    fn common_prefix_from_jsonl_preserves_hyphenated_prefixes() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let first = serde_json::json!({
+            "id": "document-intelligence-0sa",
+            "title": "first",
+            "status": "open",
+        });
+        let second = serde_json::json!({
+            "id": "document-intelligence-1ab",
+            "title": "second",
+            "status": "open",
+        });
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).expect("serialize first"),
+                serde_json::to_string(&second).expect("serialize second")
+            ),
+        )
+        .expect("write jsonl");
+
+        assert_eq!(
+            common_prefix_from_jsonl(&jsonl_path).expect("infer prefix"),
+            Some("document-intelligence".to_string())
         );
     }
 

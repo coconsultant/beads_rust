@@ -70,8 +70,8 @@ fn main() {
             &paths.db_path,
             &paths.jsonl_path,
         );
-        let expected_prefix = match res.storage.get_config("issue_prefix") {
-            Ok(p) => p,
+        let expected_prefix = match resolve_auto_import_expected_prefix(res, &ctx.overrides) {
+            Ok(prefix) => Some(prefix),
             Err(e) => {
                 handle_error(&e, json_error_mode);
             }
@@ -364,6 +364,14 @@ fn open_storage_from_ctx(ctx: &StartupContext) -> Result<config::OpenStorageResu
     config::open_storage_with_cli(beads_dir, &ctx.overrides)
 }
 
+fn resolve_auto_import_expected_prefix(
+    storage_result: &config::OpenStorageResult,
+    cli: &config::CliOverrides,
+) -> Result<String> {
+    let layer = storage_result.load_config(cli)?;
+    Ok(config::id_config_from_layer(&layer).prefix)
+}
+
 const fn should_preopen_storage(
     storage_enabled: bool,
     needs_bootstrap_context: bool,
@@ -537,6 +545,8 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn make_create_args() -> beads_rust::cli::CreateArgs {
         beads_rust::cli::CreateArgs {
@@ -687,6 +697,32 @@ mod tests {
     fn orphans_handles_freshness_without_global_auto_import() {
         let command = Cli::parse_from(["br", "orphans"]).command;
         assert!(!should_auto_import(&command));
+    }
+
+    #[test]
+    fn auto_import_expected_prefix_uses_merged_config_layers() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(
+            beads_dir.join("config.yaml"),
+            "issue_prefix: document-intelligence\n",
+        )
+        .expect("write config");
+
+        let mut storage_result =
+            config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
+                .expect("open storage");
+        storage_result
+            .storage
+            .set_config("issue_prefix", "db-prefix")
+            .expect("set db prefix");
+
+        let prefix =
+            resolve_auto_import_expected_prefix(&storage_result, &config::CliOverrides::default())
+                .expect("resolve prefix");
+
+        assert_eq!(prefix, "document-intelligence");
     }
 
     #[test]

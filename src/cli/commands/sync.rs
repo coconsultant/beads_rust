@@ -17,6 +17,7 @@ use crate::sync::{
     require_safe_sync_overwrite_path, save_base_snapshot, three_way_merge,
     validate_sync_path_with_external,
 };
+use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1103,7 +1104,7 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
 /// Detect the issue ID prefix from the first non-tombstone issue in a JSONL file.
 ///
 /// Returns `None` if the file is empty or contains no issues with a recognizable prefix.
-/// A prefix is the part before the first hyphen in the issue ID (e.g., "mcp" from "mcp-015c").
+/// Supports hyphenated prefixes such as `document-intelligence-0sa`.
 fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
     #[derive(Deserialize)]
     struct PrefixProbe {
@@ -1136,12 +1137,8 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
             continue;
         }
 
-        // Extract prefix (part before first hyphen)
-        if let Some(hyphen_pos) = probe.id.find('-') {
-            let prefix = &probe.id[..hyphen_pos];
-            if !prefix.is_empty() {
-                return Some(prefix.to_string());
-            }
+        if let Some((prefix, _)) = split_prefix_remainder(&probe.id) {
+            return Some(prefix.to_string());
         }
     }
 
@@ -1436,7 +1433,7 @@ fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputConte
 
 #[cfg(test)]
 mod tests {
-    use super::validate_sync_paths;
+    use super::{detect_prefix_from_jsonl, validate_sync_paths};
     use crate::error::BeadsError;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
@@ -1614,5 +1611,22 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_detect_prefix_from_jsonl_supports_hyphenated_prefixes() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let issue = make_test_issue("document-intelligence-0sa", "Hyphenated Prefix");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_prefix_from_jsonl(&jsonl_path),
+            Some("document-intelligence".to_string())
+        );
     }
 }
