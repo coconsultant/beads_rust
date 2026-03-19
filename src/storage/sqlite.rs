@@ -253,6 +253,15 @@ impl SqliteStorage {
         )
     }
 
+    /// Mark the blocked-cache as stale so a future read can rebuild it on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata update fails.
+    pub(crate) fn mark_blocked_cache_stale(&mut self) -> Result<()> {
+        self.set_metadata(BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)
+    }
+
     pub(crate) fn ensure_blocked_cache_fresh(&self) -> Result<bool> {
         if !self.blocked_cache_marked_stale()? {
             return Ok(false);

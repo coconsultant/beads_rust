@@ -1,6 +1,9 @@
 //! Update command implementation.
 
-use super::{resolve_issue_id, retry_mutation_with_jsonl_recovery, update_issue_with_recovery};
+use super::{
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_id,
+    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+};
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -269,75 +272,123 @@ fn execute_prepared_route(
     let mut render_items = Vec::new();
     let resolved_ids = prepared.resolved_ids.clone();
     let mut route_has_mutated = false;
+    let mut blocked_cache_dirty = false;
     let defer_blocked_cache_rebuild = prepared.update.status.is_some()
         || !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
+    let parent_changes_cache = !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
 
     for id in &prepared.resolved_ids {
         // Get issue before update for change tracking
-        let issue_before = prepared.storage_ctx.storage.get_issue(id)?;
+        let issue_before_result = prepared.storage_ctx.storage.get_issue(id);
+        let issue_before = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+            issue_before_result,
+        )?;
 
         // Apply basic field updates
         if !prepared.update.is_empty() {
             let mut issue_update = prepared.update.clone();
             issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
-            update_issue_with_recovery(
+            let update_result = update_issue_with_recovery(
                 &mut prepared.storage_ctx,
                 !route_has_mutated,
                 "update",
                 id,
                 &issue_update,
                 &prepared.actor,
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                update_result,
             )?;
+            if prepared.update.status.is_some() {
+                blocked_cache_dirty = true;
+            }
             route_has_mutated = true;
         }
 
         // Apply labels
         for label in &prepared.add_labels {
-            retry_mutation_with_jsonl_recovery(
+            let add_label_result = retry_mutation_with_jsonl_recovery(
                 &mut prepared.storage_ctx,
                 !route_has_mutated,
                 "update label add",
                 Some(id.as_str()),
                 |storage| storage.add_label(id, label, &prepared.actor),
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                add_label_result,
             )?;
             route_has_mutated = true;
         }
         for label in &prepared.remove_labels {
-            retry_mutation_with_jsonl_recovery(
+            let remove_label_result = retry_mutation_with_jsonl_recovery(
                 &mut prepared.storage_ctx,
                 !route_has_mutated,
                 "update label remove",
                 Some(id.as_str()),
                 |storage| storage.remove_label(id, label, &prepared.actor),
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                remove_label_result,
             )?;
             route_has_mutated = true;
         }
         if prepared.set_labels {
-            retry_mutation_with_jsonl_recovery(
+            let set_labels_result = retry_mutation_with_jsonl_recovery(
                 &mut prepared.storage_ctx,
                 !route_has_mutated,
                 "update label set",
                 Some(id.as_str()),
                 |storage| storage.set_labels(id, &prepared.valid_set_labels, &prepared.actor),
+            );
+            preserve_blocked_cache_on_error(
+                &mut prepared.storage_ctx.storage,
+                blocked_cache_dirty,
+                "update",
+                set_labels_result,
             )?;
             route_has_mutated = true;
         }
 
         // Apply parent
-        apply_parent_update(
+        let parent_result = apply_parent_update(
             &mut prepared.storage_ctx,
             !route_has_mutated,
             id,
             &prepared.resolved_parent,
             &prepared.actor,
             defer_blocked_cache_rebuild,
+        );
+        preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+            parent_result,
         )?;
-        if !matches!(&prepared.resolved_parent, ParentUpdatePlan::Unchanged) {
+        if parent_changes_cache {
             route_has_mutated = true;
+            blocked_cache_dirty = true;
         }
 
         // Get issue after update for output
-        let issue_after = prepared.storage_ctx.storage.get_issue(id)?;
+        let issue_after_result = prepared.storage_ctx.storage.get_issue(id);
+        let issue_after = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+            issue_after_result,
+        )?;
 
         if let Some(issue) = issue_after {
             if ctx.is_json() || ctx.is_toon() {
@@ -356,8 +407,12 @@ fn execute_prepared_route(
         }
     }
 
-    if defer_blocked_cache_rebuild && route_has_mutated {
-        prepared.storage_ctx.storage.rebuild_blocked_cache(true)?;
+    if defer_blocked_cache_rebuild && blocked_cache_dirty {
+        finalize_batched_blocked_cache_refresh(
+            &mut prepared.storage_ctx.storage,
+            blocked_cache_dirty,
+            "update",
+        )?;
     }
 
     prepared.storage_ctx.flush_no_db_if_dirty()?;
@@ -803,10 +858,14 @@ fn parse_date(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CliOverrides;
     use crate::logging::init_test_logging;
     use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use chrono::{Datelike, Timelike};
+    use std::fs;
+    use tempfile::TempDir;
     use tracing::info;
 
     #[test]
@@ -1097,6 +1156,112 @@ mod tests {
 
         info!(
             "test_validate_multi_issue_external_ref_update_rejects_multiple_distinct_ids: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_execute_prepared_route_repairs_blocked_cache_after_late_update_error() {
+        init_test_logging();
+        info!(
+            "test_execute_prepared_route_repairs_blocked_cache_after_late_update_error: starting"
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+
+        let blocker = Issue {
+            id: "bd-blocker".to_string(),
+            title: "Blocker".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+        let blocked = Issue {
+            id: "bd-blocked".to_string(),
+            title: "Blocked".to_string(),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            ..Issue::default()
+        };
+
+        storage_ctx
+            .storage
+            .create_issue(&blocker, "tester")
+            .expect("create blocker");
+        storage_ctx
+            .storage
+            .create_issue(&blocked, "tester")
+            .expect("create blocked");
+        storage_ctx
+            .storage
+            .add_dependency("bd-blocked", "bd-blocker", "blocks", "tester")
+            .expect("create dependency");
+
+        assert!(
+            storage_ctx
+                .storage
+                .get_blocked_ids()
+                .expect("blocked ids before update")
+                .contains("bd-blocked")
+        );
+
+        storage_ctx
+            .storage
+            .execute_raw("DROP TABLE labels")
+            .expect("drop labels table");
+
+        let prepared = PreparedUpdateRoute {
+            storage_ctx,
+            actor: "tester".to_string(),
+            resolved_ids: vec!["bd-blocker".to_string()],
+            update: IssueUpdate {
+                status: Some(Status::Closed),
+                ..IssueUpdate::default()
+            },
+            has_updates: true,
+            add_labels: vec!["late-runtime-error".to_string()],
+            remove_labels: Vec::new(),
+            set_labels: false,
+            valid_set_labels: Vec::new(),
+            resolved_parent: ParentUpdatePlan::Unchanged,
+        };
+
+        let ctx = OutputContext::from_flags(false, false, true);
+        let err = execute_prepared_route(prepared, &ctx).expect_err("update should fail");
+        assert!(
+            !err.to_string().contains("failed to rebuild blocked cache"),
+            "late runtime error should not be masked by blocked-cache repair: {err}"
+        );
+
+        let reopened =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen");
+        let blocker_after = reopened
+            .storage
+            .get_issue("bd-blocker")
+            .expect("load blocker")
+            .expect("blocker should still exist");
+        assert_eq!(blocker_after.status, Status::Closed);
+        assert!(
+            !reopened
+                .storage
+                .get_blocked_ids()
+                .expect("blocked ids after repair")
+                .contains("bd-blocked"),
+            "dependent issue should be unblocked after the blocker closed despite the later error"
+        );
+
+        info!(
+            "test_execute_prepared_route_repairs_blocked_cache_after_late_update_error: assertions passed"
         );
     }
 }

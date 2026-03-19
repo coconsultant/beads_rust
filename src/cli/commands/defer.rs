@@ -1,6 +1,9 @@
 //! Defer and Undefer command implementations.
 
-use crate::cli::commands::{preserve_blocked_cache_on_error, update_issue_with_recovery};
+use crate::cli::commands::{
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    update_issue_with_recovery,
+};
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -290,7 +293,7 @@ fn execute_defer_route(
             "Rebuilding blocked cache after deferring {} issues",
             deferred_issues.len()
         );
-        storage_ctx.storage.rebuild_blocked_cache(true)?;
+        finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "defer")?;
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -518,7 +521,7 @@ fn execute_undefer_route(
             "Rebuilding blocked cache after undeferring {} issues",
             undeferred_issues.len()
         );
-        storage_ctx.storage.rebuild_blocked_cache(true)?;
+        finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "undefer")?;
     }
 
     storage_ctx.flush_no_db_if_dirty()?;

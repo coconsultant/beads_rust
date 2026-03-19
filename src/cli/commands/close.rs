@@ -1,7 +1,10 @@
 //! Close command implementation.
 
 use crate::cli::CloseArgs as CliCloseArgs;
-use crate::cli::commands::{preserve_blocked_cache_on_error, update_issue_with_recovery};
+use crate::cli::commands::{
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    update_issue_with_recovery,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Status};
@@ -656,7 +659,7 @@ fn execute_route(
             "Rebuilding blocked cache after closing {} issues",
             closed_issues.len()
         );
-        storage_ctx.storage.rebuild_blocked_cache(true)?;
+        finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "close")?;
     }
 
     let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {

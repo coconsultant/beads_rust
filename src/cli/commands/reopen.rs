@@ -2,7 +2,8 @@
 
 use crate::cli::ReopenArgs;
 use crate::cli::commands::{
-    preserve_blocked_cache_on_error, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -299,7 +300,7 @@ fn execute_route(
             "Rebuilding blocked cache after reopening {} issues",
             reopened_issues.len()
         );
-        storage_ctx.storage.rebuild_blocked_cache(true)?;
+        finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "reopen")?;
     }
 
     storage_ctx.flush_no_db_if_dirty()?;

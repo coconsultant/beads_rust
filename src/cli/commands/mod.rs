@@ -69,11 +69,28 @@ pub(super) fn rebuild_blocked_cache_after_partial_mutation(
         return Ok(());
     }
 
+    let stale_mark_error = storage.mark_blocked_cache_stale().err();
+    if let Some(mark_error) = stale_mark_error.as_ref() {
+        tracing::warn!(
+            command = command,
+            error = %mark_error,
+            "Failed to pre-mark blocked cache stale before rebuilding after partial mutation"
+        );
+    }
+
     storage
         .rebuild_blocked_cache(true)
         .map(|_| ())
         .map_err(|rebuild_err| crate::error::BeadsError::WithContext {
-            context: format!("failed to rebuild blocked cache after partial {command} mutation"),
+            context: stale_mark_error.as_ref().map_or_else(
+                || format!("failed to rebuild blocked cache after partial {command} mutation"),
+                |mark_error| {
+                    format!(
+                        "failed to rebuild blocked cache after partial {command} mutation; \
+                         pre-marking it stale also failed: {mark_error}"
+                    )
+                },
+            ),
             source: Box::new(rebuild_err),
         })
 }
@@ -99,6 +116,47 @@ pub(super) fn preserve_blocked_cache_on_error<T>(
             }
             Err(operation_err)
         }
+    }
+}
+
+pub(super) fn finalize_batched_blocked_cache_refresh(
+    storage: &mut SqliteStorage,
+    cache_dirty: bool,
+    command: &str,
+) -> crate::Result<()> {
+    if !cache_dirty {
+        return Ok(());
+    }
+
+    let stale_mark_error = storage.mark_blocked_cache_stale().err();
+    if let Some(mark_error) = stale_mark_error.as_ref() {
+        tracing::warn!(
+            command = command,
+            error = %mark_error,
+            "Failed to pre-mark blocked cache stale before batched refresh"
+        );
+    }
+
+    match storage.rebuild_blocked_cache(true) {
+        Ok(_) => Ok(()),
+        Err(rebuild_err) if stale_mark_error.is_none() => {
+            tracing::warn!(
+                command = command,
+                error = %rebuild_err,
+                "Blocked cache refresh deferred after successful batched mutation; cache remains marked stale"
+            );
+            Ok(())
+        }
+        Err(rebuild_err) => Err(crate::error::BeadsError::WithContext {
+            context: format!(
+                "failed to rebuild blocked cache after successful batched {command} mutation; \
+                 leaving the cache stale also failed first: {}",
+                stale_mark_error
+                    .as_ref()
+                    .expect("stale mark error should exist on this branch")
+            ),
+            source: Box::new(rebuild_err),
+        }),
     }
 }
 
@@ -197,8 +255,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        preserve_blocked_cache_on_error, rebuild_blocked_cache_after_partial_mutation,
-        retry_mutation_with_jsonl_recovery,
+        finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+        rebuild_blocked_cache_after_partial_mutation, retry_mutation_with_jsonl_recovery,
     };
     use crate::config::{CliOverrides, open_storage_with_cli};
     use crate::error::BeadsError;
@@ -247,6 +305,35 @@ mod tests {
             }
             other => panic!("expected WithContext, got {other:?}"),
         }
+
+        assert_eq!(
+            storage
+                .get_metadata("blocked_cache_state")
+                .unwrap()
+                .as_deref(),
+            Some("stale")
+        );
+    }
+
+    #[test]
+    fn finalize_batched_refresh_marks_cache_stale_when_rebuild_fails() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("conn");
+        conn.execute("DROP TABLE blocked_issues_cache")
+            .expect("drop blocked cache table");
+
+        finalize_batched_blocked_cache_refresh(&mut storage, true, "close")
+            .expect("batched refresh should degrade to a stale marker");
+
+        assert_eq!(
+            storage
+                .get_metadata("blocked_cache_state")
+                .unwrap()
+                .as_deref(),
+            Some("stale")
+        );
     }
 
     #[test]
