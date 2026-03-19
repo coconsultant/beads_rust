@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.1.28"
+version = "0.1.29"
 edition = "2024"
 rust-version = "1.88"
 description = "Agent-first issue tracker (SQLite + JSONL)"
@@ -46,21 +46,21 @@ clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.0"
-fsqlite-types = "0.1.0"
-fsqlite-error = "0.1.0"
-fsqlite-core = "0.1.0"
-fsqlite-func = "0.1.0"
-fsqlite-vdbe = "0.1.0"
-fsqlite-vfs = "0.1.0"
-fsqlite-pager = "0.1.0"
-fsqlite-parser = "0.1.0"
-fsqlite-planner = "0.1.0"
-fsqlite-wal = "0.1.0"
-fsqlite-btree = "0.1.0"
-fsqlite-ast = "0.1.0"
-fsqlite-mvcc = "0.1.0"
-fsqlite-observability = "0.1.0"
+fsqlite = "0.1.1"
+fsqlite-types = "0.1.1"
+fsqlite-error = "0.1.1"
+fsqlite-core = "0.1.1"
+fsqlite-func = "0.1.1"
+fsqlite-vdbe = "0.1.1"
+fsqlite-vfs = "0.1.2"
+fsqlite-pager = "0.1.1"
+fsqlite-parser = "0.1.1"
+fsqlite-planner = "0.1.1"
+fsqlite-wal = "0.1.1"
+fsqlite-btree = "0.1.1"
+fsqlite-ast = "0.1.1"
+fsqlite-mvcc = "0.1.1"
+fsqlite-observability = "0.1.1"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -152,8 +152,8 @@ self_update = [
 
 # Override crates.io fsqlite with the frankensqlite Git HEAD so standalone
 # builds and `cargo install` work without requiring a local sibling checkout.
-# For local development with a sibling checkout, cargo will prefer path deps
-# if ../frankensqlite exists (add path overrides to .cargo/config.toml).
+# For local development with a sibling checkout, add path overrides to
+# .cargo/config.toml pointing to /dp/frankensqlite/crates/*.
 [patch.crates-io]
 fsqlite              = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite" }
 fsqlite-ast          = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ast" }
