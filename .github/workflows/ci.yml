@@ -31,6 +31,9 @@ jobs:
       - name: Checkout frankensqlite (path dependency)
         run: git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
 
+      - name: Checkout asupersync (path dependency of fsqlite-core)
+        run: git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -62,6 +65,9 @@ jobs:
       - name: Checkout frankensqlite (path dependency)
         run: git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
 
+      - name: Checkout asupersync (path dependency of fsqlite-core)
+        run: git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+
       - name: Install cargo-audit
         uses: taiki-e/install-action@0bc4cd8a3e21db4cb9519857377b0c8c5e150de5  # v2
         with:
@@ -84,6 +90,9 @@ jobs:
 
       - name: Checkout frankensqlite (path dependency)
         run: git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+
+      - name: Checkout asupersync (path dependency of fsqlite-core)
+        run: git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -114,6 +123,9 @@ jobs:
 
       - name: Checkout frankensqlite (path dependency)
         run: git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+
+      - name: Checkout asupersync (path dependency of fsqlite-core)
+        run: git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -176,6 +188,9 @@ jobs:
       - name: Checkout frankensqlite (path dependency)
         run: git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
 
+      - name: Checkout asupersync (path dependency of fsqlite-core)
+        run: git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -223,6 +238,9 @@ jobs:
 
       - name: Checkout frankensqlite (path dependency)
         run: git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+
+      - name: Checkout asupersync (path dependency of fsqlite-core)
+        run: git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -360,6 +378,9 @@ jobs:
 
       - name: Checkout frankensqlite (path dependency)
         run: git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+
+      - name: Checkout asupersync (path dependency of fsqlite-core)
+        run: git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
