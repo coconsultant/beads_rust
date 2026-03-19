@@ -9,7 +9,7 @@
 mod common;
 
 use common::cli::parse_list_issues;
-use common::harness::{TestWorkspace, extract_json_payload, parse_created_id};
+use common::harness::{TestWorkspace, parse_created_id};
 
 #[test]
 fn harness_full_workflow() {

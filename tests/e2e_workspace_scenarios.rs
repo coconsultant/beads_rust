@@ -13,8 +13,8 @@
 
 mod common;
 
-use common::harness::{TestWorkspace, extract_json_payload};
 use common::cli::parse_list_issues;
+use common::harness::{TestWorkspace, extract_json_payload};
 use serde_json::Value;
 
 // =============================================================================

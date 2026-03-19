@@ -5,9 +5,7 @@
 
 mod common;
 
-use common::cli::{
-    BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env,
-};
+use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
 use fsqlite::Connection;
 use serde_json::Value;
 use std::fs;
@@ -618,7 +616,7 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_malformed() {
     let listed = parse_list_issues(&show.stdout);
     assert!(
         !listed.is_empty(),
-        "expected repaired database to contain at least one issue: {listed}"
+        "expected repaired database to contain at least one issue: {listed:?}"
     );
 }
 

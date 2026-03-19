@@ -6688,7 +6688,7 @@ impl SqliteStorage {
 mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
-    use chrono::{Datelike, DateTime, TimeZone, Utc};
+    use chrono::{DateTime, Datelike, TimeZone, Utc};
     use std::fs;
     use tempfile::TempDir;
 

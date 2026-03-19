@@ -1349,8 +1349,11 @@ pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
         return Some(!v);
     }
     // Legacy key: no-auto-import / no_auto_import / no.auto.import
-    get_startup_value(layer, &["no-auto-import", "no_auto_import", "no.auto.import"])
-        .and_then(|value| parse_bool(value))
+    get_startup_value(
+        layer,
+        &["no-auto-import", "no_auto_import", "no.auto.import"],
+    )
+    .and_then(|value| parse_bool(value))
 }
 
 fn resolve_bootstrap_issue_prefix(
@@ -1721,11 +1724,7 @@ impl CliOverrides {
         if let Some(no_auto_flush) = self.no_auto_flush {
             // Store as the canonical positive key so it wins over any legacy
             // `no-auto-flush` entry in the project/user config when merged.
-            insert_key_value(
-                &mut layer,
-                "sync.auto_flush",
-                (!no_auto_flush).to_string(),
-            );
+            insert_key_value(&mut layer, "sync.auto_flush", (!no_auto_flush).to_string());
         }
         if let Some(no_auto_import) = self.no_auto_import {
             insert_key_value(

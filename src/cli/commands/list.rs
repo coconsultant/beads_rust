@@ -1,7 +1,7 @@
 //! List command implementation.
 //!
 //! Primary discovery interface with classic filter semantics and
-//! `IssueWithCounts` JSON output. Supports text, JSON, and CSV formats.
+//! paginated `ListPage` JSON output. Supports text, JSON, and CSV formats.
 
 use crate::cli::{ListArgs, OutputFormat, resolve_output_format_with_outer_mode};
 use crate::config;
