@@ -52,6 +52,11 @@ pub struct MutationContext {
     /// descendants) need their blocked-cache entries recomputed.  If `None`
     /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
     pub cache_affected_ids: Option<HashSet<String>>,
+    /// When true, skip the eager post-commit cache refresh and rely on the
+    /// lazy `ensure_blocked_cache_fresh` rebuild triggered by the next read.
+    /// This reduces DB write-lock contention for high-frequency mutations like
+    /// dep add/remove where the caller does not immediately read blocked state.
+    pub defer_cache_refresh: bool,
     pub force_flush: bool,
 }
 
@@ -59,12 +64,21 @@ pub struct MutationContext {
 enum BlockedCacheRefreshPlan {
     Full,
     Incremental(HashSet<String>),
+    /// The stale marker has been set inside the transaction; skip the eager
+    /// post-commit rebuild and let `ensure_blocked_cache_fresh` handle it
+    /// lazily on the next read.  Eliminates a second write transaction per
+    /// dep add/remove, reducing DB lock contention under concurrent agents.
+    Deferred,
 }
 
 impl BlockedCacheRefreshPlan {
     fn from_context(ctx: &MutationContext) -> Option<Self> {
         if !ctx.invalidate_blocked_cache {
             return None;
+        }
+
+        if ctx.defer_cache_refresh {
+            return Some(Self::Deferred);
         }
 
         match &ctx.cache_affected_ids {
@@ -84,6 +98,7 @@ impl MutationContext {
             dirty_ids: HashSet::new(),
             invalidate_blocked_cache: false,
             cache_affected_ids: None,
+            defer_cache_refresh: false,
             force_flush: false,
         }
     }
@@ -142,6 +157,18 @@ impl MutationContext {
         for id in ids {
             set.insert((*id).to_string());
         }
+    }
+
+    /// Mark the blocked-cache as needing invalidation but defer the actual
+    /// rebuild to the next read that calls `ensure_blocked_cache_fresh`.
+    ///
+    /// Use this for high-frequency write operations (dep add/remove) where the
+    /// caller does not immediately read blocked state and where eliminating the
+    /// second post-commit write transaction reduces DB lock contention under
+    /// concurrent agents.
+    pub fn invalidate_cache_deferred(&mut self) {
+        self.invalidate_blocked_cache = true;
+        self.defer_cache_refresh = true;
     }
 }
 
@@ -229,6 +256,9 @@ impl SqliteStorage {
             BlockedCacheRefreshPlan::Incremental(ids) => {
                 Self::incremental_blocked_cache_update(conn, ids)
             }
+            // Deferred plan is never applied eagerly; the stale marker already
+            // set inside the write transaction will trigger a lazy rebuild.
+            BlockedCacheRefreshPlan::Deferred => Ok(0),
         }
     }
 
@@ -818,14 +848,27 @@ impl SqliteStorage {
             Ok((result, blocked_cache_plan))
         })?;
 
-        if let Some(ref plan) = blocked_cache_plan
-            && let Err(error) = self.refresh_blocked_cache_after_commit(op, plan)
-        {
-            tracing::warn!(
-                operation = op,
-                error = %error,
-                "Blocked cache refresh deferred after commit; cache remains marked stale"
-            );
+        match blocked_cache_plan {
+            Some(BlockedCacheRefreshPlan::Deferred) => {
+                // Stale marker already set inside the transaction.  The next
+                // read that calls ensure_blocked_cache_fresh will rebuild.
+                // Skipping the eager second write transaction here eliminates
+                // the main source of DB lock contention for dep add/remove.
+                tracing::debug!(
+                    operation = op,
+                    "Blocked cache refresh deferred; will rebuild lazily on next read"
+                );
+            }
+            Some(ref plan) => {
+                if let Err(error) = self.refresh_blocked_cache_after_commit(op, plan) {
+                    tracing::warn!(
+                        operation = op,
+                        error = %error,
+                        "Blocked cache refresh deferred after commit; cache remains marked stale"
+                    );
+                }
+            }
+            None => {}
         }
 
         Ok(result)
@@ -3527,7 +3570,12 @@ impl SqliteStorage {
                 Some(format!("Added dependency on {depends_on_id} ({dep_type})")),
             );
             ctx.mark_dirty(issue_id);
-            ctx.invalidate_cache_for(&[issue_id, depends_on_id]);
+            // Defer the blocked-cache rebuild to the next read rather than
+            // doing it eagerly in a second write transaction.  This eliminates
+            // the main DB lock contention source under concurrent agents:
+            // previously even the incremental path held a second write lock
+            // while traversing all parent-child edges in the graph.
+            ctx.invalidate_cache_deferred();
 
             Ok(true)
         })
@@ -3568,7 +3616,8 @@ impl SqliteStorage {
                     Some(format!("Removed dependency on {depends_on_id}")),
                 );
                 ctx.mark_dirty(issue_id);
-                ctx.invalidate_cache_for(&[issue_id, depends_on_id]);
+                // Defer rebuild for the same reason as add_dependency_with_metadata.
+                ctx.invalidate_cache_deferred();
             }
 
             Ok(rows > 0)
