@@ -663,7 +663,7 @@ fix_alias_conflicts() {
         if [ -f "$rc" ]; then
             # Add unalias after any potential alias definitions
             if ! grep -q "unalias br.*# br installer" "$rc" 2>/dev/null; then
-                if grep -q "alias br=" "$rc" 2>/dev/null || grep -q "\.bun" "$rc" 2>/dev/null; then
+                if grep -q "alias br=" "$rc" 2>/dev/null; then
                     echo "" >> "$rc"
                     echo "unalias br 2>/dev/null  # br installer - remove conflicting alias" >> "$rc"
                     log_step "Added unalias to $rc to prevent conflicts"
