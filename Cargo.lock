@@ -1654,6 +1654,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-types",
  "fsqlite-vfs",
+ "fsqlite-wal",
  "hashbrown 0.14.5",
  "parking_lot",
  "smallvec",
