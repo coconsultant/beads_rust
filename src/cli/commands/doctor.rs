@@ -72,7 +72,10 @@ const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale 
 
 #[derive(Debug, Default)]
 struct SidecarInspection {
+    /// Error-level findings that indicate a genuine problem requiring repair.
     findings: Vec<String>,
+    /// Warning-level findings that are informational but do not require repair.
+    warning_findings: Vec<String>,
     quarantine_candidates: Vec<PathBuf>,
     wal_requires_reconciliation: bool,
 }
@@ -245,13 +248,15 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     }
 
     if wal_kind.is_regular_file() && !shm_kind.exists() {
-        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
-        inspection.findings.push(format!(
-            "WAL sidecar exists without a matching SHM sidecar at {}",
-            wal_path.display()
+        // frankensqlite manages the WAL index in process-local memory rather than in an SHM
+        // file, so a WAL without a sibling SHM is the normal operating state — not an error.
+        // We record this as a warning finding so callers can observe it, but we do not set
+        // wal_requires_reconciliation and do not quarantine the WAL, because the WAL is
+        // valid and the database is accessible.  The db.write_probe check validates liveness.
+        inspection.warning_findings.push(format!(
+            "WAL sidecar exists without a matching SHM sidecar at {} (expected for frankensqlite)",
+            PathBuf::from(format!("{}-wal", db_path.to_string_lossy())).display()
         ));
-        inspection.wal_requires_reconciliation = true;
-        inspection.quarantine_candidates.push(wal_path);
     }
 
     if shm_kind.is_regular_file() && !wal_kind.exists() {
@@ -287,25 +292,39 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
 
 fn check_database_sidecars(db_path: &Path, checks: &mut Vec<CheckResult>) -> Result<()> {
     let inspection = inspect_database_sidecars(db_path)?;
-    if inspection.findings.is_empty() {
-        push_check(checks, "db.sidecars", CheckStatus::Ok, None, None);
+
+    if !inspection.findings.is_empty() {
+        push_check(
+            checks,
+            "db.sidecars",
+            CheckStatus::Error,
+            Some(inspection.findings[0].clone()),
+            Some(serde_json::json!({
+                "findings": inspection.findings,
+                "quarantine_candidates": inspection
+                    .quarantine_candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            })),
+        );
         return Ok(());
     }
 
-    push_check(
-        checks,
-        "db.sidecars",
-        CheckStatus::Error,
-        Some(inspection.findings[0].clone()),
-        Some(serde_json::json!({
-            "findings": inspection.findings,
-            "quarantine_candidates": inspection
-                .quarantine_candidates
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>(),
-        })),
-    );
+    if !inspection.warning_findings.is_empty() {
+        push_check(
+            checks,
+            "db.sidecars",
+            CheckStatus::Warn,
+            Some(inspection.warning_findings[0].clone()),
+            Some(serde_json::json!({
+                "findings": inspection.warning_findings,
+            })),
+        );
+        return Ok(());
+    }
+
+    push_check(checks, "db.sidecars", CheckStatus::Ok, None, None);
     Ok(())
 }
 
@@ -852,6 +871,43 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
     Ok(())
 }
 
+/// Return true if all integrity check messages relate only to "never used" page notices.
+///
+/// frankensqlite may emit "page N is never used" after concurrent writes due to
+/// a known page-accounting inconsistency in the free-list header.  The data
+/// itself remains intact and the write probe succeeds, so these messages are
+/// treated as warnings rather than fatal errors.
+///
+/// Both the frankensqlite internal check and the external sqlite3 CLI are handled:
+///
+///   frankensqlite: "database disk image is malformed: page N is never used"
+///   sqlite3 CLI:   "*** in database main ***" followed by "Page N: never used"
+///
+/// The function requires that at least one "never used" message is present and
+/// that every message in the list is either a "never used" page notice or a
+/// known benign context header that accompanies them.
+fn integrity_messages_only_unused_pages(messages: &[String]) -> bool {
+    if messages.is_empty() {
+        return false;
+    }
+    // Must have at least one actual "never used" notice.
+    let has_never_used = messages.iter().any(|msg| {
+        let lower = msg.to_lowercase();
+        lower.contains("never used")
+    });
+    if !has_never_used {
+        return false;
+    }
+    // Every message must be either:
+    //   (a) a "never used" page notice (possibly wrapped in "malformed" prefix), or
+    //   (b) a sqlite3 CLI context header line ("*** in database main ***")
+    messages.iter().all(|msg| {
+        let lower = msg.to_lowercase();
+        lower.contains("never used")
+            || lower.contains("*** in database")
+    })
+}
+
 fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
     let rows = match conn.query("PRAGMA integrity_check") {
         Ok(rows) => rows,
@@ -876,6 +932,16 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
             CheckStatus::Ok,
             None,
             None,
+        );
+    } else if integrity_messages_only_unused_pages(&messages) {
+        // Unused-page notices are a known frankensqlite page-accounting artefact.
+        // The data is intact (write probe passes), so report Warn rather than Error.
+        push_check(
+            checks,
+            "sqlite.integrity_check",
+            CheckStatus::Warn,
+            Some(messages.join("; ")),
+            (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
         );
     } else {
         push_check(
@@ -1176,6 +1242,16 @@ fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
                 CheckStatus::Ok,
                 None,
                 None,
+            );
+        }
+        Ok(messages) if integrity_messages_only_unused_pages(&messages) => {
+            // Treat never-used page notices as warnings (frankensqlite page-accounting artefact).
+            push_check(
+                checks,
+                "sqlite3.integrity_check",
+                CheckStatus::Warn,
+                Some(messages.join("; ")),
+                (messages.len() > 1).then(|| serde_json::json!({ "messages": messages })),
             );
         }
         Ok(messages) => {
@@ -2384,7 +2460,9 @@ mod tests {
     }
 
     #[test]
-    fn test_check_database_sidecars_detects_wal_without_shm() -> Result<()> {
+    fn test_check_database_sidecars_warns_on_wal_without_shm() -> Result<()> {
+        // frankensqlite does not create SHM files — WAL without SHM is expected and should
+        // produce a Warn (informational) rather than an Error that triggers repair.
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         fs::write(&db_path, b"sqlite-header-placeholder")?;
@@ -2397,7 +2475,11 @@ mod tests {
         check_database_sidecars(&db_path, &mut checks)?;
 
         let check = find_check(&checks, "db.sidecars").expect("sidecar check");
-        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "expected Warn for WAL-without-SHM, got {:?}",
+            check.status
+        );
         assert!(
             check.message.as_deref().is_some_and(|message| {
                 message.contains("WAL sidecar exists without a matching SHM sidecar")
@@ -2484,21 +2566,26 @@ mod tests {
     }
 
     #[test]
-    fn test_repair_recoverable_db_state_preserves_orphan_wal_when_checkpoint_fails() -> Result<()> {
+    fn test_repair_recoverable_db_state_skips_repair_for_wal_without_shm_warn() -> Result<()> {
+        // WAL-without-SHM is now a Warn (not Error) for frankensqlite compatibility.
+        // repair_recoverable_db_state should NOT attempt any repair for this condition.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir)?;
         let db_path = beads_dir.join("beads.db");
         fs::write(&db_path, b"not a sqlite database")?;
         let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
-        fs::write(&wal_path, b"orphan wal")?;
+        fs::write(&wal_path, b"frankensqlite wal without shm")?;
 
         let report = DoctorReport {
-            ok: false,
+            ok: true, // Warn-only report is considered ok
             checks: vec![CheckResult {
                 name: "db.sidecars".to_string(),
-                status: CheckStatus::Error,
-                message: Some("WAL sidecar exists without a matching SHM sidecar".to_string()),
+                status: CheckStatus::Warn,
+                message: Some(
+                    "WAL sidecar exists without a matching SHM sidecar (expected for frankensqlite)"
+                        .to_string(),
+                ),
                 details: None,
             }],
         };
@@ -2506,15 +2593,15 @@ mod tests {
         let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
         assert!(
             !repair.wal_checkpoint_completed,
-            "checkpoint should not succeed against an invalid database"
+            "no checkpoint should be attempted for a Warn-level sidecar check"
         );
         assert!(
             repair.quarantined_artifacts.is_empty(),
-            "orphan WAL should remain in place when checkpoint reconciliation fails"
+            "WAL should not be quarantined for a Warn-level sidecar check"
         );
         assert!(
             wal_path.exists(),
-            "orphan WAL should not be quarantined after failed reconciliation"
+            "WAL file should remain untouched when sidecar check is only a warning"
         );
         Ok(())
     }
