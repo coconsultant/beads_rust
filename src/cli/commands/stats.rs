@@ -791,10 +791,12 @@ fn repo_relative_git_path(path: &Path, repo_root: &Path) -> Option<PathBuf> {
 }
 
 fn git_pathspec_string(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
+    let pathspec = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        pathspec.replace('\\', "/")
+    } else {
+        pathspec
+    }
 }
 
 fn recent_activity_cache_key(pathspec: &str, hours: u32) -> String {
@@ -1746,7 +1748,7 @@ mod tests {
     #[test]
     fn test_git_pathspec_string_normalizes_separators() {
         assert_eq!(
-            git_pathspec_string(&PathBuf::from(r".beads\issues.jsonl")),
+            git_pathspec_string(&PathBuf::from(".beads").join("issues.jsonl")),
             ".beads/issues.jsonl"
         );
         assert_eq!(
