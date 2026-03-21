@@ -952,6 +952,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
+        let _guard = DirGuard::new(temp.path());
         let ctx = OutputContext::from_flags(false, false, true);
         commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
 
@@ -962,7 +963,6 @@ mod tests {
             storage.create_issue(&issue, "tester").expect("create");
         }
 
-        let _guard = DirGuard::new(temp.path());
         let defer_args = DeferArgs {
             ids: vec!["bd-defer-3".to_string()],
             until: Some("+1d".to_string()),

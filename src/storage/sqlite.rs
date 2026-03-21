@@ -329,7 +329,6 @@ impl SqliteStorage {
     /// Returns an error if the connection cannot be established or schema application fails.
     pub fn open_with_timeout(path: &Path, lock_timeout_ms: Option<u64>) -> Result<Self> {
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
-        conn.set_checkpoint_on_close(false);
 
         // Configure busy_timeout so that BEGIN IMMEDIATE retries instead of
         // failing instantly when another writer holds the lock (issue #109).
@@ -358,9 +357,16 @@ impl SqliteStorage {
     ///
     /// Returns an error if the connection cannot be established.
     pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open(":memory:")?;
+        static MEM_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = MEM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("beads_mem_{}_{}.db", std::process::id(), count));
+        let conn = Connection::open(path.to_string_lossy().into_owned())?;
+        
         conn.execute(&format!("PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}"))?;
-        apply_schema(&conn)?;
+        if let Err(e) = apply_schema(&conn) {
+            eprintln!("apply_schema failed: {:?}", e);
+            return Err(e);
+        }
         Ok(Self {
             conn,
             mutation_count: 0,
@@ -7539,6 +7545,7 @@ mod tests {
             .unwrap();
 
         let events = storage.get_events("bd-r1", 10).unwrap();
+        println!("Events: {:#?}", events);
         assert!(
             events
                 .iter()
