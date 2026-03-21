@@ -3068,7 +3068,7 @@ impl SqliteStorage {
                      bc.blocked_by
               FROM issues i
               INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
-              WHERE i.status IN ('open', 'in_progress')
+              WHERE i.status NOT IN ('closed', 'tombstone')
               ORDER BY i.priority ASC, i.created_at DESC",
         )?;
 
@@ -7432,6 +7432,52 @@ mod tests {
         assert_eq!(blocked_issues.len(), 1);
         assert_eq!(blocked_issues[0].0.id, "bd-b2");
         assert_eq!(blocked_issues[0].1.len(), 1);
+    }
+
+    #[test]
+    fn test_get_blocked_issues_includes_nonterminal_statuses() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 1, None, t1, None);
+        let mut deferred = make_issue(
+            "bd-b2",
+            "Deferred blocked",
+            Status::Deferred,
+            2,
+            None,
+            t1,
+            None,
+        );
+        deferred.defer_until = Some(t1 + chrono::Duration::days(1));
+        let custom = make_issue(
+            "bd-b3",
+            "Custom blocked",
+            Status::Custom("review".to_string()),
+            2,
+            None,
+            t1,
+            None,
+        );
+
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&deferred, "tester").unwrap();
+        storage.create_issue(&custom, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-b2", "bd-b1", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-b3", "bd-b1", "blocks", "tester")
+            .unwrap();
+
+        let blocked_issues = storage.get_blocked_issues().unwrap();
+        let ids: HashSet<_> = blocked_issues
+            .iter()
+            .map(|(issue, _)| issue.id.as_str())
+            .collect();
+        assert!(ids.contains("bd-b2"));
+        assert!(ids.contains("bd-b3"));
     }
 
     #[test]

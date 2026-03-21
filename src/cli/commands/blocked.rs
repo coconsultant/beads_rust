@@ -154,7 +154,7 @@ fn execute_inner(
         if !external_ids_to_fetch.is_empty() {
             let fetched_issues = storage.get_issues_by_ids(&external_ids_to_fetch)?;
             for issue in fetched_issues {
-                if issue.status.is_terminal() {
+                if !include_in_blocked_list(&issue.status) {
                     continue;
                 }
                 if let Some(blockers) = external_blockers.remove(&issue.id) {
@@ -261,6 +261,10 @@ fn execute_inner(
     }
 
     Ok(())
+}
+
+fn include_in_blocked_list(status: &crate::model::Status) -> bool {
+    !status.is_terminal()
 }
 
 /// Sort blocked issues by priority (ascending), then by blocker count (descending).
@@ -663,6 +667,20 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].issue.id, "a");
         info!("test_filter_by_type_filters_correctly: assertions passed");
+    }
+
+    #[test]
+    fn test_include_in_blocked_list_matches_local_blocked_query_statuses() {
+        assert!(include_in_blocked_list(&Status::Open));
+        assert!(include_in_blocked_list(&Status::InProgress));
+        assert!(include_in_blocked_list(&Status::Deferred));
+        assert!(include_in_blocked_list(&Status::Blocked));
+        assert!(include_in_blocked_list(&Status::Pinned));
+        assert!(include_in_blocked_list(&Status::Custom(
+            "review".to_string()
+        )));
+        assert!(!include_in_blocked_list(&Status::Closed));
+        assert!(!include_in_blocked_list(&Status::Tombstone));
     }
 
     #[test]
