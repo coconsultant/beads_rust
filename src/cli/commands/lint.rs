@@ -265,6 +265,9 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
         if status.is_terminal() {
             filters.include_closed = true;
         }
+        if status == Status::Deferred {
+            filters.include_deferred = true;
+        }
         filters.statuses = Some(vec![status]);
     } else if status_filter.eq_ignore_ascii_case("all") {
         filters.include_closed = true;

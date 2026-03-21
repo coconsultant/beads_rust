@@ -380,6 +380,50 @@ fn e2e_lint_filter_by_status_all() {
 }
 
 #[test]
+fn e2e_lint_filter_by_status_deferred() {
+    let _log = common::test_log("e2e_lint_filter_by_status_deferred");
+    let workspace = BrWorkspace::new();
+    init_workspace(&workspace);
+
+    let open_bug = create_issue_with_description(&workspace, "Open bug", "bug", Some("Open"));
+    let deferred_bug =
+        create_issue_with_description(&workspace, "Deferred bug", "bug", Some("Deferred"));
+    let defer = run_br(
+        &workspace,
+        [
+            "update",
+            &deferred_bug,
+            "--status",
+            "deferred",
+            "--defer",
+            "2100-01-01T00:00:00Z",
+        ],
+        "defer_bug",
+    );
+    assert!(defer.status.success(), "defer failed: {}", defer.stderr);
+
+    let lint = run_br(
+        &workspace,
+        ["lint", "--status", "deferred", "--json"],
+        "lint_status_deferred",
+    );
+    assert!(lint.status.success(), "lint failed: {}", lint.stderr);
+
+    let json_str = extract_json_payload(&lint.stdout);
+    let json: Value = serde_json::from_str(&json_str).expect("valid JSON");
+    let results = json["results"].as_array().expect("results array");
+
+    assert!(
+        results.iter().any(|r| r["id"] == deferred_bug),
+        "deferred issue should appear when filtering deferred"
+    );
+    assert!(
+        !results.iter().any(|r| r["id"] == open_bug),
+        "open issue should not appear when filtering deferred"
+    );
+}
+
+#[test]
 fn e2e_lint_specific_issue_id() {
     let _log = common::test_log("e2e_lint_specific_issue_id");
     // Lint specific issue by ID
