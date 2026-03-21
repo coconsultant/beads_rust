@@ -22,9 +22,9 @@ use std::time::Duration;
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
-// `fsqlite` starts returning false PRIMARY KEY conflicts when we try to
-// rewrite too many existing `export_hashes` rows in one statement. Keeping
-// these batches small avoids spurious post-export failures in `--no-db` mode.
+// `fsqlite` starts returning false PRIMARY KEY conflicts when we rewrite
+// existing `export_hashes` rows with a single multi-values INSERT. Batch the
+// DELETE side for efficiency, but re-insert one row at a time for correctness.
 const EXPORT_HASH_CHUNK_SIZE: usize = 32;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
@@ -652,21 +652,19 @@ impl SqliteStorage {
                 .collect();
             self.conn.execute_with_params(&sql, &params)?;
 
-            // Insert new hashes
-            for insert_chunk in chunk.chunks(300) {
-                let placeholders: Vec<&str> = insert_chunk.iter().map(|_| "(?, ?, ?)").collect();
-                let insert_sql = format!(
-                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES {}",
-                    placeholders.join(", ")
-                );
-                let mut insert_params = Vec::with_capacity(insert_chunk.len() * 3);
-                for (issue_id, content_hash) in insert_chunk {
-                    insert_params.push(SqliteValue::from(issue_id.as_str()));
-                    insert_params.push(SqliteValue::from(content_hash.as_str()));
-                    insert_params.push(SqliteValue::from(now.as_str()));
-                    count += 1;
-                }
-                self.conn.execute_with_params(&insert_sql, &insert_params)?;
+            // `fsqlite` can report a false primary-key conflict when many
+            // existing rows are reinserted via one VALUES list, so keep each
+            // insert isolated after the chunk delete.
+            for (issue_id, content_hash) in chunk {
+                self.conn.execute_with_params(
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from(content_hash.as_str()),
+                        SqliteValue::from(now.as_str()),
+                    ],
+                )?;
+                count += 1;
             }
         }
 
@@ -8950,6 +8948,72 @@ mod tests {
             .unwrap()
             .expect("updated export hash");
         assert_eq!(content_hash, "hash-b-bd-hash-39");
+    }
+
+    #[test]
+    fn test_set_export_hashes_rewrites_large_mixed_prefix_batch_on_file_db() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue_ids: Vec<String> = (0..160)
+            .map(|idx| {
+                let prefix = if idx % 2 == 0 { "bd" } else { "br" };
+                format!("{prefix}-hash-{idx:03}")
+            })
+            .collect();
+
+        let initial_hashes: Vec<(String, String)> = issue_ids
+            .iter()
+            .map(|issue_id| {
+                let issue = make_issue(
+                    issue_id,
+                    &format!("Hash target {issue_id}"),
+                    Status::Open,
+                    2,
+                    None,
+                    created_at,
+                    None,
+                );
+                storage.create_issue(&issue, "tester").unwrap();
+                (issue_id.clone(), format!("hash-a-{issue_id}"))
+            })
+            .collect();
+
+        storage.set_export_hashes(&initial_hashes).unwrap();
+
+        let mut rewritten_hashes: Vec<(String, String)> = issue_ids
+            .iter()
+            .rev()
+            .map(|issue_id| (issue_id.clone(), format!("hash-b-{issue_id}")))
+            .collect();
+        rewritten_hashes.push(("bd-hash-000".to_string(), "hash-c-bd-hash-000".to_string()));
+        rewritten_hashes.push(("br-hash-001".to_string(), "hash-c-br-hash-001".to_string()));
+
+        let updated = storage.set_export_hashes(&rewritten_hashes).unwrap();
+        assert_eq!(updated, issue_ids.len());
+
+        let (first_hash, _) = storage
+            .get_export_hash("bd-hash-000")
+            .unwrap()
+            .expect("updated export hash for bd-hash-000");
+        assert_eq!(first_hash, "hash-c-bd-hash-000");
+
+        let (second_hash, _) = storage
+            .get_export_hash("br-hash-001")
+            .unwrap()
+            .expect("updated export hash for br-hash-001");
+        assert_eq!(second_hash, "hash-c-br-hash-001");
+
+        let row_count = storage
+            .execute_raw_query("SELECT COUNT(*) FROM export_hashes")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(row_count, issue_ids.len() as i64);
     }
 
     #[test]
