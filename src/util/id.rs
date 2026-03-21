@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn test_parse_id_long_hash() {
         // Fallback generates 12 chars + potential nonce.
-        // parse_id currently limits to 8. This test should PASS if we fix it.
+        // parse_id used to limit to 8, but now allows up to MAX_ID_HASH_LEN.
         let long_id = "bd-abc123456789";
         let parsed = parse_id(long_id).unwrap();
         assert_eq!(parsed.hash, "abc123456789");

@@ -359,9 +359,10 @@ impl SqliteStorage {
     pub fn open_memory() -> Result<Self> {
         static MEM_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let count = MEM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("beads_mem_{}_{}.db", std::process::id(), count));
+        let path =
+            std::env::temp_dir().join(format!("beads_mem_{}_{}.db", std::process::id(), count));
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
-        
+
         conn.execute(&format!("PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}"))?;
         if let Err(e) = apply_schema(&conn) {
             eprintln!("apply_schema failed: {:?}", e);
@@ -775,39 +776,27 @@ impl SqliteStorage {
 
             // Write events
             if !ctx.events.is_empty() {
-                for event_chunk in ctx.events.chunks(140) {
-                    let placeholders: Vec<&str> =
-                        event_chunk.iter().map(|_| "(?, ?, ?, ?, ?, ?, ?)").collect();
-                    let sql = format!(
-                        "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES {}",
-                        placeholders.join(", ")
-                    );
-                    let mut params = Vec::with_capacity(event_chunk.len() * 7);
-                    for event in event_chunk {
-                        params.push(SqliteValue::from(event.issue_id.as_str()));
-                        params.push(SqliteValue::from(event.event_type.as_str()));
-                        params.push(SqliteValue::from(event.actor.as_str()));
-                        params.push(
-                            event
-                                .old_value
-                                .as_deref()
-                                .map_or(SqliteValue::Null, SqliteValue::from),
-                        );
-                        params.push(
-                            event
-                                .new_value
-                                .as_deref()
-                                .map_or(SqliteValue::Null, SqliteValue::from),
-                        );
-                        params.push(
-                            event
-                                .comment
-                                .as_deref()
-                                .map_or(SqliteValue::Null, SqliteValue::from),
-                        );
-                        params.push(SqliteValue::from(event.created_at.to_rfc3339()));
-                    }
-                    storage.conn.execute_with_params(&sql, &params)?;
+                let sql = "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                for event in &ctx.events {
+                    let params = vec![
+                        SqliteValue::from(event.issue_id.as_str()),
+                        SqliteValue::from(event.event_type.as_str()),
+                        SqliteValue::from(event.actor.as_str()),
+                        event
+                            .old_value
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .new_value
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .comment
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        SqliteValue::from(event.created_at.to_rfc3339()),
+                    ];
+                    storage.conn.execute_with_params(sql, &params)?;
                 }
             }
 
@@ -9633,7 +9622,6 @@ mod tests {
             "CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_issues_updated_at ON issues(updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_issues_content_hash ON issues(content_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_issues_external_ref ON issues(external_ref) WHERE external_ref IS NOT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_external_ref_unique ON issues(external_ref) WHERE external_ref IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_ephemeral ON issues(ephemeral) WHERE ephemeral = 1",
             "CREATE INDEX IF NOT EXISTS idx_issues_pinned ON issues(pinned) WHERE pinned = 1",
