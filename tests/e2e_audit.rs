@@ -842,8 +842,13 @@ fn e2e_audit_summary() {
 
     // Get ID of Issue 1
     let list = run_br(&workspace, ["list", "--json"], "list");
-    let json: Vec<Value> = serde_json::from_str(&extract_json_payload(&list.stdout)).unwrap();
-    let id1 = json.iter().find(|i| i["title"] == "Issue 1").unwrap()["id"]
+    let json: Value = serde_json::from_str(&extract_json_payload(&list.stdout)).unwrap();
+    let id1 = json["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["title"] == "Issue 1")
+        .unwrap()["id"]
         .as_str()
         .unwrap();
 

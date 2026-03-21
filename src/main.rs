@@ -462,7 +462,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Status(_)
         | Commands::Changelog(_)
         | Commands::Graph(_)
-        | Commands::Orphans(_)
         | Commands::Create(_)
         | Commands::Update(_)
         | Commands::Delete(_)
@@ -488,6 +487,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Audit { .. }
         | Commands::Config { .. }
         | Commands::History(_)
+        | Commands::Orphans(_)
         | Commands::Agents(_) => false,
 
         #[cfg(feature = "mcp")]

@@ -232,11 +232,11 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 
         // Get dependencies from bulk map
         if let Some(deps) = all_dependencies.get(&issue.id) {
-            for dep in deps {
-                if !dep.dep_type.affects_ready_work() {
+            for dependency in deps {
+                if !dependency.dep_type.affects_ready_work() {
                     continue;
                 }
-                let dep_id = &dep.depends_on_id;
+                let dep_id = &dependency.depends_on_id;
                 // Only include edges within our issue set
                 if issue_set.contains(dep_id) {
                     adj.entry(issue.id.clone())
@@ -507,10 +507,9 @@ fn collect_single_graph(
                     }
                 } else {
                     storage.get_issue(&dep.id)?.ok_or_else(|| {
-                        BeadsError::Config(format!(
-                            "dependency graph references missing issue {}",
-                            dep.id
-                        ))
+                        BeadsError::IssueNotFound {
+                            id: dep.id.clone(),
+                        }
                     })?
                 };
 
