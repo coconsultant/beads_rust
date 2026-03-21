@@ -115,6 +115,36 @@ fn is_expected_contention_failure(result: &BrResult) -> bool {
         && !combined.contains("panic")
 }
 
+fn has_integrity_failure_signal(result: &BrResult) -> bool {
+    let combined = format!("{} {}", result.stdout, result.stderr).to_lowercase();
+    combined.contains("unique constraint failed: blocked_issues_cache.issue_id")
+        || combined.contains("constraint failed")
+        || combined.contains("constraint")
+        || combined.contains("corrupt")
+        || combined.contains("malformed")
+        || combined.contains("unexpected token")
+        || combined.contains("panic")
+}
+
+fn assert_no_integrity_failure_signals(role: &str, results: &[BrResult]) {
+    let mut integrity_failures = Vec::new();
+
+    for (index, result) in results.iter().enumerate() {
+        if has_integrity_failure_signal(result) {
+            integrity_failures.push(format!(
+                "{role}[{index}] stdout={} stderr={}",
+                result.stdout, result.stderr
+            ));
+        }
+    }
+
+    assert!(
+        integrity_failures.is_empty(),
+        "integrity failure signals detected in {role}: {}",
+        integrity_failures.join(" | ")
+    );
+}
+
 fn assert_only_success_or_contention(role: &str, results: &[BrResult]) -> usize {
     let mut success_count = 0;
     let mut unexpected_failures = Vec::new();
@@ -1865,6 +1895,211 @@ fn e2e_actor_oriented_command_families_preserve_workspace_integrity() {
         "list failed after actor contention: {}",
         list.stderr
     );
+}
+
+/// Regression for direct close/update cache-refresh integrity under contention.
+///
+/// The failure mode we are guarding is not ordinary lock contention; that is
+/// already allowed by the test harness. What must never reappear is a
+/// blocked-cache UNIQUE constraint or other corruption signal while close-style
+/// status mutations interleave with update/reopen traffic.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_close_update_reopen_preserve_blocked_cache_integrity() {
+    let _log = common::test_log("e2e_close_update_reopen_preserve_blocked_cache_integrity");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    let mut close_ids = Vec::new();
+    for idx in 0..6 {
+        let created = run_br_in_dir(&root, ["create", &format!("Close target {idx}")]);
+        assert!(created.success, "create close target {idx} failed");
+        close_ids.push(parse_created_id(&created.stdout));
+    }
+
+    let mut reopen_ids = Vec::new();
+    for idx in 0..3 {
+        let created = run_br_in_dir(&root, ["create", &format!("Reopen target {idx}")]);
+        assert!(created.success, "create reopen target {idx} failed");
+        let issue_id = parse_created_id(&created.stdout);
+        let closed = run_br_in_dir(&root, ["close", &issue_id, "--reason", "seed closed"]);
+        assert!(closed.success, "seed close {idx} failed: {}", closed.stderr);
+        reopen_ids.push(issue_id);
+    }
+
+    let update_issue = run_br_in_dir(&root, ["create", "Update target"]);
+    assert!(update_issue.success, "create update target failed");
+    let update_id = parse_created_id(&update_issue.stdout);
+
+    let barrier = Arc::new(Barrier::new(4));
+    let shared_root = Arc::new(root.clone());
+
+    let closer = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let close_ids = close_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for issue_id in close_ids {
+                let args = vec![
+                    "--no-auto-import".to_string(),
+                    "--lock-timeout".to_string(),
+                    "250".to_string(),
+                    "close".to_string(),
+                    issue_id,
+                    "--reason".to_string(),
+                    "cache regression stress".to_string(),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(10));
+            }
+            results
+        })
+    };
+
+    let updater = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let update_id = update_id.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 0..10 {
+                let args = vec![
+                    "--no-auto-import".to_string(),
+                    "--lock-timeout".to_string(),
+                    "250".to_string(),
+                    "update".to_string(),
+                    update_id.clone(),
+                    "--title".to_string(),
+                    format!("Update target {idx}"),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(10));
+            }
+            results
+        })
+    };
+
+    let reopener = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let reopen_ids = reopen_ids.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 0..9 {
+                let issue_id = reopen_ids[idx % reopen_ids.len()].clone();
+                let args = vec![
+                    "--no-auto-import".to_string(),
+                    "--lock-timeout".to_string(),
+                    "250".to_string(),
+                    "reopen".to_string(),
+                    issue_id,
+                    "--reason".to_string(),
+                    format!("reopen round {idx}"),
+                    "--json".to_string(),
+                ];
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(10));
+            }
+            results
+        })
+    };
+
+    let reader = {
+        let barrier = Arc::clone(&barrier);
+        let root = Arc::clone(&shared_root);
+        let update_id = update_id.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            let mut results = Vec::new();
+            for idx in 0..12 {
+                let args = match idx % 3 {
+                    0 => vec![
+                        "--lock-timeout".to_string(),
+                        "25".to_string(),
+                        "show".to_string(),
+                        update_id.clone(),
+                        "--json".to_string(),
+                    ],
+                    1 => vec![
+                        "--lock-timeout".to_string(),
+                        "25".to_string(),
+                        "ready".to_string(),
+                        "--json".to_string(),
+                    ],
+                    _ => vec![
+                        "--lock-timeout".to_string(),
+                        "25".to_string(),
+                        "stats".to_string(),
+                        "--json".to_string(),
+                    ],
+                };
+                results.push(run_br_in_dir(&root, args));
+                thread::sleep(Duration::from_millis(5));
+            }
+            results
+        })
+    };
+
+    let close_results = closer.join().expect("closer panicked");
+    let update_results = updater.join().expect("updater panicked");
+    let reopen_results = reopener.join().expect("reopener panicked");
+    let reader_results = reader.join().expect("reader panicked");
+
+    assert_no_integrity_failure_signals("close", &close_results);
+    assert_no_integrity_failure_signals("update", &update_results);
+    assert_no_integrity_failure_signals("reopen", &reopen_results);
+    assert_no_integrity_failure_signals("reader", &reader_results);
+
+    let close_successes = assert_only_success_or_contention("close", &close_results);
+    let update_successes = assert_only_success_or_contention("update", &update_results);
+    let reopen_successes = assert_only_success_or_contention("reopen", &reopen_results);
+    let reader_successes = assert_only_success_or_contention("reader", &reader_results);
+
+    assert!(
+        close_successes > 0,
+        "expected at least one successful close under contention"
+    );
+    assert!(
+        update_successes > 0,
+        "expected at least one successful update under contention"
+    );
+    assert!(
+        reopen_successes > 0,
+        "expected at least one successful reopen under contention"
+    );
+    assert!(
+        reader_successes > 0,
+        "expected at least one successful reader command"
+    );
+
+    assert_doctor_healthy(&root);
+
+    let update_show = run_br_in_dir(&root, ["--no-auto-import", "show", &update_id, "--json"]);
+    assert!(
+        update_show.success,
+        "show update target failed: {}",
+        update_show.stderr
+    );
+
+    for issue_id in close_ids.iter().take(2) {
+        let show = run_br_in_dir(&root, ["--no-auto-import", "show", issue_id, "--json"]);
+        assert!(show.success, "show close target failed: {}", show.stderr);
+    }
+
+    for issue_id in &reopen_ids {
+        let show = run_br_in_dir(&root, ["--no-auto-import", "show", issue_id, "--json"]);
+        assert!(show.success, "show reopen target failed: {}", show.stderr);
+    }
 }
 
 /// Test that routed access remains bounded even while the routed workspace
