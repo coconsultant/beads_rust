@@ -173,7 +173,8 @@ pub fn contains_any_blurb(content: &str) -> bool {
 }
 
 static BLURB_VERSION_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"<!-- br-agent-instructions-v(\d+) -->").expect("static regex compilation must not fail")
+    Regex::new(r"<!-- br-agent-instructions-v(\d+) -->")
+        .expect("static regex compilation must not fail")
 });
 
 /// Extract the version number from an existing blurb.

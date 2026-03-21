@@ -2,7 +2,7 @@ use crate::config::OpenStorageResult;
 use crate::error::BeadsError;
 use crate::model::Issue;
 use crate::storage::{IssueUpdate, SqliteStorage};
-use crate::util::id::{IdResolver, find_matching_ids};
+use crate::util::id::IdResolver;
 
 pub mod agents;
 pub mod audit;
@@ -48,16 +48,29 @@ pub mod upgrade;
 pub(super) fn resolve_issue_id(
     storage: &SqliteStorage,
     resolver: &IdResolver,
-    all_ids: &[String],
     input: &str,
 ) -> crate::Result<String> {
     resolver
         .resolve_fallible(
             input,
             |id| storage.id_exists(id),
-            |hash| Ok(find_matching_ids(all_ids, hash)),
+            |hash| storage.find_ids_by_hash(hash),
         )
         .map(|resolved| resolved.id)
+}
+
+pub(super) fn resolve_issue_ids(
+    storage: &SqliteStorage,
+    resolver: &IdResolver,
+    inputs: &[String],
+) -> crate::Result<Vec<String>> {
+    resolver
+        .resolve_all_fallible(
+            inputs,
+            |id| storage.id_exists(id),
+            |hash| storage.find_ids_by_hash(hash),
+        )
+        .map(|resolved| resolved.into_iter().map(|entry| entry.id).collect())
 }
 
 pub(super) fn rebuild_blocked_cache_after_partial_mutation(

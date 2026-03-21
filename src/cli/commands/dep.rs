@@ -36,36 +36,20 @@ pub fn execute(
     let quiet = cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
 
     let actor = config::resolve_actor(&config_layer);
 
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
 
     match command {
-        DepCommands::Add(args) => dep_add(
-            args,
-            &mut storage_ctx,
-            &resolver,
-            &all_ids,
-            &actor,
-            json,
-            ctx,
-        ),
-        DepCommands::Remove(args) => dep_remove(
-            args,
-            &mut storage_ctx,
-            &resolver,
-            &all_ids,
-            &actor,
-            json,
-            ctx,
-        ),
+        DepCommands::Add(args) => dep_add(args, &mut storage_ctx, &resolver, &actor, json, ctx),
+        DepCommands::Remove(args) => {
+            dep_remove(args, &mut storage_ctx, &resolver, &actor, json, ctx)
+        }
         DepCommands::List(args) => dep_list(
             args,
             &storage_ctx.storage,
             &resolver,
-            &all_ids,
             &external_db_paths,
             ctx,
             quiet,
@@ -75,7 +59,6 @@ pub fn execute(
             args,
             &storage_ctx.storage,
             &resolver,
-            &all_ids,
             &external_db_paths,
             json,
             ctx,
@@ -137,18 +120,17 @@ fn dep_add(
     args: &DepAddArgs,
     storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
-    all_ids: &[String],
     actor: &str,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.issue)?;
+    let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, &args.issue)?;
 
     // External dependencies don't need resolution
     let depends_on_id = if args.depends_on.starts_with("external:") {
         args.depends_on.clone()
     } else {
-        resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.depends_on)?
+        resolve_issue_id(&storage_ctx.storage, resolver, &args.depends_on)?
     };
 
     // Parse and validate dependency type
@@ -266,18 +248,17 @@ fn dep_remove(
     args: &DepRemoveArgs,
     storage_ctx: &mut config::OpenStorageResult,
     resolver: &IdResolver,
-    all_ids: &[String],
     actor: &str,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.issue)?;
+    let issue_id = resolve_issue_id(&storage_ctx.storage, resolver, &args.issue)?;
 
     // External dependencies don't need resolution
     let depends_on_id = if args.depends_on.starts_with("external:") {
         args.depends_on.clone()
     } else {
-        resolve_issue_id(&storage_ctx.storage, resolver, all_ids, &args.depends_on)?
+        resolve_issue_id(&storage_ctx.storage, resolver, &args.depends_on)?
     };
 
     let dep_type = dependency_type_for_pair(&storage_ctx.storage, &issue_id, &depends_on_id)?
@@ -372,7 +353,6 @@ fn dep_list(
     args: &DepListArgs,
     storage: &SqliteStorage,
     resolver: &IdResolver,
-    all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
     outer_ctx: &OutputContext,
     quiet: bool,
@@ -384,7 +364,7 @@ fn dep_list(
         false,
     );
     let ctx = OutputContext::from_output_format(output_format, quiet, no_color);
-    let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
+    let issue_id = resolve_issue_id(storage, resolver, &args.issue)?;
     let dep_type_filter = args
         .dep_type
         .as_deref()
@@ -709,12 +689,11 @@ fn dep_tree(
     args: &DepTreeArgs,
     storage: &SqliteStorage,
     resolver: &IdResolver,
-    all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let root_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
+    let root_id = resolve_issue_id(storage, resolver, &args.issue)?;
     let root_issue = storage
         .get_issue(&root_id)?
         .ok_or_else(|| BeadsError::IssueNotFound {

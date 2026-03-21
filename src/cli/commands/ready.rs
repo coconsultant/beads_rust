@@ -111,14 +111,14 @@ fn execute_inner(
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage.get_all_ids()?;
-
     let resolved_parent = args
         .parent
         .as_deref()
-        .map(|p| resolve_issue_id(storage, &resolver, &all_ids, p))
+        .map(|parent| {
+            let id_config = config::id_config_from_layer(&config_layer);
+            let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+            resolve_issue_id(storage, &resolver, parent)
+        })
         .transpose()?;
 
     let filters = ReadyFilters {

@@ -887,7 +887,7 @@ impl SqliteStorage {
             // Explicit duplicate check since fsqlite does not enforce
             // UNIQUE constraints on non-rowid columns.
             let existing = conn.query_with_params(
-                "SELECT id FROM issues WHERE id = ?",
+                "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
                 &[SqliteValue::from(issue.id.as_str())],
             )?;
             if !existing.is_empty() {
@@ -899,7 +899,7 @@ impl SqliteStorage {
             // Check for external_ref collision
             if let Some(ref ext_ref) = issue.external_ref {
                 let existing_ext = conn.query_with_params(
-                    "SELECT id FROM issues WHERE external_ref = ?",
+                    "SELECT id FROM issues WHERE external_ref = ? LIMIT 1",
                     &[SqliteValue::from(ext_ref.as_str())],
                 )?;
                 if !existing_ext.is_empty() {
@@ -1169,12 +1169,10 @@ impl SqliteStorage {
     /// Returns an error if the issue doesn't exist or the update fails.
     #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
-        let issue = self
-            .get_issue(id)?
-            .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
-
         if updates.is_empty() {
-            return Ok(issue);
+            return self
+                .get_issue(id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() });
         }
 
         self.mutate("update_issue", actor, |conn, ctx| {
@@ -1393,7 +1391,7 @@ impl SqliteStorage {
                 // Explicit uniqueness check for fsqlite
                 if let Some(ext_ref) = val {
                     let existing_ext = conn.query_with_params(
-                        "SELECT id FROM issues WHERE external_ref = ? AND id != ?",
+                        "SELECT id FROM issues WHERE external_ref = ? AND id != ? LIMIT 1",
                         &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
                     )?;
                     if !existing_ext.is_empty() {
@@ -3712,16 +3710,14 @@ impl SqliteStorage {
                 });
             }
 
-            let row = conn.query_row_with_params(
-                "SELECT count(*) FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+            let existing = conn.query_with_params(
+                "SELECT 1 FROM dependencies WHERE issue_id = ? AND depends_on_id = ? LIMIT 1",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
                 ],
             )?;
-            let exists = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
-
-            if exists > 0 {
+            if !existing.is_empty() {
                 return Ok(false);
             }
 

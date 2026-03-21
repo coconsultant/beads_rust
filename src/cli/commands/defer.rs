@@ -1,7 +1,7 @@
 //! Defer and Undefer command implementations.
 
 use crate::cli::commands::{
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
     update_issue_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
@@ -10,7 +10,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use crate::util::time::parse_flexible_timestamp;
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -193,7 +193,6 @@ fn execute_defer_route(
     let actor = config::resolve_actor(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
 
     let defer_until = args
         .until
@@ -201,19 +200,14 @@ fn execute_defer_route(
         .map(|s| parse_flexible_timestamp(s, "defer_until"))
         .transpose()?;
 
-    let resolved_ids = resolver.resolve_all(
-        &args.ids,
-        |id| all_ids.iter().any(|existing| existing == id),
-        |hash| find_matching_ids(&all_ids, hash),
-    )?;
+    let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
 
     let mut deferred_issues: Vec<DeferredIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
 
-    for resolved in &resolved_ids {
-        let id = &resolved.id;
+    for id in &resolved_ids {
         tracing::info!(id = %id, until = ?defer_until, "Deferring issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);
@@ -445,21 +439,14 @@ fn execute_undefer_route(
     let actor = config::resolve_actor(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-
-    let resolved_ids = resolver.resolve_all(
-        &args.ids,
-        |id| all_ids.iter().any(|existing| existing == id),
-        |hash| find_matching_ids(&all_ids, hash),
-    )?;
+    let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
 
     let mut undeferred_issues: Vec<DeferredIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
 
-    for resolved in &resolved_ids {
-        let id = &resolved.id;
+    for id in &resolved_ids {
         tracing::info!(id = %id, "Undeferring issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);

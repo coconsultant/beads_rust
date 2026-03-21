@@ -2,7 +2,7 @@
 
 use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::{
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
     update_issue_with_recovery,
 };
 use crate::config;
@@ -10,7 +10,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -456,13 +456,7 @@ fn execute_route(
     let actor = config::resolve_actor(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-
-    let resolved_ids = resolver.resolve_all(
-        &args.ids,
-        |id| all_ids.iter().any(|existing| existing == id),
-        |hash| find_matching_ids(&all_ids, hash),
-    )?;
+    let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
 
     let epic_counts = storage_ctx.storage.get_epic_counts()?;
     let blocked_before: Vec<String> = if args.suggest_next {
@@ -476,10 +470,7 @@ fn execute_route(
         Vec::new()
     };
 
-    let requested_ids: HashSet<String> = resolved_ids
-        .iter()
-        .map(|resolved| resolved.id.clone())
-        .collect();
+    let requested_ids: HashSet<String> = resolved_ids.iter().cloned().collect();
     let mut open_issues: HashMap<String, crate::model::Issue> = HashMap::new();
     let mut internal_blockers_by_id: HashMap<String, Vec<String>> = HashMap::new();
     let mut external_blockers_by_id: HashMap<String, Vec<String>> = HashMap::new();
@@ -488,8 +479,7 @@ fn execute_route(
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
 
-    for resolved in &resolved_ids {
-        let id = &resolved.id;
+    for id in &resolved_ids {
         tracing::info!(id = %id, "Closing issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);
@@ -584,8 +574,7 @@ fn execute_route(
         )
     };
 
-    for resolved in &resolved_ids {
-        let id = &resolved.id;
+    for id in &resolved_ids {
         let Some(issue) = open_issues.get(id) else {
             continue;
         };

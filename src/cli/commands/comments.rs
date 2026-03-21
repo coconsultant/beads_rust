@@ -53,16 +53,10 @@ fn execute_add(
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
     let actor = config::actor_from_layer(&config_layer);
 
-    let (issue_id, author, text) = prepare_comment_add(
-        args,
-        &storage_ctx.storage,
-        &resolver,
-        &all_ids,
-        actor.as_deref(),
-    )?;
+    let (issue_id, author, text) =
+        prepare_comment_add(args, &storage_ctx.storage, &resolver, actor.as_deref())?;
     let comment = retry_mutation_with_jsonl_recovery(
         &mut storage_ctx,
         true,
@@ -102,13 +96,11 @@ fn execute_list(
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
 
     list_comments_by_id(
         issue_input,
         &storage_ctx.storage,
         &resolver,
-        &all_ids,
         json,
         ctx,
         wrap,
@@ -133,10 +125,9 @@ fn prepare_comment_add(
     args: &CommentAddArgs,
     storage: &SqliteStorage,
     resolver: &IdResolver,
-    all_ids: &[String],
     actor: Option<&str>,
 ) -> Result<(String, String, String)> {
-    let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.id)?;
+    let issue_id = resolve_issue_id(storage, resolver, &args.id)?;
     let text = read_comment_text(args)?;
     if text.trim().is_empty() {
         return Err(BeadsError::validation(
@@ -152,12 +143,11 @@ fn list_comments_by_id(
     id: &str,
     storage: &SqliteStorage,
     resolver: &IdResolver,
-    all_ids: &[String],
     _json: bool,
     ctx: &OutputContext,
     wrap: bool,
 ) -> Result<()> {
-    let issue_id = resolve_issue_id(storage, resolver, all_ids, id)?;
+    let issue_id = resolve_issue_id(storage, resolver, id)?;
     let comments = storage.get_comments(&issue_id)?;
 
     if matches!(ctx.mode(), OutputMode::Quiet) {

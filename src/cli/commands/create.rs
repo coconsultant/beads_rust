@@ -174,11 +174,10 @@ pub fn create_issue_impl(
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(config.id_config.prefix.clone()));
-    let all_ids = storage.get_all_ids()?;
     let resolved_parent = args
         .parent
         .as_deref()
-        .map(|parent| resolve_issue_id(storage, &id_resolver, &all_ids, parent))
+        .map(|parent| resolve_issue_id(storage, &id_resolver, parent))
         .transpose()?;
 
     // Parse status (default to Open if not provided)
@@ -270,7 +269,6 @@ pub fn create_issue_impl(
             now,
             resolved_parent: resolved_parent.as_deref(),
             storage,
-            all_ids: &all_ids,
             prefix: &config.id_config.prefix,
         };
         populate_relations(&mut issue, args, &relation_context)?;
@@ -361,14 +359,13 @@ fn generate_new_id(
 fn resolve_dependency_id(
     resolver: &IdResolver,
     storage: &SqliteStorage,
-    all_ids: &[String],
     input: &str,
 ) -> Result<String> {
     if input.starts_with("external:") {
         return Ok(input.to_string());
     }
 
-    resolve_issue_id(storage, resolver, all_ids, input)
+    resolve_issue_id(storage, resolver, input)
 }
 
 fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
@@ -438,7 +435,6 @@ struct RelationContext<'a> {
     now: DateTime<Utc>,
     resolved_parent: Option<&'a str>,
     storage: &'a crate::storage::SqliteStorage,
-    all_ids: &'a [String],
     prefix: &'a str,
 }
 
@@ -487,7 +483,7 @@ fn populate_relations(
             type_str
         };
 
-        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, ctx.all_ids, dep_id)?;
+        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, dep_id)?;
 
         // from_str is infallible - Custom types are rejected by validate_relations above
         let dep_type: DependencyType = normalized_type.parse().expect("validated above");
@@ -556,7 +552,7 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
-    let mut all_ids = storage.get_all_ids()?;
+    
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
     'outer: for parsed in parsed_issues {
@@ -575,7 +571,7 @@ fn execute_import(
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
         let resolved_parent = parent_candidate
-            .map(|p| resolve_issue_id(storage, &id_resolver, &all_ids, p))
+            .map(|p| resolve_issue_id(storage, &id_resolver, p))
             .transpose()?;
 
         let mut retries = 0;
@@ -725,16 +721,15 @@ fn execute_import(
                     type_str = "blocks".to_string();
                 }
 
-                let resolved_dep_id =
-                    match resolve_dependency_id(&resolver, storage, &all_ids, &dep_id) {
-                        Ok(resolved_dep) => resolved_dep,
-                        Err(err) => {
-                            dependency_error = Some(format!(
-                                "unresolved dependency '{dep_id}' for issue {id}: {err}"
-                            ));
-                            break;
-                        }
-                    };
+                let resolved_dep_id = match resolve_dependency_id(&resolver, storage, &dep_id) {
+                    Ok(resolved_dep) => resolved_dep,
+                    Err(err) => {
+                        dependency_error = Some(format!(
+                            "unresolved dependency '{dep_id}' for issue {id}: {err}"
+                        ));
+                        break;
+                    }
+                };
 
                 if resolved_dep_id == id {
                     eprintln!("warning: skipping self-dependency for issue {id}");

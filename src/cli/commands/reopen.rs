@@ -2,7 +2,7 @@
 
 use crate::cli::ReopenArgs;
 use crate::cli::commands::{
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
+    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_ids,
     retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
 };
 use crate::config;
@@ -10,7 +10,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::Status;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -181,21 +181,14 @@ fn execute_route(
     let actor = config::resolve_actor(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-
-    let resolved_ids = resolver.resolve_all(
-        &args.ids,
-        |id| all_ids.binary_search_by(|p| p.as_str().cmp(id)).is_ok(),
-        |hash| find_matching_ids(&all_ids, hash),
-    )?;
+    let resolved_ids = resolve_issue_ids(&storage_ctx.storage, &resolver, &args.ids)?;
 
     let mut reopened_issues: Vec<ReopenedIssue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
 
-    for resolved in &resolved_ids {
-        let id = &resolved.id;
+    for id in &resolved_ids {
         tracing::info!(id = %id, "Reopening issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);

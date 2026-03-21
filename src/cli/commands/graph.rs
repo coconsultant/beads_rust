@@ -94,8 +94,6 @@ pub fn execute_with_storage_ctx(
     let config_layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-
     if args.all {
         graph_all(&storage_ctx.storage, args.compact, ctx)
     } else {
@@ -103,7 +101,7 @@ pub fn execute_with_storage_ctx(
             BeadsError::validation("issue", "Issue ID required unless --all is specified")
         })?;
 
-        let resolved_id = resolve_issue_id(&storage_ctx.storage, &resolver, &all_ids, issue_id)?;
+        let resolved_id = resolve_issue_id(&storage_ctx.storage, &resolver, issue_id)?;
         graph_single(&storage_ctx.storage, &resolved_id, args.compact, ctx)
     }
 }

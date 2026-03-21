@@ -2,7 +2,7 @@
 
 use super::{
     finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error, resolve_issue_id,
-    retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
 };
 use crate::cli::UpdateArgs;
 use crate::config;
@@ -210,9 +210,7 @@ fn prepare_single_route(
     let config_layer = storage_ctx.load_config(cli)?;
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
-    let all_ids = storage_ctx.storage.get_all_ids()?;
-    let resolved_ids =
-        resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage, &all_ids)?;
+    let resolved_ids = resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage)?;
 
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
@@ -242,12 +240,8 @@ fn prepare_single_route(
         }
     }
 
-    let resolved_parent = resolve_parent_update(
-        args.parent.as_deref(),
-        &resolver,
-        &storage_ctx.storage,
-        &all_ids,
-    )?;
+    let resolved_parent =
+        resolve_parent_update(args.parent.as_deref(), &resolver, &storage_ctx.storage)?;
     validate_parent_updates(&storage_ctx.storage, &resolved_ids, &resolved_parent)?;
 
     validate_transition_to_in_progress(&storage_ctx.storage, &resolved_ids, args)?;
@@ -658,7 +652,6 @@ fn resolve_target_ids(
     beads_dir: &std::path::Path,
     resolver: &IdResolver,
     storage: &SqliteStorage,
-    all_ids: &[String],
 ) -> Result<Vec<String>> {
     let mut ids = args.ids.clone();
     if ids.is_empty() {
@@ -672,13 +665,7 @@ fn resolve_target_ids(
         ids.push(last_touched);
     }
 
-    let resolved_ids = resolver.resolve_all_fallible(
-        &ids,
-        |id| storage.id_exists(id),
-        |hash| Ok(crate::util::id::find_matching_ids(all_ids, hash)),
-    )?;
-
-    Ok(resolved_ids.into_iter().map(|r| r.id).collect())
+    resolve_issue_ids(storage, resolver, &ids)
 }
 
 fn validate_mutable_target_issues(
@@ -794,13 +781,12 @@ fn resolve_parent_update(
     parent: Option<&str>,
     resolver: &IdResolver,
     storage: &SqliteStorage,
-    all_ids: &[String],
 ) -> Result<ParentUpdatePlan> {
     match parent {
         None => Ok(ParentUpdatePlan::Unchanged),
         Some("") => Ok(ParentUpdatePlan::Clear),
         Some(parent_value) => {
-            resolve_issue_id(storage, resolver, all_ids, parent_value).map(ParentUpdatePlan::Set)
+            resolve_issue_id(storage, resolver, parent_value).map(ParentUpdatePlan::Set)
         }
     }
 }

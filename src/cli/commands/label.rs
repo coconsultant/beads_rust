@@ -275,15 +275,13 @@ fn execute_label_list_command(
         let config_layer = storage_ctx.load_config(&route_cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let all_ids = storage_ctx.storage.get_all_ids()?;
-        label_list(args, &storage_ctx.storage, &resolver, &all_ids, json, ctx)
+        label_list(args, &storage_ctx.storage, &resolver, json, ctx)
     } else {
         let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
         let config_layer = storage_ctx.load_config(cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let all_ids = storage_ctx.storage.get_all_ids()?;
-        label_list(args, &storage_ctx.storage, &resolver, &all_ids, json, ctx)
+        label_list(args, &storage_ctx.storage, &resolver, json, ctx)
     }
 }
 
@@ -301,11 +299,10 @@ fn prepare_label_routes(
         let config_layer = storage_ctx.load_config(&batch_cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let all_ids = storage_ctx.storage.get_all_ids()?;
         let resolved_ids = batch
             .issue_inputs
             .iter()
-            .map(|input| resolve_issue_id(&storage_ctx.storage, &resolver, &all_ids, input))
+            .map(|input| resolve_issue_id(&storage_ctx.storage, &resolver, input))
             .collect::<Result<Vec<_>>>()?;
 
         prepared_routes.push(PreparedLabelRoute {
@@ -377,13 +374,12 @@ fn label_list(
     args: &LabelListArgs,
     storage: &SqliteStorage,
     resolver: &IdResolver,
-    all_ids: &[String],
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     if let Some(input) = &args.issue {
         // List labels for a specific issue
-        let issue_id = resolve_issue_id(storage, resolver, all_ids, input)?;
+        let issue_id = resolve_issue_id(storage, resolver, input)?;
         let labels = storage.get_labels(&issue_id)?;
 
         if ctx.is_json() {
