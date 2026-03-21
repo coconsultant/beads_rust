@@ -1336,6 +1336,104 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
     Ok(())
 }
 
+/// Check whether the project root `.gitignore` contains a pattern that would
+/// hide `.beads/.gitignore`, preventing git from reading br's ignore rules.
+/// This commonly happens during bd-to-br migration where the old `.gitignore`
+/// included `.beads/.gitignore` or `.beads/*`.
+fn check_root_gitignore(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
+    let Some(project_root) = beads_dir.parent() else {
+        return;
+    };
+    let gitignore_path = project_root.join(".gitignore");
+    let content = match fs::read_to_string(&gitignore_path) {
+        Ok(c) => c,
+        Err(_) => {
+            // No .gitignore is fine — nothing to warn about.
+            return;
+        }
+    };
+
+    let offending: Vec<String> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Skip comments and blank lines.
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return false;
+            }
+            // Patterns that would cause git to ignore .beads/.gitignore:
+            //   .beads/.gitignore   — exact match
+            //   .beads/*            — wildcard that covers .gitignore inside
+            trimmed == ".beads/.gitignore" || trimmed == ".beads/*"
+        })
+        .map(String::from)
+        .collect();
+
+    if offending.is_empty() {
+        push_check(checks, "gitignore.beads_inner", CheckStatus::Ok, None, None);
+    } else {
+        push_check(
+            checks,
+            "gitignore.beads_inner",
+            CheckStatus::Warn,
+            Some(format!(
+                "Root .gitignore excludes .beads/.gitignore — br's ignore rules are ineffective. \
+                 Remove the offending line(s) from .gitignore to fix: {}",
+                offending.join(", ")
+            )),
+            Some(serde_json::json!({
+                "gitignore_path": gitignore_path.display().to_string(),
+                "offending_patterns": offending,
+            })),
+        );
+    }
+}
+
+/// When `--repair` is passed and the `gitignore.beads_inner` warning is present,
+/// automatically remove the offending lines from the root `.gitignore`.
+fn fix_root_gitignore_if_warned(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+) {
+    let has_warning = report.checks.iter().any(|c| {
+        c.name == "gitignore.beads_inner" && c.status == CheckStatus::Warn
+    });
+    if !has_warning {
+        return;
+    }
+    let Some(project_root) = beads_dir.parent() else {
+        return;
+    };
+    let gitignore_path = project_root.join(".gitignore");
+    let content = match fs::read_to_string(&gitignore_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let filtered: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed != ".beads/.gitignore" && trimmed != ".beads/*"
+        })
+        .collect();
+    let mut new_content = filtered.join("\n");
+    if content.ends_with('\n') {
+        new_content.push('\n');
+    }
+
+    if let Err(err) = fs::write(&gitignore_path, new_content) {
+        if !ctx.is_json() {
+            ctx.warning(&format!(
+                "Failed to fix .gitignore: {err}"
+            ));
+        }
+    } else if !ctx.is_json() {
+        ctx.info("Removed offending .beads/.gitignore pattern(s) from root .gitignore");
+    }
+}
+
 fn discover_jsonl(beads_dir: &Path) -> Option<PathBuf> {
     let issues = beads_dir.join("issues.jsonl");
     if issues.exists() {
@@ -1847,6 +1945,7 @@ fn check_sync_metadata(
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
     let mut checks = Vec::new();
     check_merge_artifacts(beads_dir, &mut checks)?;
+    check_root_gitignore(beads_dir, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
     inspect_doctor_database(
@@ -2040,6 +2139,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     let initial = collect_doctor_report(&beads_dir, &paths)?;
+
+    // Auto-fix root .gitignore if --repair is passed and the warning is present.
+    if args.repair {
+        fix_root_gitignore_if_warned(&beads_dir, &initial.report, ctx);
+    }
 
     if !args.repair {
         print_report(&initial.report, ctx)?;
