@@ -298,15 +298,15 @@ jobs:
             fi
           fi
 
-          # Create changelog file
-          cat << EOF > CHANGELOG.md
+          # Create release notes file
+          cat << EOF > RELEASE_NOTES.md
           ## What's Changed
 
           ${BEADS_SECTION}### Commits
 
           EOF
-          echo "$COMMITS" >> CHANGELOG.md
-          cat << 'EOF' >> CHANGELOG.md
+          echo "$COMMITS" >> RELEASE_NOTES.md
+          cat << 'EOF' >> RELEASE_NOTES.md
 
           ## Platforms
 
@@ -359,8 +359,8 @@ jobs:
           See [CHANGELOG.md](https://github.com/Dicklesworthstone/beads_rust/blob/main/CHANGELOG.md) for the complete history.
           EOF
 
-          echo "=== Generated changelog ==="
-          cat CHANGELOG.md
+          echo "=== Generated release notes ==="
+          cat RELEASE_NOTES.md
 
       - name: Generate SBOM (CycloneDX)
         run: |
@@ -372,7 +372,7 @@ jobs:
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b  # v2
         with:
           name: br ${{ github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
