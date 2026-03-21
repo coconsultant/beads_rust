@@ -2649,7 +2649,7 @@ impl SqliteStorage {
             let placeholders: Vec<&str> =
                 chunk.iter().map(|_| "(?, ?, CURRENT_TIMESTAMP)").collect();
             let sql = format!(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
+                "INSERT OR REPLACE INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
                 placeholders.join(", ")
             );
             let mut params = Vec::with_capacity(chunk.len() * 2);
@@ -2736,7 +2736,7 @@ impl SqliteStorage {
             let placeholders: Vec<&str> =
                 chunk.iter().map(|_| "(?, ?, CURRENT_TIMESTAMP)").collect();
             let sql = format!(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
+                "INSERT OR REPLACE INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES {}",
                 placeholders.join(", ")
             );
             let mut params = Vec::with_capacity(chunk.len() * 2);
