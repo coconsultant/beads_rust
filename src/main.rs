@@ -7,8 +7,9 @@ use beads_rust::sync::{auto_flush, auto_import_if_stale};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
+use std::fs::File;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 #[allow(clippy::too_many_lines)]
@@ -61,33 +62,37 @@ fn main() {
         None
     };
 
-    // Phase 3: Auto-Import
-    if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
-        && should_auto_import(&cli.command)
+    // Phase 3: Auto-Import (with advisory flock to serialize concurrent access)
     {
-        let allow_external_jsonl = config::implicit_external_jsonl_allowed(
-            &paths.beads_dir,
-            &paths.db_path,
-            &paths.jsonl_path,
-        );
-        let expected_prefix = match resolve_auto_import_expected_prefix(res, &ctx.overrides) {
-            Ok(prefix) => Some(prefix),
-            Err(e) => {
+        let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
+        if let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+            && should_auto_import(&cli.command)
+        {
+            let allow_external_jsonl = config::implicit_external_jsonl_allowed(
+                &paths.beads_dir,
+                &paths.db_path,
+                &paths.jsonl_path,
+            );
+            let expected_prefix = match resolve_auto_import_expected_prefix(res, &ctx.overrides) {
+                Ok(prefix) => Some(prefix),
+                Err(e) => {
+                    handle_error(&e, json_error_mode);
+                }
+            };
+            let outcome = auto_import_if_stale(
+                &mut res.storage,
+                &paths.beads_dir,
+                &paths.jsonl_path,
+                expected_prefix.as_deref(),
+                allow_external_jsonl,
+                cli.allow_stale,
+                ctx.no_auto_import(),
+            );
+            if let Err(e) = outcome {
                 handle_error(&e, json_error_mode);
             }
-        };
-        let outcome = auto_import_if_stale(
-            &mut res.storage,
-            &paths.beads_dir,
-            &paths.jsonl_path,
-            expected_prefix.as_deref(),
-            allow_external_jsonl,
-            cli.allow_stale,
-            ctx.no_auto_import(),
-        );
-        if let Err(e) = outcome {
-            handle_error(&e, json_error_mode);
         }
+        // _sync_lock drops here, releasing the advisory lock before command execution
     }
 
     // Phase 4: Command Execution
@@ -281,22 +286,41 @@ fn main() {
         handle_error(&e, json_error_mode);
     }
 
-    // Phase 5: Auto-Flush
-    if is_mutating
-        && !ctx.no_auto_flush()
-        && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
-        && let Err(e) = auto_flush(
-            &mut res.storage,
-            &paths.beads_dir,
-            &paths.jsonl_path,
-            config::implicit_external_jsonl_allowed(
-                &paths.beads_dir,
-                &paths.db_path,
-                &paths.jsonl_path,
-            ),
-        )
+    // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
     {
-        debug!(?e, "Auto-flush failed (non-fatal)");
+        let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);
+        if is_mutating
+            && !ctx.no_auto_flush()
+            && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
+            && let Err(e) = auto_flush(
+                &mut res.storage,
+                &paths.beads_dir,
+                &paths.jsonl_path,
+                config::implicit_external_jsonl_allowed(
+                    &paths.beads_dir,
+                    &paths.db_path,
+                    &paths.jsonl_path,
+                ),
+            )
+        {
+            debug!(?e, "Auto-flush failed (non-fatal)");
+        }
+    }
+}
+
+/// Try to acquire an exclusive advisory lock on `.beads/.sync.lock`.
+///
+/// Returns the lock file on success. The lock is held until the returned
+/// `File` is dropped.  If another process already holds the lock, returns
+/// `None` (non-blocking).
+fn try_sync_lock(beads_dir: &Path) -> Option<File> {
+    let lock_path = beads_dir.join(".sync.lock");
+    let file = File::create(&lock_path).ok()?;
+    // `try_lock()` is non-blocking: returns `Ok(())` if we got the exclusive
+    // lock, or `Err(WouldBlock)` if another process already holds it.
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(_) => None,
     }
 }
 

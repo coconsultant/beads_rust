@@ -1964,21 +1964,23 @@ pub fn auto_import_if_stale(
         return Ok(AutoImportResult::default());
     }
 
-    // Refuse to auto-import if DB is dirty (has local unsaved changes)
-    // to prevent silent data loss during Last-Write-Wins import.
+    // When both JSONL and DB have changed, skip the auto-import with a
+    // warning instead of failing the command.  This prevents spurious
+    // SyncConflict errors when ≥3 concurrent `br` processes race: one
+    // process flushes JSONL while another has pending local writes,
+    // causing both `jsonl_newer` and `db_newer` to be true.
+    //
+    // Explicit `br sync` still detects this as a hard conflict so the
+    // user can reconcile manually.
     if staleness.db_newer && !allow_stale {
-        return Err(BeadsError::SyncConflict {
-            message: format!(
-                "JSONL is newer ({}), but the database also has {} unsaved change(s).\n\
-                 A silent auto-import would risk overwriting local changes.\n\
-                 Hint: run `br sync` to perform a safe 3-way merge, or `br sync --flush-only` to push your changes first.",
-                staleness.jsonl_mtime.map_or_else(
-                    || "unknown".to_string(),
-                    |t| chrono::DateTime::<Utc>::from(t).to_rfc3339(),
-                ),
-                staleness.dirty_count
-            ),
-        });
+        tracing::warn!(
+            dirty_count = staleness.dirty_count,
+            jsonl_mtime = ?staleness.jsonl_mtime,
+            "Skipping auto-import: JSONL changed externally while {} local change(s) are pending. \
+             Run `br sync` to reconcile.",
+            staleness.dirty_count,
+        );
+        return Ok(AutoImportResult::default());
     }
 
     let import_config = ImportConfig {
