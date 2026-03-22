@@ -496,7 +496,8 @@ fn collect_single_graph(
             }
 
             if !discovered_nodes.contains(&dep.id) {
-                // Use cache if available, otherwise fallback to DB
+                // Use cache if available, otherwise preserve the dependency metadata
+                // placeholder instead of turning a missing issue back into a hard error.
                 let issue = if let Some(meta) = metadata_cache.get(&dep.id) {
                     Issue {
                         id: dep.id.clone(),
@@ -506,11 +507,13 @@ fn collect_single_graph(
                         ..Issue::default()
                     }
                 } else {
-                    storage.get_issue(&dep.id)?.ok_or_else(|| {
-                        BeadsError::IssueNotFound {
-                            id: dep.id.clone(),
-                        }
-                    })?
+                    Issue {
+                        id: dep.id.clone(),
+                        title: dep.title.clone(),
+                        priority: dep.priority,
+                        status: dep.status.clone(),
+                        ..Issue::default()
+                    }
                 };
 
                 traversal_order.push(dep.id.clone());
@@ -1599,6 +1602,51 @@ mod tests {
         // If it hangs, the test runner will timeout
         let result = graph_all(&storage, false, &ctx);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_collect_single_graph_preserves_missing_dependent_placeholder() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = chrono::Utc::now();
+
+        let root = Issue {
+            id: "bd-root".to_string(),
+            title: "Root".to_string(),
+            status: Status::Open,
+            priority: crate::model::Priority::MEDIUM,
+            issue_type: crate::model::IssueType::Task,
+            created_at: t1,
+            updated_at: t1,
+            ..Default::default()
+        };
+
+        storage.create_issue(&root, "test").unwrap();
+
+        let created_at = t1.to_rfc3339();
+        storage
+            .execute_test_sql(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                 VALUES ('bd-missing', 'bd-root', 'blocks', '{created_at}', 'test');
+                 PRAGMA foreign_keys = ON;"
+            ))
+            .unwrap();
+
+        let traversal = collect_single_graph(&storage, "bd-root", &root)
+            .expect("graph traversal should preserve missing dependent placeholders");
+
+        let missing = traversal
+            .issues_by_id
+            .get("bd-missing")
+            .expect("missing dependent should be represented in graph output");
+        assert_eq!(missing.title, "[missing issue: bd-missing]");
+        assert_eq!(missing.status, Status::Tombstone);
+        assert!(
+            traversal
+                .edges
+                .contains(&(String::from("bd-missing"), String::from("bd-root"))),
+            "graph should retain the dangling edge"
+        );
     }
 
     #[test]

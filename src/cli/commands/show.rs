@@ -467,7 +467,7 @@ fn build_issue_details_from_jsonl(
         .dependencies
         .iter()
         .map(|dep| dependency_metadata_from_jsonl(dep, issues_by_id, true))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     dependencies.sort_by(|left, right| {
         left.1
             .cmp(&right.1)
@@ -532,9 +532,9 @@ fn dependency_metadata_from_jsonl(
     dep: &Dependency,
     issues_by_id: &HashMap<String, Issue>,
     allow_external_placeholder: bool,
-) -> Result<(IssueWithDependencyMetadata, Priority, DateTime<Utc>)> {
+) -> (IssueWithDependencyMetadata, Priority, DateTime<Utc>) {
     if let Some(target) = issues_by_id.get(&dep.depends_on_id) {
-        return Ok((
+        return (
             IssueWithDependencyMetadata {
                 id: target.id.clone(),
                 title: target.title.clone(),
@@ -544,11 +544,11 @@ fn dependency_metadata_from_jsonl(
             },
             target.priority,
             target.created_at,
-        ));
+        );
     }
 
     if allow_external_placeholder && dep.depends_on_id.starts_with("external:") {
-        return Ok((
+        return (
             IssueWithDependencyMetadata {
                 id: dep.depends_on_id.clone(),
                 title: dep
@@ -562,13 +562,20 @@ fn dependency_metadata_from_jsonl(
             },
             Priority::MEDIUM,
             dep.created_at,
-        ));
+        );
     }
 
-    Err(BeadsError::Config(format!(
-        "dependency row references missing issue {}",
-        dep.depends_on_id
-    )))
+    (
+        IssueWithDependencyMetadata {
+            id: dep.depends_on_id.clone(),
+            title: format!("[missing issue: {}]", dep.depends_on_id),
+            status: Status::Tombstone,
+            priority: Priority::MEDIUM,
+            dep_type: dep.dep_type.as_str().to_string(),
+        },
+        Priority::MEDIUM,
+        dep.created_at,
+    )
 }
 
 fn find_ids_by_hash_in_memory(
@@ -1125,6 +1132,37 @@ mod tests {
         assert_eq!(parent_details.dependents[0].dep_type, "parent-child");
         info!(
             "test_build_issue_details_from_jsonl_derives_parent_and_dependents: assertions passed"
+        );
+    }
+
+    #[test]
+    fn test_build_issue_details_from_jsonl_preserves_missing_dependency_placeholder() {
+        init_logging();
+        info!(
+            "test_build_issue_details_from_jsonl_preserves_missing_dependency_placeholder: starting"
+        );
+
+        let mut issue = make_test_issue("bd-root", "Root");
+        issue.dependencies = vec![Dependency {
+            issue_id: "bd-root".to_string(),
+            depends_on_id: "bd-missing".to_string(),
+            dep_type: DependencyType::Blocks,
+            created_at: Utc.with_ymd_and_hms(2025, 1, 1, 1, 0, 0).unwrap(),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }];
+
+        let issues_by_id = HashMap::from([(issue.id.clone(), issue.clone())]);
+        let details = build_issue_details_from_jsonl(&issue, &issues_by_id).unwrap();
+
+        assert_eq!(details.dependencies.len(), 1);
+        assert_eq!(details.dependencies[0].id, "bd-missing");
+        assert_eq!(details.dependencies[0].title, "[missing issue: bd-missing]");
+        assert_eq!(details.dependencies[0].status, Status::Tombstone);
+        assert_eq!(details.dependencies[0].priority, Priority::MEDIUM);
+        info!(
+            "test_build_issue_details_from_jsonl_preserves_missing_dependency_placeholder: assertions passed"
         );
     }
 

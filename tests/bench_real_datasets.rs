@@ -38,6 +38,7 @@ use common::dataset_registry::{
     DatasetIntegrityGuard, DatasetMetadata, IsolatedDataset, KnownDataset,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -128,11 +129,68 @@ pub struct BenchmarkSummary {
     pub total_bd_ms: u128,
 }
 
+#[derive(Debug, Clone)]
+struct CapturedRun {
+    metrics: RunMetrics,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug)]
+struct CreatedWriteWorkloads {
+    comparisons: Vec<Comparison>,
+    br_created_ids: Vec<String>,
+    bd_created_ids: Vec<String>,
+}
+
 // =============================================================================
 // Command Runner with Metrics
 // =============================================================================
 
 /// Run a command and capture metrics including RSS.
+fn run_with_capture(
+    binary_path: &Path,
+    args: &[&str],
+    cwd: &Path,
+    label: &str,
+    binary_name: &str,
+) -> CapturedRun {
+    let start = Instant::now();
+
+    let output = Command::new(binary_path)
+        .args(args)
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run command");
+
+    let duration = start.elapsed();
+
+    // Try to get peak RSS from /proc/self/status on Linux
+    // For more accurate measurements, we'd need to use getrusage or external tools
+    let peak_rss_bytes = get_peak_rss_bytes();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    CapturedRun {
+        metrics: RunMetrics {
+            label: label.to_string(),
+            binary: binary_name.to_string(),
+            duration_ms: duration.as_millis(),
+            peak_rss_bytes,
+            exit_code: output.status.code().unwrap_or(-1),
+            success: output.status.success(),
+            stdout_len: output.stdout.len(),
+            stderr_len: output.stderr.len(),
+        },
+        stdout,
+        stderr,
+    }
+}
+
 fn run_with_metrics(
     binary_path: &Path,
     args: &[&str],
@@ -153,20 +211,103 @@ fn run_with_metrics(
 
     let duration = start.elapsed();
 
-    // Try to get peak RSS from /proc/self/status on Linux
-    // For more accurate measurements, we'd need to use getrusage or external tools
-    let peak_rss_bytes = get_peak_rss_bytes();
-
     RunMetrics {
         label: label.to_string(),
         binary: binary_name.to_string(),
         duration_ms: duration.as_millis(),
-        peak_rss_bytes,
+        peak_rss_bytes: get_peak_rss_bytes(),
         exit_code: output.status.code().unwrap_or(-1),
         success: output.status.success(),
         stdout_len: output.stdout.len(),
         stderr_len: output.stderr.len(),
     }
+}
+
+fn summarize_command_failure(run: &CapturedRun) -> String {
+    let stderr = run.stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.chars().take(300).collect();
+    }
+
+    let stdout = run.stdout.trim();
+    if !stdout.is_empty() {
+        return stdout.chars().take(300).collect();
+    }
+
+    "command produced no output".to_string()
+}
+
+fn ensure_command_succeeded(run: &CapturedRun, context: &str) -> Result<(), String> {
+    if run.metrics.success {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{context} failed with exit code {}: {}",
+        run.metrics.exit_code,
+        summarize_command_failure(run)
+    ))
+}
+
+fn extract_issue_id(output: &str) -> Result<String, String> {
+    let parsed: Value = serde_json::from_str(output)
+        .map_err(|error| format!("failed to parse JSON output: {error}"))?;
+
+    let id = match parsed {
+        Value::Object(map) => map.get("id").and_then(Value::as_str).map(str::to_string),
+        Value::Array(items) => items.first().and_then(|item| {
+            item.as_object()
+                .and_then(|map| map.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }),
+        _ => None,
+    };
+
+    id.ok_or_else(|| "JSON output did not contain an issue id".to_string())
+}
+
+fn push_aggregate_total(comparisons: &mut Vec<Comparison>, prefix: &str, total_label: &str) {
+    let br_total: u128 = comparisons
+        .iter()
+        .filter(|comparison| comparison.label.starts_with(prefix))
+        .map(|comparison| comparison.br.duration_ms)
+        .sum();
+    let bd_total: u128 = comparisons
+        .iter()
+        .filter(|comparison| comparison.label.starts_with(prefix))
+        .map(|comparison| comparison.bd.duration_ms)
+        .sum();
+
+    comparisons.push(Comparison {
+        label: total_label.to_string(),
+        br: RunMetrics {
+            label: total_label.to_string(),
+            binary: "br".to_string(),
+            duration_ms: br_total,
+            peak_rss_bytes: None,
+            exit_code: 0,
+            success: true,
+            stdout_len: 0,
+            stderr_len: 0,
+        },
+        bd: RunMetrics {
+            label: total_label.to_string(),
+            binary: "bd".to_string(),
+            duration_ms: bd_total,
+            peak_rss_bytes: None,
+            exit_code: 0,
+            success: true,
+            stdout_len: 0,
+            stderr_len: 0,
+        },
+        duration_ratio: if bd_total > 0 {
+            br_total as f64 / bd_total as f64
+        } else {
+            1.0
+        },
+        rss_ratio: None,
+    });
 }
 
 /// Try to get peak RSS from the OS.
@@ -276,81 +417,201 @@ fn run_read_workloads(br_path: &Path, bd_path: &Path, workspace: &Path) -> Vec<C
 
 /// Run write-heavy workloads and return comparisons.
 /// Note: These modify the workspace, so they should be run on an isolated copy.
+fn benchmark_create_workloads(
+    br_path: &Path,
+    bd_path: &Path,
+    br_workspace: &Path,
+    bd_workspace: &Path,
+) -> Result<CreatedWriteWorkloads, String> {
+    let mut comparisons = Vec::new();
+    let mut br_created_ids = Vec::new();
+    let mut bd_created_ids = Vec::new();
+
+    for i in 0..10 {
+        let title = format!("Benchmark issue {i}");
+        let br = run_with_capture(
+            br_path,
+            &[
+                "create",
+                "--title",
+                &title,
+                "--type=task",
+                "--priority=2",
+                "--json",
+            ],
+            br_workspace,
+            &format!("create_{i}"),
+            "br",
+        );
+        let bd = run_with_capture(
+            bd_path,
+            &[
+                "create",
+                "--title",
+                &title,
+                "--type=task",
+                "--priority=2",
+                "--json",
+            ],
+            bd_workspace,
+            &format!("create_{i}"),
+            "bd",
+        );
+
+        ensure_command_succeeded(&br, &format!("br create_{i}"))?;
+        ensure_command_succeeded(&bd, &format!("bd create_{i}"))?;
+
+        let br_id = extract_issue_id(&br.stdout).map_err(|error| {
+            format!(
+                "failed to capture created br issue id for create_{i}: {error}; stderr: {}",
+                br.stderr.trim()
+            )
+        })?;
+        let bd_id = extract_issue_id(&bd.stdout).map_err(|error| {
+            format!(
+                "failed to capture created bd issue id for create_{i}: {error}; stderr: {}",
+                bd.stderr.trim()
+            )
+        })?;
+
+        br_created_ids.push(br_id);
+        bd_created_ids.push(bd_id);
+        comparisons.push(make_comparison(
+            &format!("create_{i}"),
+            br.metrics,
+            bd.metrics,
+        ));
+    }
+
+    push_aggregate_total(&mut comparisons, "create_", "create_10_total");
+    Ok(CreatedWriteWorkloads {
+        comparisons,
+        br_created_ids,
+        bd_created_ids,
+    })
+}
+
+fn benchmark_update_workloads(
+    br_path: &Path,
+    bd_path: &Path,
+    br_workspace: &Path,
+    bd_workspace: &Path,
+    br_created_ids: &[String],
+    bd_created_ids: &[String],
+) -> Result<Vec<Comparison>, String> {
+    let mut comparisons = Vec::new();
+
+    for (i, (br_id, bd_id)) in br_created_ids.iter().zip(bd_created_ids).enumerate() {
+        let update_title = format!("Benchmark issue {i} updated");
+        let br = run_with_capture(
+            br_path,
+            &[
+                "update",
+                br_id,
+                "--title",
+                &update_title,
+                "--priority=1",
+                "--json",
+            ],
+            br_workspace,
+            &format!("update_{i}"),
+            "br",
+        );
+        let bd = run_with_capture(
+            bd_path,
+            &[
+                "update",
+                bd_id,
+                "--title",
+                &update_title,
+                "--priority=1",
+                "--json",
+            ],
+            bd_workspace,
+            &format!("update_{i}"),
+            "bd",
+        );
+
+        ensure_command_succeeded(&br, &format!("br update_{i}"))?;
+        ensure_command_succeeded(&bd, &format!("bd update_{i}"))?;
+        comparisons.push(make_comparison(
+            &format!("update_{i}"),
+            br.metrics,
+            bd.metrics,
+        ));
+    }
+
+    push_aggregate_total(&mut comparisons, "update_", "update_10_total");
+    Ok(comparisons)
+}
+
+fn benchmark_close_workloads(
+    br_path: &Path,
+    bd_path: &Path,
+    br_workspace: &Path,
+    bd_workspace: &Path,
+    br_created_ids: &[String],
+    bd_created_ids: &[String],
+) -> Result<Vec<Comparison>, String> {
+    let mut comparisons = Vec::new();
+
+    for (i, (br_id, bd_id)) in br_created_ids.iter().zip(bd_created_ids).enumerate() {
+        let br = run_with_capture(
+            br_path,
+            &["close", br_id, "--reason", "benchmark close", "--json"],
+            br_workspace,
+            &format!("close_{i}"),
+            "br",
+        );
+        let bd = run_with_capture(
+            bd_path,
+            &["close", bd_id, "--reason", "benchmark close", "--json"],
+            bd_workspace,
+            &format!("close_{i}"),
+            "bd",
+        );
+
+        ensure_command_succeeded(&br, &format!("br close_{i}"))?;
+        ensure_command_succeeded(&bd, &format!("bd close_{i}"))?;
+        comparisons.push(make_comparison(
+            &format!("close_{i}"),
+            br.metrics,
+            bd.metrics,
+        ));
+    }
+
+    push_aggregate_total(&mut comparisons, "close_", "close_10_total");
+    Ok(comparisons)
+}
+
 fn run_write_workloads(
     br_path: &Path,
     bd_path: &Path,
     br_workspace: &Path,
     bd_workspace: &Path,
-) -> Vec<Comparison> {
-    let mut comparisons = Vec::new();
-
-    // Create 10 issues
-    for i in 0..10 {
-        let title = format!("Benchmark issue {i}");
-        let br = run_with_metrics(
-            br_path,
-            &["create", "--title", &title, "--type=task", "--priority=2"],
-            br_workspace,
-            &format!("create_{i}"),
-            "br",
-        );
-        let bd = run_with_metrics(
-            bd_path,
-            &["create", "--title", &title, "--type=task", "--priority=2"],
-            bd_workspace,
-            &format!("create_{i}"),
-            "bd",
-        );
-        comparisons.push(make_comparison(&format!("create_{i}"), br, bd));
-    }
-
-    // Aggregate create metrics
-    let br_create_total: u128 = comparisons
-        .iter()
-        .filter(|c| c.label.starts_with("create_"))
-        .map(|c| c.br.duration_ms)
-        .sum();
-    let bd_create_total: u128 = comparisons
-        .iter()
-        .filter(|c| c.label.starts_with("create_"))
-        .map(|c| c.bd.duration_ms)
-        .sum();
-
-    // Add aggregate comparison
-    comparisons.push(Comparison {
-        label: "create_10_total".to_string(),
-        br: RunMetrics {
-            label: "create_10_total".to_string(),
-            binary: "br".to_string(),
-            duration_ms: br_create_total,
-            peak_rss_bytes: None,
-            exit_code: 0,
-            success: true,
-            stdout_len: 0,
-            stderr_len: 0,
-        },
-        bd: RunMetrics {
-            label: "create_10_total".to_string(),
-            binary: "bd".to_string(),
-            duration_ms: bd_create_total,
-            peak_rss_bytes: None,
-            exit_code: 0,
-            success: true,
-            stdout_len: 0,
-            stderr_len: 0,
-        },
-        duration_ratio: if bd_create_total > 0 {
-            br_create_total as f64 / bd_create_total as f64
-        } else {
-            1.0
-        },
-        rss_ratio: None,
-    });
-
-    // Note: update and close would need issue IDs from the creates above
-    // For now, we focus on create operations as the primary write workload
-
-    comparisons
+) -> Result<Vec<Comparison>, String> {
+    let CreatedWriteWorkloads {
+        mut comparisons,
+        br_created_ids,
+        bd_created_ids,
+    } = benchmark_create_workloads(br_path, bd_path, br_workspace, bd_workspace)?;
+    comparisons.extend(benchmark_update_workloads(
+        br_path,
+        bd_path,
+        br_workspace,
+        bd_workspace,
+        &br_created_ids,
+        &bd_created_ids,
+    )?);
+    comparisons.extend(benchmark_close_workloads(
+        br_path,
+        bd_path,
+        br_workspace,
+        bd_workspace,
+        &br_created_ids,
+        &bd_created_ids,
+    )?);
+    Ok(comparisons)
 }
 
 /// Create a comparison from br and bd metrics.
@@ -532,7 +793,7 @@ fn benchmark_dataset(
         &bd.path,
         br_isolated.workspace_root(),
         bd_isolated.workspace_root(),
-    );
+    )?;
     comparisons.extend(write_comparisons);
 
     // Verify source wasn't mutated
@@ -780,4 +1041,16 @@ fn test_make_comparison() {
     assert_eq!(comparison.label, "test");
     assert!((comparison.duration_ratio - 0.5).abs() < 0.01);
     assert!((comparison.rss_ratio.unwrap() - 0.5).abs() < 0.01);
+}
+
+#[test]
+fn test_extract_issue_id_from_object_output() {
+    let output = r#"{"id":"bd-123","title":"example"}"#;
+    assert_eq!(extract_issue_id(output).unwrap(), "bd-123");
+}
+
+#[test]
+fn test_extract_issue_id_from_array_output() {
+    let output = r#"[{"id":"bd-456","title":"example"}]"#;
+    assert_eq!(extract_issue_id(output).unwrap(), "bd-456");
 }

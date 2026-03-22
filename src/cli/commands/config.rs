@@ -24,7 +24,8 @@ use serde_json::json;
 use shell_words::split as split_shell_words;
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace};
@@ -78,6 +79,81 @@ struct ConfigEntry {
 struct LayerWithSource {
     source: ConfigSource,
     layer: ConfigLayer,
+}
+
+struct TempConfigFileGuard {
+    path: PathBuf,
+    persist: bool,
+}
+
+impl TempConfigFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            persist: false,
+        }
+    }
+
+    fn persist(&mut self) {
+        self.persist = true;
+    }
+}
+
+impl Drop for TempConfigFileGuard {
+    fn drop(&mut self) {
+        if !self.persist {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_temp_config_file(config_path: &Path) -> Result<(PathBuf, File)> {
+    let pid = std::process::id();
+    for attempt in 0..64_u32 {
+        let extension = if attempt == 0 {
+            format!("yaml.{pid}.tmp")
+        } else {
+            format!("yaml.{pid}.{attempt}.tmp")
+        };
+        let temp_path = config_path.with_extension(extension);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate temp config file for {}",
+        config_path.display()
+    )))
+}
+
+fn write_config_atomically(config_path: &Path, yaml: &str) -> Result<()> {
+    let existing_permissions = fs::metadata(config_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let (temp_path, mut temp_file) = create_temp_config_file(config_path)?;
+    let mut guard = TempConfigFileGuard::new(temp_path.clone());
+    temp_file.write_all(yaml.as_bytes())?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+    fs::rename(&temp_path, config_path)?;
+    if let Some(permissions) = existing_permissions
+        && let Err(error) = fs::set_permissions(config_path, permissions)
+    {
+        tracing::warn!(
+            path = %config_path.display(),
+            error = %error,
+            "Failed to restore original config file permissions after atomic rewrite"
+        );
+    }
+    guard.persist();
+    Ok(())
 }
 
 /// Execute the config command.
@@ -532,9 +608,7 @@ fn set_config_value(
 
     // Write back atomically (temp file + rename) to prevent corruption on crash
     let yaml_str = serde_yml::to_string(&config)?;
-    let temp_path = config_path.with_extension(format!("yaml.{}.tmp", std::process::id()));
-    fs::write(&temp_path, &yaml_str)?;
-    fs::rename(&temp_path, &config_path)?;
+    write_config_atomically(&config_path, &yaml_str)?;
 
     info!(
         key,
@@ -812,9 +886,7 @@ fn apply_prepared_yaml_delete(prepared: Option<PreparedYamlDelete>) -> Result<bo
     };
 
     // Atomic write: temp file + rename to prevent corruption on crash
-    let temp_path = prepared.path.with_extension(format!("yaml.{}.tmp", std::process::id()));
-    fs::write(&temp_path, &prepared.yaml)?;
-    fs::rename(&temp_path, &prepared.path)?;
+    write_config_atomically(&prepared.path, &prepared.yaml)?;
     Ok(true)
 }
 
@@ -1143,6 +1215,46 @@ mod tests {
 
         let contents = fs::read_to_string(&config_path).unwrap();
         assert!(!contents.contains("color"));
+    }
+
+    #[test]
+    fn test_write_config_atomically_skips_stale_temp_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        fs::write(&config_path, "display:\n  color: true\n").unwrap();
+
+        let stale_temp = config_path.with_extension(format!("yaml.{}.tmp", std::process::id()));
+        fs::write(&stale_temp, "stale-temp-sentinel").unwrap();
+
+        write_config_atomically(&config_path, "display:\n  color: false\n").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&stale_temp).unwrap(),
+            "stale-temp-sentinel",
+            "existing temp file should not be clobbered"
+        );
+        assert!(
+            fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("color: false"),
+            "config should be updated via a fresh temp file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_config_atomically_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        fs::write(&config_path, "display:\n  color: true\n").unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_config_atomically(&config_path, "display:\n  color: false\n").unwrap();
+
+        let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "atomic rewrite should preserve file mode");
     }
 
     #[test]

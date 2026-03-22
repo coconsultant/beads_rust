@@ -710,11 +710,8 @@ fn e2e_no_db_mixed_prefixes_are_supported() {
         list.stderr
     );
 
-    let payload = extract_json_payload(&list.stdout);
-    let issues: Value = serde_json::from_str(&payload).expect("parse list JSON");
+    let issues = parse_list_issues(&list.stdout);
     let ids: Vec<&str> = issues
-        .as_array()
-        .expect("list payload array")
         .iter()
         .filter_map(|issue| issue["id"].as_str())
         .collect();

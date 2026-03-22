@@ -7890,7 +7890,7 @@ mod tests {
         let deps = storage
             .get_dependencies_with_metadata("bd-a1")
             .expect("should return placeholder for missing dependency");
-        
+
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].id, "bd-missing");
         assert_eq!(deps[0].title, "[missing issue: bd-missing]");
@@ -7918,7 +7918,7 @@ mod tests {
         let deps = storage
             .get_dependents_with_metadata("bd-b1")
             .expect("should return placeholder for missing dependent");
-        
+
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].id, "bd-missing");
         assert_eq!(deps[0].title, "[missing issue: bd-missing]");

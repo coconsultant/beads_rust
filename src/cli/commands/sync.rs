@@ -6,6 +6,7 @@
 use crate::cli::SyncArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::model::Issue;
 use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::{
@@ -961,11 +962,18 @@ fn execute_import(
         None
     };
 
+    let preserved_tombstones = if args.force {
+        snapshot_tombstones(storage)?
+    } else {
+        Vec::new()
+    };
+
     // For force imports, drop and recreate data tables to avoid fsqlite btree
     // cursor bugs on DELETE operations in large tables. Config/metadata are preserved.
     if args.force {
         debug!("Force import: resetting data tables to avoid btree DELETE bugs");
         storage.reset_data_tables()?;
+        restore_tombstones(storage, &preserved_tombstones)?;
     }
 
     // Execute import
@@ -1052,6 +1060,32 @@ fn execute_import(
         println!("  Rebuilt blocked cache");
     }
 
+    Ok(())
+}
+
+fn snapshot_tombstones(storage: &crate::storage::SqliteStorage) -> Result<Vec<Issue>> {
+    let mut tombstones = Vec::new();
+    for meta in storage.get_all_issues_metadata()? {
+        if meta.status != crate::model::Status::Tombstone {
+            continue;
+        }
+        if let Some(issue) = storage.get_issue(&meta.id)? {
+            tombstones.push(issue);
+        }
+    }
+    Ok(tombstones)
+}
+
+fn restore_tombstones(
+    storage: &crate::storage::SqliteStorage,
+    tombstones: &[Issue],
+) -> Result<()> {
+    for tombstone in tombstones {
+        storage.upsert_issue_for_import(tombstone)?;
+    }
+    if !tombstones.is_empty() {
+        debug!(count = tombstones.len(), "Restored tombstones after force reset");
+    }
     Ok(())
 }
 

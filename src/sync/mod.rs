@@ -505,6 +505,74 @@ impl PreflightResult {
     }
 }
 
+const JSONL_VALIDATION_PREVIEW_LIMIT: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JsonlIssueValidationFailure {
+    pub line: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct JsonlIssueValidationSummary {
+    pub record_count: usize,
+    pub invalid_count: usize,
+    pub failures: Vec<JsonlIssueValidationFailure>,
+}
+
+impl JsonlIssueValidationSummary {
+    fn push_failure(&mut self, line: usize, message: impl Into<String>) {
+        self.invalid_count += 1;
+        if self.failures.len() < JSONL_VALIDATION_PREVIEW_LIMIT {
+            self.failures.push(JsonlIssueValidationFailure {
+                line,
+                message: message.into(),
+            });
+        }
+    }
+
+    pub(crate) fn preview_messages(&self) -> Vec<String> {
+        self.failures
+            .iter()
+            .map(|failure| format!("line {}: {}", failure.line, failure.message))
+            .collect()
+    }
+}
+
+pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueValidationSummary> {
+    let file = File::open(path)?;
+    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut summary = JsonlIssueValidationSummary::default();
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = line_result?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        summary.record_count += 1;
+        match serde_json::from_str::<Issue>(trimmed) {
+            Ok(mut issue) => {
+                normalize_issue(&mut issue);
+                if let Err(errors) = IssueValidator::validate(&issue) {
+                    summary.push_failure(
+                        line_num + 1,
+                        errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+            }
+            Err(err) => summary.push_failure(line_num + 1, err.to_string()),
+        }
+    }
+
+    Ok(summary)
+}
+
 /// Run preflight checks for export operation.
 ///
 /// This function is read-only and validates:
@@ -916,68 +984,46 @@ pub fn preflight_import(
         }
     }
 
-    // Check 5: Per-line JSON validation
-    {
-        let file = File::open(input_path);
-        match file {
-            Ok(f) => {
-                let reader = BufReader::new(f);
-                let mut invalid_lines: Vec<(usize, String)> = Vec::new();
-                for (line_num, line_result) in reader.lines().enumerate() {
-                    let line = match line_result {
-                        Ok(l) => l,
-                        Err(e) => {
-                            invalid_lines.push((line_num + 1, format!("IO error: {e}")));
-                            continue;
-                        }
-                    };
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
+    // Check 5: Per-line issue-record validation
+    match validate_jsonl_issue_records(input_path) {
+        Ok(summary) if summary.invalid_count == 0 => {
+            result.add(PreflightCheck::pass(
+                "json_valid",
+                "All JSONL lines are valid issue records",
+                format!("Validated {} issue record(s).", summary.record_count),
+            ));
+            tracing::debug!(path = %input_path.display(), record_count = summary.record_count, "JSONL issue validation check: PASS");
+        }
+        Ok(summary) => {
+            let preview = summary.preview_messages();
+            result.add(PreflightCheck::fail(
+                "json_valid",
+                "All JSONL lines are valid issue records",
+                format!(
+                    "Found {} invalid issue record(s): {}{}",
+                    summary.invalid_count,
+                    preview.join("; "),
+                    if summary.invalid_count > preview.len() {
+                        " ..."
+                    } else {
+                        ""
                     }
-                    if let Err(e) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        invalid_lines.push((line_num + 1, e.to_string()));
-                    }
-                }
-                if invalid_lines.is_empty() {
-                    result.add(PreflightCheck::pass(
-                        "json_valid",
-                        "All JSONL lines are valid JSON",
-                        "Every non-empty line parses as valid JSON.",
-                    ));
-                    tracing::debug!(path = %input_path.display(), "JSON validation check: PASS");
-                } else {
-                    let preview: Vec<String> = invalid_lines
-                        .iter()
-                        .take(5)
-                        .map(|(ln, msg)| format!("line {ln}: {msg}"))
-                        .collect();
-                    result.add(PreflightCheck::fail(
-                        "json_valid",
-                        "All JSONL lines are valid JSON",
-                        format!(
-                            "Found {} invalid line(s): {}{}",
-                            invalid_lines.len(),
-                            preview.join("; "),
-                            if invalid_lines.len() > 5 { " ..." } else { "" }
-                        ),
-                        "Fix or remove invalid JSON lines before importing.",
-                    ));
-                    tracing::debug!(
-                        path = %input_path.display(),
-                        invalid_count = invalid_lines.len(),
-                        "JSON validation check: FAIL"
-                    );
-                }
-            }
-            Err(e) => {
-                result.add(PreflightCheck::warn(
-                    "json_valid",
-                    "All JSONL lines are valid JSON",
-                    format!("Could not open file for JSON validation: {e}"),
-                    "Verify file is readable.",
-                ));
-            }
+                ),
+                "Fix or remove malformed issue records before importing.",
+            ));
+            tracing::debug!(
+                path = %input_path.display(),
+                invalid_count = summary.invalid_count,
+                "JSONL issue validation check: FAIL"
+            );
+        }
+        Err(err) => {
+            result.add(PreflightCheck::warn(
+                "json_valid",
+                "All JSONL lines are valid issue records",
+                format!("Could not open file for JSONL validation: {err}"),
+                "Verify file is readable.",
+            ));
         }
     }
 
@@ -5785,7 +5831,7 @@ mod tests {
         let json_check = failures.iter().find(|c| c.name == "json_valid");
         assert!(json_check.is_some(), "Expected json_valid failure");
         let msg = &json_check.unwrap().message;
-        assert!(msg.contains("2 invalid line(s)"), "Message was: {msg}");
+        assert!(msg.contains("2 invalid issue record"), "Message was: {msg}");
         assert!(msg.contains("line 2"), "Should mention line 2: {msg}");
         assert!(msg.contains("line 4"), "Should mention line 4: {msg}");
     }
@@ -5817,6 +5863,41 @@ mod tests {
         let json_check = result.checks.iter().find(|c| c.name == "json_valid");
         assert!(json_check.is_some());
         assert_eq!(json_check.unwrap().status, PreflightCheckStatus::Pass);
+    }
+
+    #[test]
+    fn test_preflight_import_rejects_semantically_invalid_issue_records() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let mut invalid_issue = make_test_issue("bd-001", "");
+        invalid_issue.title.clear();
+        std::fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&invalid_issue).unwrap()),
+        )
+        .unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
+
+        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
+        let failures = result.failures();
+        let json_check = failures.iter().find(|c| c.name == "json_valid");
+        assert!(json_check.is_some(), "Expected json_valid failure");
+        assert!(
+            json_check
+                .expect("json_valid failure")
+                .message
+                .contains("title"),
+            "Expected validation failure to mention the empty title"
+        );
     }
 
     #[test]

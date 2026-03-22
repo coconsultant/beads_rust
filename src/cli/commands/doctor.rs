@@ -8,8 +8,8 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    PathValidation, compute_staleness, scan_conflict_markers, validate_no_git_path,
-    validate_sync_path, validate_sync_path_with_external,
+    PathValidation, compute_staleness, scan_conflict_markers, validate_jsonl_issue_records,
+    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
 };
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
@@ -17,8 +17,7 @@ use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1458,56 +1457,52 @@ fn select_doctor_jsonl_path(beads_dir: &Path, paths: &config::ConfigPaths) -> Op
 }
 
 fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<usize> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut total = 0usize;
-    let mut invalid = Vec::new();
-    let mut invalid_count = 0usize;
+    let summary = validate_jsonl_issue_records(path)?;
 
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        total += 1;
-        if serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
-            invalid_count += 1;
-            if invalid.len() < 10 {
-                invalid.push(idx + 1);
-            }
-        }
-    }
-
-    if invalid.is_empty() {
+    if summary.invalid_count == 0 {
         push_check(
             checks,
             "jsonl.parse",
             CheckStatus::Ok,
-            Some(format!("Parsed {total} records")),
+            Some(format!("Parsed {} records", summary.record_count)),
             Some(serde_json::json!({
                 "path": path.display().to_string(),
-                "records": total
+                "records": summary.record_count
             })),
         );
     } else {
+        let preview = summary.preview_messages();
         push_check(
             checks,
             "jsonl.parse",
             CheckStatus::Error,
             Some(format!(
-                "Malformed JSONL lines: {invalid_count} (first: {invalid:?})"
+                "Malformed or invalid issue records: {} ({})",
+                summary.invalid_count,
+                preview.join("; ")
             )),
             Some(serde_json::json!({
                 "path": path.display().to_string(),
-                "records": total,
-                "invalid_lines": invalid,
-                "invalid_count": invalid_count
+                "records": summary.record_count,
+                "invalid_lines": summary
+                    .failures
+                    .iter()
+                    .map(|failure| failure.line)
+                    .collect::<Vec<_>>(),
+                "invalid_count": summary.invalid_count,
+                "invalid_examples": summary
+                    .failures
+                    .iter()
+                    .map(|failure| serde_json::json!({
+                        "line": failure.line,
+                        "error": failure.message
+                    }))
+                    .collect::<Vec<_>>()
             })),
         );
     }
 
-    Ok(total)
+    Ok(summary.record_count)
 }
 
 fn check_db_count(
@@ -2318,6 +2313,33 @@ mod tests {
     }
 
     #[test]
+    fn test_check_jsonl_detects_invalid_issue_records() -> Result<()> {
+        let mut file = NamedTempFile::new().unwrap();
+        let mut invalid_issue = sample_issue("bd-bad01", "");
+        invalid_issue.id = "bd-bad01".to_string();
+        let encoded = serde_json::to_string(&invalid_issue)?;
+        std::io::Write::write_all(file.as_file_mut(), encoded.as_bytes())?;
+        std::io::Write::write_all(file.as_file_mut(), b"\n")?;
+
+        let mut checks = Vec::new();
+        let count = check_jsonl(file.path(), &mut checks).unwrap();
+        assert_eq!(count, 1);
+
+        let check = find_check(&checks, "jsonl.parse").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("title")),
+            "unexpected check message: {:?}",
+            check.message
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_required_schema_checks_missing_tables() {
         let conn = Connection::open(":memory:").unwrap();
         let mut checks = Vec::new();
@@ -2911,7 +2933,9 @@ mod tests {
         .unwrap_err();
         let err_msg = err.to_string();
         assert!(
-            err_msg.contains("invalid line") || err_msg.contains("Invalid JSON"),
+            err_msg.contains("invalid issue record")
+                || err_msg.contains("Preflight checks failed")
+                || err_msg.contains("Invalid JSON"),
             "unexpected error: {err}"
         );
 
