@@ -92,6 +92,40 @@ impl BlockedCacheRefreshPlan {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReadyIssueProjection {
+    Full,
+    Command,
+}
+
+impl ReadyIssueProjection {
+    const fn select_clause(self) -> &'static str {
+        match self {
+            Self::Full => {
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                         status, priority, issue_type, assignee, owner, estimated_minutes,
+                         created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                         due_at, defer_until, external_ref, source_system, source_repo,
+                         deleted_at, deleted_by, delete_reason, original_type,
+                         compaction_level, compacted_at, compacted_at_commit, original_size,
+                         sender, ephemeral, pinned, is_template"
+            }
+            Self::Command => {
+                r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
+                         issue_type, assignee, owner, estimated_minutes, created_at, created_by,
+                         updated_at"
+            }
+        }
+    }
+
+    fn parse_row(self, row: &fsqlite::Row) -> Result<Issue> {
+        match self {
+            Self::Full => SqliteStorage::issue_from_row(row),
+            Self::Command => SqliteStorage::ready_issue_from_row(row),
+        }
+    }
+}
+
 impl MutationContext {
     #[must_use]
     pub fn new(op_name: &str, actor: &str) -> Self {
@@ -1480,11 +1514,50 @@ impl SqliteStorage {
             set_clauses.push("content_hash = ?".to_string());
             params.push(SqliteValue::from(new_hash));
 
-            // Build and execute SQL
-            let sql = format!("UPDATE issues SET {} WHERE id = ? ", set_clauses.join(", "));
+            // Build and execute SQL. Claim operations use an additional
+            // compare-and-set predicate so exactly one contender can win even
+            // if two writers both observed the row as unassigned earlier.
+            let mut where_clause = "id = ?".to_string();
             params.push(SqliteValue::from(id));
+            if updates.expect_unassigned {
+                where_clause.push_str(" AND (assignee IS NULL OR TRIM(assignee) = ''");
+                if !updates.claim_exclusive
+                    && let Some(claim_actor) = updates
+                        .claim_actor
+                        .as_deref()
+                        .filter(|actor| !actor.is_empty())
+                {
+                    where_clause.push_str(" OR assignee = ?");
+                    params.push(SqliteValue::from(claim_actor));
+                }
+                where_clause.push(')');
+            }
 
-            conn.execute_with_params(&sql, &params)?;
+            let sql = format!(
+                "UPDATE issues SET {} WHERE {where_clause}",
+                set_clauses.join(", ")
+            );
+            let updated_rows = conn.execute_with_params(&sql, &params)?;
+            if updated_rows == 0 {
+                if updates.expect_unassigned {
+                    let rows = conn.query_with_params(
+                        "SELECT assignee FROM issues WHERE id = ?",
+                        &[SqliteValue::from(id)],
+                    )?;
+                    let current_assignee = rows
+                        .first()
+                        .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+                        .map(str::trim)
+                        .filter(|assignee| !assignee.is_empty())
+                        .unwrap_or("<unknown>");
+                    return Err(BeadsError::validation(
+                        "claim",
+                        format!("issue {id} already assigned to {current_assignee}"),
+                    ));
+                }
+
+                return Err(BeadsError::IssueNotFound { id: id.to_string() });
+            }
 
             ctx.mark_dirty(id);
 
@@ -2216,40 +2289,70 @@ impl SqliteStorage {
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
+        self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Full)
+    }
+
+    /// Get ready issues optimized for `ready` command rendering.
+    ///
+    /// Hydrates only the columns consumed by the command's JSON/TOON/text
+    /// output, avoiding large overflow-page reads for fields that never reach
+    /// the user-facing result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_ready_issues_for_command_output(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+    ) -> Result<Vec<Issue>> {
+        self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Command)
+    }
+
+    fn get_ready_issues_with_projection(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        projection: ReadyIssueProjection,
+    ) -> Result<Vec<Issue>> {
         match self.ensure_blocked_cache_fresh() {
-            Ok(_) => match self.query_ready_issue_candidates(filters, sort, true, true) {
+            Ok(_) => match self
+                .query_ready_issue_candidates_with_projection(filters, sort, true, true, projection)
+            {
                 Ok(issues) => Ok(issues),
                 Err(error) => {
                     let blocked_ids = self.recover_blocked_ids("ready_issues_query", &error)?;
-                    self.query_ready_issues_without_cache(filters, sort, &blocked_ids)
+                    self.query_ready_issues_without_cache_with_projection(
+                        filters,
+                        sort,
+                        &blocked_ids,
+                        projection,
+                    )
                 }
             },
             Err(error) => {
                 let blocked_ids = self.recover_blocked_ids("ready_issues_refresh", &error)?;
-                self.query_ready_issues_without_cache(filters, sort, &blocked_ids)
+                self.query_ready_issues_without_cache_with_projection(
+                    filters,
+                    sort,
+                    &blocked_ids,
+                    projection,
+                )
             }
         }
     }
 
     #[allow(clippy::too_many_lines)]
-    fn query_ready_issue_candidates(
+    fn build_ready_issue_candidates_query(
         &self,
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
         exclude_blocked_in_sql: bool,
         apply_limit: bool,
-    ) -> Result<Vec<Issue>> {
-        let mut sql = String::from(
-            r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
-                     status, priority, issue_type, assignee, owner, estimated_minutes,
-                     created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system, source_repo,
-                     deleted_at, deleted_by, delete_reason, original_type,
-                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
-              FROM issues WHERE 1=1",
-        );
-
+        projection: ReadyIssueProjection,
+    ) -> Result<(String, Vec<SqliteValue>)> {
+        let mut sql = String::from(projection.select_clause());
+        sql.push_str(" FROM issues WHERE 1=1");
         let mut params: Vec<SqliteValue> = Vec::new();
 
         if !filters.labels_and.is_empty() {
@@ -2391,22 +2494,43 @@ impl SqliteStorage {
             let _ = write!(sql, " LIMIT {limit}");
         }
 
+        Ok((sql, params))
+    }
+
+    fn query_ready_issue_candidates_with_projection(
+        &self,
+        filters: &ReadyFilters,
+        sort: ReadySortPolicy,
+        exclude_blocked_in_sql: bool,
+        apply_limit: bool,
+        projection: ReadyIssueProjection,
+    ) -> Result<Vec<Issue>> {
+        let (sql, params) = self.build_ready_issue_candidates_query(
+            filters,
+            sort,
+            exclude_blocked_in_sql,
+            apply_limit,
+            projection,
+        )?;
         let rows = self.conn.query_with_params(&sql, &params)?;
         let mut issues = Vec::with_capacity(rows.len());
         for row in &rows {
-            issues.push(Self::issue_from_row(row)?);
+            issues.push(projection.parse_row(row)?);
         }
 
         Ok(issues)
     }
 
-    fn query_ready_issues_without_cache(
+    fn query_ready_issues_without_cache_with_projection(
         &self,
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
         blocked_ids: &HashSet<String>,
+        projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
-        let mut issues = self.query_ready_issue_candidates(filters, sort, false, false)?;
+        let mut issues = self.query_ready_issue_candidates_with_projection(
+            filters, sort, false, false, projection,
+        )?;
         issues.retain(|issue| !blocked_ids.contains(issue.id.as_str()));
         if let Some(limit) = filters.limit
             && limit > 0
@@ -5651,6 +5775,71 @@ impl SqliteStorage {
         })
     }
 
+    fn ready_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+        let get_str = |idx: usize| -> String {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_str_ref =
+            |idx: usize| -> &str { row.get(idx).and_then(SqliteValue::as_text).unwrap_or("") };
+        let get_non_empty_str = |idx: usize| -> Option<String> {
+            row.get(idx)
+                .and_then(SqliteValue::as_text)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let get_opt_i32 = |idx: usize| -> Option<i32> {
+            row.get(idx)
+                .and_then(SqliteValue::as_integer)
+                .map(|value| value as i32)
+        };
+
+        Ok(Issue {
+            id: get_str(0),
+            content_hash: None,
+            title: get_str(1),
+            description: get_non_empty_str(2),
+            design: None,
+            acceptance_criteria: get_non_empty_str(3),
+            notes: get_non_empty_str(4),
+            status: parse_status(row.get(5).and_then(SqliteValue::as_text)),
+            priority: Priority(get_opt_i32(6).unwrap_or_else(|| Priority::default().0)),
+            issue_type: parse_issue_type(row.get(7).and_then(SqliteValue::as_text)),
+            assignee: get_non_empty_str(8),
+            owner: get_non_empty_str(9),
+            estimated_minutes: get_opt_i32(10),
+            created_at: parse_datetime(get_str_ref(11))?,
+            created_by: get_non_empty_str(12),
+            updated_at: parse_datetime(get_str_ref(13))?,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        })
+    }
+
     fn stats_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
@@ -7017,6 +7206,7 @@ impl SqliteStorage {
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
+    use crate::format::ReadyIssue;
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{DateTime, Datelike, TimeZone, Utc};
     use std::fs;
@@ -8751,6 +8941,134 @@ mod tests {
         assert!(!ready_ids.contains("bd-c1"));
         assert!(ready_ids.contains("bd-b1"));
         assert!(ready_ids.contains("bd-r1"));
+    }
+
+    #[test]
+    fn test_get_ready_issues_for_command_output_matches_full_ready_output() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 3, 20, 12, 0, 0).unwrap();
+
+        let mut ready = make_issue(
+            "bd-ready-detailed",
+            "Detailed ready issue",
+            Status::Open,
+            1,
+            Some("alice"),
+            created_at,
+            None,
+        );
+        ready.description = Some("Description".to_string());
+        ready.design = Some("Should not be loaded for ready output".to_string());
+        ready.acceptance_criteria = Some("AC".to_string());
+        ready.notes = Some("Notes".to_string());
+        ready.owner = Some("product".to_string());
+        ready.estimated_minutes = Some(45);
+        ready.created_by = Some("agent".to_string());
+        ready.updated_at = created_at + chrono::Duration::minutes(5);
+        ready.external_ref = Some("jira-123".to_string());
+        ready.source_system = Some("jira".to_string());
+        ready.source_repo = Some("proj".to_string());
+        ready.sender = Some("cli".to_string());
+
+        let blocker = make_issue(
+            "bd-blocker-detailed",
+            "Blocker",
+            Status::Open,
+            0,
+            None,
+            created_at + chrono::Duration::minutes(1),
+            None,
+        );
+        let blocked = make_issue(
+            "bd-blocked-detailed",
+            "Blocked",
+            Status::Open,
+            2,
+            None,
+            created_at + chrono::Duration::minutes(2),
+            None,
+        );
+
+        storage.create_issue(&ready, "tester").unwrap();
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-blocked-detailed",
+                "bd-blocker-detailed",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters::default();
+        let full: Vec<_> = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Priority)
+            .unwrap()
+            .into_iter()
+            .map(ReadyIssue::from)
+            .collect();
+        let projected: Vec<_> = storage
+            .get_ready_issues_for_command_output(&filters, ReadySortPolicy::Priority)
+            .unwrap()
+            .into_iter()
+            .map(ReadyIssue::from)
+            .collect();
+
+        assert_eq!(projected, full);
+    }
+
+    #[test]
+    fn test_get_ready_issues_for_command_output_falls_back_when_cache_table_missing() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let blocker = make_issue("bd-b1", "Blocker", Status::Open, 1, None, Utc::now(), None);
+        let blocked = make_issue(
+            "bd-c1",
+            "Blocked issue",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        let ready = make_issue(
+            "bd-r1",
+            "Ready issue",
+            Status::Open,
+            3,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+        storage.create_issue(&ready, "tester").unwrap();
+        storage
+            .add_dependency("bd-c1", "bd-b1", "blocks", "tester")
+            .unwrap();
+
+        storage
+            .conn
+            .execute("DROP TABLE blocked_issues_cache")
+            .unwrap();
+
+        let full: Vec<_> = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+            .unwrap()
+            .into_iter()
+            .map(ReadyIssue::from)
+            .collect();
+        let projected: Vec<_> = storage
+            .get_ready_issues_for_command_output(
+                &ReadyFilters::default(),
+                ReadySortPolicy::Priority,
+            )
+            .unwrap()
+            .into_iter()
+            .map(ReadyIssue::from)
+            .collect();
+
+        assert_eq!(projected, full);
     }
 
     #[test]

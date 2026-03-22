@@ -1076,15 +1076,15 @@ fn snapshot_tombstones(storage: &crate::storage::SqliteStorage) -> Result<Vec<Is
     Ok(tombstones)
 }
 
-fn restore_tombstones(
-    storage: &crate::storage::SqliteStorage,
-    tombstones: &[Issue],
-) -> Result<()> {
+fn restore_tombstones(storage: &crate::storage::SqliteStorage, tombstones: &[Issue]) -> Result<()> {
     for tombstone in tombstones {
         storage.upsert_issue_for_import(tombstone)?;
     }
     if !tombstones.is_empty() {
-        debug!(count = tombstones.len(), "Restored tombstones after force reset");
+        debug!(
+            count = tombstones.len(),
+            "Restored tombstones after force reset"
+        );
     }
     Ok(())
 }

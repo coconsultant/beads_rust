@@ -13,6 +13,29 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use toon_rust::try_decode;
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn toon_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .or_else(|| {
+            value.as_f64().and_then(|n| {
+                if n.is_finite() && n >= 0.0 && n.fract() == 0.0 {
+                    Some(n as u64)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn toon_array_items(value: &Value) -> Vec<&Value> {
+    value
+        .as_array()
+        .map(|items| items.iter().filter(|item| !item.is_null()).collect())
+        .unwrap_or_default()
+}
+
 // ============================================================================
 // BEADS_DIR tests
 // ============================================================================
@@ -813,7 +836,9 @@ fn e2e_delete_honors_toon_env_mode() {
     let decoded = try_decode(delete.stdout.trim(), None).expect("valid delete TOON");
     let json = Value::from(decoded);
     assert_eq!(json["deleted_count"].as_f64(), Some(1.0));
-    assert_eq!(json["deleted"][0], issue_id);
+    let deleted = toon_array_items(&json["deleted"]);
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0], &Value::String(issue_id.to_string()));
 }
 
 #[test]
@@ -877,8 +902,12 @@ fn e2e_delete_preview_honors_toon_env_mode() {
     let decoded = try_decode(delete.stdout.trim(), None).expect("valid delete preview TOON");
     let json = Value::from(decoded);
     assert_eq!(json["preview"], true);
-    assert_eq!(json["would_delete"][0], blocker_id);
-    assert_eq!(json["blocked_dependents"][0], dependent_id);
+    let would_delete = toon_array_items(&json["would_delete"]);
+    assert_eq!(would_delete.len(), 1);
+    assert_eq!(would_delete[0], &Value::String(blocker_id));
+    let blocked_dependents = toon_array_items(&json["blocked_dependents"]);
+    assert_eq!(blocked_dependents.len(), 1);
+    assert_eq!(blocked_dependents[0], &Value::String(dependent_id));
 }
 
 #[test]
@@ -913,7 +942,7 @@ fn e2e_close_honors_toon_env_mode() {
 
     let decoded = try_decode(close.stdout.trim(), None).expect("valid close TOON");
     let json = Value::from(decoded);
-    let closed = json.as_array().expect("closed array");
+    let closed = toon_array_items(&json);
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0]["id"], issue_id);
     assert_eq!(closed[0]["status"], "closed");
@@ -954,7 +983,7 @@ fn e2e_reopen_honors_toon_env_mode() {
 
     let decoded = try_decode(reopen.stdout.trim(), None).expect("valid reopen TOON");
     let json = Value::from(decoded);
-    let reopened = json["reopened"].as_array().expect("reopened array");
+    let reopened = toon_array_items(&json["reopened"]);
     assert_eq!(reopened.len(), 1);
     assert_eq!(reopened[0]["id"], issue_id);
     assert_eq!(reopened[0]["status"], "open");
@@ -992,7 +1021,7 @@ fn e2e_defer_honors_toon_env_mode() {
 
     let decoded = try_decode(defer.stdout.trim(), None).expect("valid defer TOON");
     let json = Value::from(decoded);
-    let deferred = json.as_array().expect("deferred array");
+    let deferred = toon_array_items(&json);
     assert_eq!(deferred.len(), 1);
     assert_eq!(deferred[0]["id"], issue_id);
     assert_eq!(deferred[0]["status"], "deferred");
@@ -1059,7 +1088,7 @@ fn e2e_update_honors_toon_env_mode() {
 
     let decoded = try_decode(update.stdout.trim(), None).expect("valid update TOON");
     let json = Value::from(decoded);
-    let results = json.as_array().expect("update array");
+    let results = toon_array_items(&json);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"].as_str(), Some(issue_id.as_str()));
     assert_eq!(results[0]["status"].as_str(), Some("in_progress"));
@@ -1094,7 +1123,7 @@ fn e2e_count_honors_toon_env_mode() {
 
     let decoded = try_decode(count.stdout.trim(), None).expect("valid count TOON");
     let json = Value::from(decoded);
-    assert_eq!(json["count"].as_u64(), Some(1));
+    assert_eq!(toon_u64(&json["count"]), Some(1));
 }
 
 #[test]
@@ -1153,9 +1182,11 @@ fn e2e_lint_honors_toon_env_mode() {
     assert!(lint.status.success(), "lint toon failed: {}", lint.stderr);
 
     let json = Value::from(try_decode(lint.stdout.trim(), None).expect("valid lint TOON"));
-    assert_eq!(json["total"].as_u64(), Some(2));
-    assert_eq!(json["issues"].as_u64(), Some(1));
-    assert_eq!(json["results"][0]["issue_type"].as_str(), Some("bug"));
+    assert_eq!(toon_u64(&json["total"]), Some(2));
+    assert_eq!(toon_u64(&json["issues"]), Some(1));
+    let results = toon_array_items(&json["results"]);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["type"].as_str(), Some("bug"));
 }
 
 #[test]
@@ -1178,7 +1209,7 @@ fn e2e_stale_honors_toon_env_mode() {
 
     let stale = run_br_with_env(
         &workspace,
-        ["stale", "0"],
+        ["stale", "--days", "0"],
         [("BR_OUTPUT_FORMAT", "toon")],
         "stale_toon_env",
     );
@@ -1190,7 +1221,7 @@ fn e2e_stale_honors_toon_env_mode() {
 
     let decoded = try_decode(stale.stdout.trim(), None).expect("valid stale TOON");
     let json = Value::from(decoded);
-    let stale_items = json.as_array().expect("stale array");
+    let stale_items = toon_array_items(&json);
     assert_eq!(stale_items.len(), 1);
     assert_eq!(stale_items[0]["id"].as_str(), Some(issue_id.as_str()));
 }
@@ -1227,7 +1258,7 @@ fn e2e_epic_status_honors_toon_env_mode() {
 
     let decoded = try_decode(status.stdout.trim(), None).expect("valid epic status TOON");
     let json = Value::from(decoded);
-    let epics = json.as_array().expect("epics array");
+    let epics = toon_array_items(&json);
     assert_eq!(epics.len(), 1);
     assert_eq!(epics[0]["epic"]["id"].as_str(), Some(epic_id.as_str()));
 }
@@ -1296,8 +1327,8 @@ fn e2e_epic_close_eligible_honors_toon_env_mode() {
 
     let decoded = try_decode(close_eligible.stdout.trim(), None).expect("valid epic close TOON");
     let json = Value::from(decoded);
-    assert_eq!(json["count"].as_u64(), Some(1));
-    let closed = json["closed"].as_array().expect("closed array");
+    assert_eq!(toon_u64(&json["count"]), Some(1));
+    let closed = toon_array_items(&json["closed"]);
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].as_str(), Some(epic_id.as_str()));
 }
@@ -1334,7 +1365,7 @@ fn e2e_label_add_honors_toon_env_mode() {
 
     let decoded = try_decode(label_add.stdout.trim(), None).expect("valid label add TOON");
     let json = Value::from(decoded);
-    let results = json.as_array().expect("label add array");
+    let results = toon_array_items(&json);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["issue_id"].as_str(), Some(issue_id.as_str()));
     assert_eq!(results[0]["label"].as_str(), Some("triage"));
@@ -1456,11 +1487,9 @@ fn e2e_audit_log_and_summary_honor_toon_env_mode() {
     );
     let summary_json =
         Value::from(try_decode(summary.stdout.trim(), None).expect("valid audit summary TOON"));
-    assert_eq!(summary_json["period_days"].as_u64(), Some(30));
+    assert_eq!(toon_u64(&summary_json["period_days"]), Some(30));
     assert!(
-        summary_json["totals"]["total"]
-            .as_u64()
-            .is_some_and(|total| total >= 1),
+        toon_u64(&summary_json["totals"]["total"]).is_some_and(|total| total >= 1),
         "TOON audit summary output should include totals: {summary_json}"
     );
 }
@@ -1616,8 +1645,10 @@ fn e2e_query_save_list_delete_honor_toon_env_mode() {
     );
     assert!(list.status.success(), "query list failed: {}", list.stderr);
     let list_json = Value::from(try_decode(list.stdout.trim(), None).expect("valid list TOON"));
-    assert_eq!(list_json["count"].as_u64(), Some(1));
-    assert_eq!(list_json["queries"][0]["name"].as_str(), Some("toon-open"));
+    assert_eq!(toon_u64(&list_json["count"]), Some(1));
+    let queries = toon_array_items(&list_json["queries"]);
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0]["name"].as_str(), Some("toon-open"));
 
     let delete = run_br_with_env(
         &workspace,
@@ -1702,7 +1733,7 @@ fn e2e_history_list_and_prune_honor_toon_env_mode() {
     );
     let list_json = Value::from(try_decode(list.stdout.trim(), None).expect("valid list TOON"));
     assert!(
-        list_json["count"].as_u64().is_some_and(|count| count >= 1),
+        toon_u64(&list_json["count"]).is_some_and(|count| count >= 1),
         "TOON history list should report at least one backup: {list_json}"
     );
     assert!(
@@ -1725,7 +1756,7 @@ fn e2e_history_list_and_prune_honor_toon_env_mode() {
     );
     let prune_json = Value::from(try_decode(prune.stdout.trim(), None).expect("valid prune TOON"));
     assert_eq!(prune_json["action"].as_str(), Some("prune"));
-    assert_eq!(prune_json["keep"].as_u64(), Some(10));
+    assert_eq!(toon_u64(&prune_json["keep"]), Some(10));
 }
 
 #[test]

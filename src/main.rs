@@ -3,7 +3,7 @@ use beads_rust::cli::{Cli, Commands, OutputFormat, command_requests_robot_json};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
-use beads_rust::sync::{auto_flush, auto_import_if_stale, compute_staleness};
+use beads_rust::sync::{auto_flush, auto_import_if_stale, compute_staleness_refreshing_witnesses};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
@@ -69,8 +69,9 @@ fn main() {
         && !cli.allow_stale
         && !ctx.no_auto_import()
     {
-        let should_attempt_auto_import = compute_staleness(&res.storage, &paths.jsonl_path)
-            .map_or(true, |staleness| staleness.jsonl_newer);
+        let should_attempt_auto_import =
+            compute_staleness_refreshing_witnesses(&mut res.storage, &paths.jsonl_path)
+                .map_or(true, |staleness| staleness.jsonl_newer);
 
         if should_attempt_auto_import {
             let _sync_lock = ctx.beads_dir.as_deref().and_then(try_sync_lock);

@@ -1845,10 +1845,19 @@ pub fn export_to_writer_with_policy<W: Write>(
 pub const METADATA_JSONL_CONTENT_HASH: &str = "jsonl_content_hash";
 /// Metadata key for the exact observed JSONL mtime at the last successful sync.
 pub const METADATA_JSONL_MTIME: &str = "jsonl_mtime";
+/// Metadata key for the exact observed JSONL size at the last successful sync.
+pub const METADATA_JSONL_SIZE: &str = "jsonl_size";
 /// Metadata key for the last export time.
 pub const METADATA_LAST_EXPORT_TIME: &str = "last_export_time";
 /// Metadata key for the last import time.
 pub const METADATA_LAST_IMPORT_TIME: &str = "last_import_time";
+
+#[derive(Debug, Clone)]
+struct JsonlWitness {
+    mtime: std::time::SystemTime,
+    mtime_witness: String,
+    size: u64,
+}
 
 /// Result of a staleness check between JSONL and DB.
 #[derive(Debug, Clone, Copy)]
@@ -1882,33 +1891,76 @@ fn pending_export_state(
 ///
 /// Returns an error if reading dirty state, metadata, JSONL mtime, or hashing fails.
 pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<StalenessCheck> {
+    let (staleness, _) = compute_staleness_impl(storage, jsonl_path)?;
+    Ok(staleness)
+}
+
+/// Compute staleness and opportunistically persist refreshed JSONL witnesses.
+///
+/// When the stored content hash still matches but the cached mtime/size witness
+/// is stale or incomplete, this updates the metadata so later commands can skip
+/// re-hashing an unchanged JSONL file.
+///
+/// # Errors
+///
+/// Returns an error if reading dirty state, metadata, JSONL metadata, or
+/// hashing fails. Opportunistic witness refresh failures are logged and
+/// ignored so startup freshness probes do not fail on metadata backfill races.
+pub fn compute_staleness_refreshing_witnesses(
+    storage: &mut SqliteStorage,
+    jsonl_path: &Path,
+) -> Result<StalenessCheck> {
+    let (staleness, refresh_witness) = compute_staleness_impl(storage, jsonl_path)?;
+    if let Some(observed) = refresh_witness {
+        refresh_jsonl_witness_best_effort(storage, jsonl_path, &observed);
+    }
+    Ok(staleness)
+}
+
+fn compute_staleness_impl(
+    storage: &SqliteStorage,
+    jsonl_path: &Path,
+) -> Result<(StalenessCheck, Option<JsonlWitness>)> {
     let jsonl_exists = jsonl_path.exists();
     let (dirty_count, _needs_flush, db_newer) = pending_export_state(storage, jsonl_exists)?;
+    let mut refresh_witness = None;
 
     let (jsonl_mtime, jsonl_newer) = if jsonl_exists {
-        let (jsonl_mtime, jsonl_mtime_witness) = observed_jsonl_mtime(jsonl_path)?;
+        let observed = observed_jsonl_witness(jsonl_path)?;
+        let stored_mtime = storage.get_metadata(METADATA_JSONL_MTIME)?;
+        let stored_size = storage.get_metadata(METADATA_JSONL_SIZE)?;
+        let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
 
-        if storage.get_metadata(METADATA_JSONL_MTIME)?.as_deref() == Some(&jsonl_mtime_witness) {
-            let jsonl_newer = storage
-                .get_metadata(METADATA_JSONL_CONTENT_HASH)?
-                .as_ref()
-                .is_none_or(|stored_hash| {
+        if stored_mtime.as_deref() == Some(observed.mtime_witness.as_str()) {
+            let stored_size_matches =
+                stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
+            let jsonl_newer = if stored_size_matches {
+                stored_hash.is_none()
+            } else {
+                stored_hash.as_ref().is_none_or(|hash| {
                     compute_jsonl_hash(jsonl_path)
-                        .map_or(true, |current_hash| &current_hash != stored_hash)
-                });
+                        .map_or(true, |current_hash| &current_hash != hash)
+                })
+            };
 
-            return Ok(StalenessCheck {
-                dirty_count,
-                jsonl_exists: true,
-                jsonl_mtime: Some(jsonl_mtime),
-                jsonl_newer,
-                db_newer,
-            });
+            if !jsonl_newer && stored_hash.is_some() && !stored_size_matches {
+                refresh_witness = Some(observed.clone());
+            }
+
+            return Ok((
+                StalenessCheck {
+                    dirty_count,
+                    jsonl_exists: true,
+                    jsonl_mtime: Some(observed.mtime),
+                    jsonl_newer,
+                    db_newer,
+                },
+                refresh_witness,
+            ));
         }
 
         let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
         let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
-        let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
 
         // Get the latest known sync time (either import or export)
         let mut latest_sync_ts: Option<chrono::DateTime<Utc>> = None;
@@ -1932,11 +1984,11 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
         // If metadata is missing or invalid, assume JSONL is newer (safe default)
         let mtime_newer = latest_sync_ts.is_none_or(|sync_ts| {
             let sync_sys_time = std::time::SystemTime::from(sync_ts);
-            jsonl_mtime > sync_sys_time
+            observed.mtime > sync_sys_time
         });
 
         let jsonl_newer = if mtime_newer {
-            jsonl_content_hash.as_ref().is_none_or(|stored_hash| {
+            stored_hash.as_ref().is_none_or(|stored_hash| {
                 compute_jsonl_hash(jsonl_path)
                     .map_or(true, |current_hash| &current_hash != stored_hash)
             })
@@ -1944,29 +1996,91 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
             false
         };
 
-        (Some(jsonl_mtime), jsonl_newer)
+        if !jsonl_newer && stored_hash.is_some() {
+            let stored_size_matches =
+                stored_size.as_deref().and_then(parse_jsonl_size_witness) == Some(observed.size);
+            if stored_mtime.as_deref() != Some(observed.mtime_witness.as_str())
+                || !stored_size_matches
+            {
+                refresh_witness = Some(observed.clone());
+            }
+        }
+
+        (Some(observed.mtime), jsonl_newer)
     } else {
         (None, false)
     };
 
-    Ok(StalenessCheck {
-        dirty_count,
-        jsonl_exists,
-        jsonl_mtime,
-        jsonl_newer,
-        db_newer,
+    Ok((
+        StalenessCheck {
+            dirty_count,
+            jsonl_exists,
+            jsonl_mtime,
+            jsonl_newer,
+            db_newer,
+        },
+        refresh_witness,
+    ))
+}
+
+#[cfg(test)]
+fn observed_jsonl_mtime(jsonl_path: &Path) -> Result<(std::time::SystemTime, String)> {
+    let observed = observed_jsonl_witness(jsonl_path)?;
+    Ok((observed.mtime, observed.mtime_witness))
+}
+
+fn observed_jsonl_witness(jsonl_path: &Path) -> Result<JsonlWitness> {
+    let metadata = fs::symlink_metadata(jsonl_path)?;
+    let jsonl_mtime = metadata.modified()?;
+    Ok(JsonlWitness {
+        mtime: jsonl_mtime,
+        mtime_witness: chrono::DateTime::<Utc>::from(jsonl_mtime).to_rfc3339(),
+        size: metadata.len(),
     })
 }
 
-fn observed_jsonl_mtime(jsonl_path: &Path) -> Result<(std::time::SystemTime, String)> {
-    let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
-    let jsonl_mtime_witness = chrono::DateTime::<Utc>::from(jsonl_mtime).to_rfc3339();
-    Ok((jsonl_mtime, jsonl_mtime_witness))
+fn parse_jsonl_size_witness(value: &str) -> Option<u64> {
+    value.parse().ok()
 }
 
-fn record_jsonl_mtime_in_tx(storage: &SqliteStorage, jsonl_path: &Path) -> Result<()> {
-    let (_, jsonl_mtime_witness) = observed_jsonl_mtime(jsonl_path)?;
-    storage.set_metadata_in_tx(METADATA_JSONL_MTIME, &jsonl_mtime_witness)
+fn record_jsonl_witness_in_tx(storage: &SqliteStorage, jsonl_path: &Path) -> Result<()> {
+    let observed = observed_jsonl_witness(jsonl_path)?;
+    record_observed_jsonl_witness_in_tx(storage, &observed)
+}
+
+fn record_observed_jsonl_witness_in_tx(
+    storage: &SqliteStorage,
+    observed: &JsonlWitness,
+) -> Result<()> {
+    storage.set_metadata_in_tx(METADATA_JSONL_MTIME, &observed.mtime_witness)?;
+    storage.set_metadata_in_tx(METADATA_JSONL_SIZE, &observed.size.to_string())
+}
+
+fn maybe_refresh_jsonl_witness(
+    storage: &mut SqliteStorage,
+    jsonl_path: &Path,
+    observed: &JsonlWitness,
+) -> Result<()> {
+    let current = observed_jsonl_witness(jsonl_path)?;
+    if current.mtime != observed.mtime || current.size != observed.size {
+        return Ok(());
+    }
+
+    storage.with_write_transaction(|storage| record_observed_jsonl_witness_in_tx(storage, &current))
+}
+
+fn refresh_jsonl_witness_best_effort(
+    storage: &mut SqliteStorage,
+    jsonl_path: &Path,
+    observed: &JsonlWitness,
+) {
+    if let Err(error) = maybe_refresh_jsonl_witness(storage, jsonl_path, observed) {
+        tracing::debug!(
+            path = %jsonl_path.display(),
+            error = %error,
+            "Skipping opportunistic JSONL witness refresh"
+        );
+    }
 }
 
 /// Result of an auto-import attempt.
@@ -2005,7 +2119,7 @@ pub fn auto_import_if_stale(
         return Ok(AutoImportResult::default());
     }
 
-    let staleness = compute_staleness(storage, jsonl_path)?;
+    let staleness = compute_staleness_refreshing_witnesses(storage, jsonl_path)?;
     if !staleness.jsonl_newer {
         return Ok(AutoImportResult::default());
     }
@@ -2087,7 +2201,7 @@ pub fn finalize_export(
         // Update metadata
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &result.content_hash)?;
         storage.set_metadata_in_tx(METADATA_LAST_EXPORT_TIME, &Utc::now().to_rfc3339())?;
-        record_jsonl_mtime_in_tx(storage, jsonl_path)?;
+        record_jsonl_witness_in_tx(storage, jsonl_path)?;
 
         // Clear force-flush flag if it was set
         storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
@@ -2252,7 +2366,7 @@ fn finalize_incremental_auto_flush(
                     "incremental auto-flush metadata update requires a JSONL path".to_string(),
                 )
             })?;
-            record_jsonl_mtime_in_tx(storage, jsonl_path)?;
+            record_jsonl_witness_in_tx(storage, jsonl_path)?;
         }
         storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
         Ok(())
@@ -3230,7 +3344,7 @@ pub fn import_from_jsonl(
         storage
             .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
         storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
-        record_jsonl_mtime_in_tx(storage, input_path)?;
+        record_jsonl_witness_in_tx(storage, input_path)?;
 
         Ok(tx_result)
     });
@@ -4461,6 +4575,48 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_staleness_refreshing_witnesses_backfills_jsonl_size() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        fs::write(&jsonl_path, "{\"id\":\"bd-1\"}\n").unwrap();
+        let (_, jsonl_mtime_witness) = observed_jsonl_mtime(&jsonl_path).unwrap();
+        let current_hash = compute_jsonl_hash(&jsonl_path).unwrap();
+        let jsonl_size = fs::metadata(&jsonl_path).unwrap().len().to_string();
+
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, &current_hash)
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, &jsonl_mtime_witness)
+            .unwrap();
+
+        let staleness = compute_staleness_refreshing_witnesses(&mut storage, &jsonl_path).unwrap();
+        assert!(!staleness.jsonl_newer);
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_SIZE).unwrap(),
+            Some(jsonl_size)
+        );
+    }
+
+    #[test]
+    fn test_refresh_jsonl_witness_best_effort_ignores_missing_jsonl() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        fs::write(&jsonl_path, "{\"id\":\"bd-1\"}\n").unwrap();
+        let observed = observed_jsonl_witness(&jsonl_path).unwrap();
+        fs::remove_file(&jsonl_path).unwrap();
+
+        refresh_jsonl_witness_best_effort(&mut storage, &jsonl_path, &observed);
+
+        assert_eq!(storage.get_metadata(METADATA_JSONL_MTIME).unwrap(), None);
+        assert_eq!(storage.get_metadata(METADATA_JSONL_SIZE).unwrap(), None);
+    }
+
+    #[test]
     fn test_compute_staleness_marks_db_newer_when_force_flush_is_pending() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -4505,9 +4661,14 @@ mod tests {
         .unwrap();
 
         let (_, jsonl_mtime_witness) = observed_jsonl_mtime(&jsonl_path).unwrap();
+        let jsonl_size = fs::metadata(&jsonl_path).unwrap().len().to_string();
         assert_eq!(
             storage.get_metadata(METADATA_JSONL_MTIME).unwrap(),
             Some(jsonl_mtime_witness)
+        );
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_SIZE).unwrap(),
+            Some(jsonl_size)
         );
     }
 
@@ -5459,6 +5620,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert!(storage.get_metadata(METADATA_JSONL_SIZE).unwrap().is_some());
     }
 
     #[test]
@@ -5536,6 +5698,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(storage.get_metadata(METADATA_JSONL_SIZE).unwrap().is_none());
     }
 
     #[test]

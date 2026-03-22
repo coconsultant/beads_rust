@@ -22,7 +22,7 @@ pub struct StaleIssue {
 ///
 /// Contains only the fields that bd's ready command outputs.
 /// Does NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReadyIssue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance_criteria: Option<String>,

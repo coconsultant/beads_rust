@@ -163,8 +163,9 @@ fn execute_inner(
 
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
-    // Get ready issues from storage (blocked cache only)
-    let mut ready_issues = storage.get_ready_issues(&filters, sort_policy)?;
+    // Get ready issues from storage (blocked cache only) while avoiding
+    // heavyweight issue columns that never reach ready output.
+    let mut ready_issues = storage.get_ready_issues_for_command_output(&filters, sort_policy)?;
 
     if has_external {
         let external_statuses = storage.resolve_external_dependency_statuses(
